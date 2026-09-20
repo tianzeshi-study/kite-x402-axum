@@ -68,6 +68,10 @@ reads the same variable names as the Go and TypeScript templates:
 `UPSTREAM_AUTH_HEADER`, `UPSTREAM_AUTH_VALUE`, `FACILITATOR_URL`,
 `SERVICE_DESCRIPTION`, `PORT`.
 
+## Logging
+
+This crate emits structured diagnostics via [`tracing`](https://crates.io/crates/tracing) at `info`, `debug`, `warn`, and `error` levels. Consumers can attach any `tracing-subscriber` (e.g. `tracing-subscriber::fmt::init()`), and configure levels via `RUST_LOG` (such as `RUST_LOG=kite_x402_axum=debug` or `RUST_LOG=debug`) to inspect the full x402 payment flow.
+
 ## Error semantics — please read
 
 The TypeScript and Go x402 SDKs disagree with each other on the HTTP

@@ -33,6 +33,28 @@ failed upstream call never charges the buyer. See
 this template's behavior is a deliberate choice rather than a direct port:
 what happens when the facilitator itself can't be reached.
 
+## Logging
+
+The service and library use [`tracing`](https://crates.io/crates/tracing) for structured diagnostic and protocol logging.
+
+The log level is configured via the standard `RUST_LOG` environment variable (defaults to `info` if unset):
+
+```bash
+# Standard informational logs
+RUST_LOG=info cargo run
+
+# Enable detailed protocol and payment flow logs
+RUST_LOG=debug cargo run
+
+# Scope debug logs to kite-x402 crates specifically
+RUST_LOG=kite_x402_service=debug,kite_x402_axum=debug cargo run
+```
+
+- **`INFO`**: High-level lifecycle events (server startup, listening address, network/chain configuration, 402 challenge issuance, payment verification success, on-chain settlement success with transaction hash, graceful shutdown).
+- **`DEBUG`**: Detailed diagnostic traces (payment requirements comparison, facilitator `/verify` and `/settle` requests, upstream proxy path and headers, round-trip timings and status codes).
+- **`WARN` / `ERROR`**: Client errors, payment signature decode failures, requirement mismatches, upstream errors, facilitator connectivity issues or settlement rejections.
+- **Sensitive data protection**: Secret tokens such as `UPSTREAM_AUTH_VALUE` are automatically redacted from logs.
+
 ## Running the tests
 
 ```bash

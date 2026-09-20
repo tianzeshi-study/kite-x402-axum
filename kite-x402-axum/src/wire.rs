@@ -20,8 +20,20 @@ pub fn encode_payment_required(pr: &PaymentRequired) -> String {
 /// Decodes the `PAYMENT-SIGNATURE` (or `X-PAYMENT`) header value into a
 /// [`PaymentPayload`].
 pub fn decode_payment_payload(header_value: &str) -> Result<PaymentPayload, WireError> {
-    let bytes = STANDARD.decode(header_value.trim()).map_err(|_| WireError)?;
-    serde_json::from_slice(&bytes).map_err(|_| WireError)
+    let bytes = match STANDARD.decode(header_value.trim()) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(error = %e, "Failed to base64-decode payment header");
+            return Err(WireError);
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            tracing::debug!(error = %e, "Failed to parse JSON payment payload");
+            Err(WireError)
+        }
+    }
 }
 
 /// Encodes a `SettleResponse` as the `PAYMENT-RESPONSE` header value.

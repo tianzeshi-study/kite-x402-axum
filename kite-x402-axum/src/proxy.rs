@@ -45,6 +45,23 @@ pub struct UpstreamConfig {
     pub auth_value: String,
 }
 
+impl std::fmt::Debug for UpstreamConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamConfig")
+            .field("base_url", &self.base_url)
+            .field("auth_header", &self.auth_header)
+            .field(
+                "auth_value",
+                &if self.auth_value.is_empty() {
+                    "[empty]"
+                } else {
+                    "[redacted]"
+                },
+            )
+            .finish()
+    }
+}
+
 /// Reverse-proxies a request to `cfg.base_url`, stripping the `/v1` prefix
 /// the route matched under. Use as the handler behind the `/v1/{*path}`
 /// route, inside the group guarded by [`crate::middleware::x402_payment`].
@@ -68,10 +85,21 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
 
     let url = format!("{}{}", cfg.base_url, forwarded);
 
+    tracing::debug!(
+        original_path = %path_and_query,
+        forwarded_url = %url,
+        "Proxying request to upstream"
+    );
+
     let (parts, body) = req.into_parts();
     let body_bytes = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(b) => b,
-        Err(_) => {
+        Err(err) => {
+            tracing::warn!(
+                max_bytes = MAX_REQUEST_BODY_BYTES,
+                error = %err,
+                "Request body too large to proxy"
+            );
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 axum::Json(json!({ "error": "request body too large to proxy" })),
@@ -105,8 +133,16 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
             reqwest::header::HeaderValue::from_str(&cfg.auth_value),
         ) {
             out_headers.insert(hn, hv);
+            tracing::trace!(auth_header = %cfg.auth_header, "Injected upstream auth header");
         }
     }
+
+    tracing::debug!(
+        method = %method,
+        url = %url,
+        body_len = body_bytes.len(),
+        "Dispatching request to upstream API"
+    );
 
     let upstream_response = cfg
         .http
@@ -119,6 +155,11 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
     let upstream_response = match upstream_response {
         Ok(r) => r,
         Err(e) => {
+            tracing::error!(
+                url = %url,
+                error = %e,
+                "Upstream API request failed (unreachable or timed out)"
+            );
             // >= 400, so the payment middleware will not settle this call.
             return (
                 StatusCode::BAD_GATEWAY,
@@ -130,6 +171,12 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
 
     let status =
         StatusCode::from_u16(upstream_response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+
+    tracing::debug!(
+        url = %url,
+        status = status.as_u16(),
+        "Received response from upstream API"
+    );
 
     let mut builder = Response::builder().status(status);
     for (name, value) in upstream_response.headers().iter() {

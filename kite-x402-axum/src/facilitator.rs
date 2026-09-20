@@ -35,7 +35,7 @@ pub enum FacilitatorError {
 /// HTTP client for one facilitator base URL (e.g.
 /// `https://facilitator.pieverse.io/v2`, keeping the `/v2`: the facilitator
 /// appends `/verify` and `/settle` to whatever base URL it is given).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FacilitatorClient {
     http: reqwest::Client,
     base_url: String,
@@ -52,6 +52,11 @@ struct FacilitatorRequest<'a> {
 }
 
 impl FacilitatorClient {
+    /// Returns the facilitator base URL.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Builds a client for `base_url` with [`DEFAULT_TIMEOUT`].
     pub fn new(base_url: impl Into<String>) -> Self {
         Self::with_timeout(base_url, DEFAULT_TIMEOUT)
@@ -99,17 +104,34 @@ impl FacilitatorClient {
             payment_requirements: requirements,
         };
 
-        let response = self
+        let url = format!("{}/{op}", self.base_url);
+        tracing::debug!(op = %op, url = %url, "Sending HTTP request to facilitator");
+
+        let response = match self
             .http
-            .post(format!("{}/{op}", self.base_url))
+            .post(&url)
             .json(&body)
             .send()
-            .await?;
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                tracing::error!(op = %op, url = %url, error = %err, "Facilitator HTTP request failed");
+                return Err(FacilitatorError::Request(err));
+            }
+        };
 
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
 
         if !status.is_success() {
+            tracing::warn!(
+                op = %op,
+                url = %url,
+                status = status.as_u16(),
+                body = %text,
+                "Facilitator returned non-success HTTP status"
+            );
             return Err(FacilitatorError::BadResponse {
                 op,
                 status: status.as_u16(),
@@ -117,10 +139,27 @@ impl FacilitatorClient {
             });
         }
 
-        serde_json::from_str(&text).map_err(|e| FacilitatorError::BadResponse {
-            op,
-            status: status.as_u16(),
-            body: format!("could not parse facilitator {op} response: {e}"),
+        tracing::debug!(
+            op = %op,
+            url = %url,
+            status = status.as_u16(),
+            "Facilitator returned success HTTP status"
+        );
+
+        serde_json::from_str(&text).map_err(|e| {
+            tracing::error!(
+                op = %op,
+                url = %url,
+                status = status.as_u16(),
+                error = %e,
+                body = %text,
+                "Failed to parse facilitator JSON response"
+            );
+            FacilitatorError::BadResponse {
+                op,
+                status: status.as_u16(),
+                body: format!("could not parse facilitator {op} response: {e}"),
+            }
         })
     }
 }

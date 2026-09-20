@@ -4,7 +4,18 @@ Deliberately deferred out of the first working version so the template
 lands and passes its acceptance tests now. Listed here instead of blocking
 on them.
 
-## 1. Dependency versions were pinned down for this sandbox's Rust 1.75
+## 1. ~~Dependency versions were pinned down for this sandbox's Rust 1.75~~ — resolved
+
+**Update:** confirmed on a real (current) Rust toolchain — `cargo update` and
+`cargo clippy` both ran clean outside this sandbox. `Cargo.toml` no longer
+pins `reqwest` to an exact version (`reqwest = "0.12"`, a normal range);
+that pin was only ever a workaround for building in this container. The
+`Cargo.lock` this sandbox generates locally (quinn/rand/idna_adapter/etc.
+downgraded to versions Rust 1.75 can compile) stays out of git — a
+contributor with a current toolchain gets normal, current dependency
+resolution.
+
+Original context, kept for the record:
 
 The container this template was developed in only has `rustc`/`cargo`
 1.75 available via `apt` (no network access to `rustup.rs` to install a
@@ -12,26 +23,21 @@ newer toolchain). Several transitive dependencies of `axum` 0.8 / `reqwest`
 0.12 (`litemap`, `zeroize`, `idna_adapter`, the `quinn`/`rand` stack used by
 reqwest's HTTP/3 support) now require Rust 1.81+ or the unstable
 `edition2024` feature in their newest published versions, which 1.75
-cannot build. To get a working, testable build in this sandbox, the
-generated `Cargo.lock` pins those crates down to their latest
-1.75-compatible versions, and `reqwest` is pinned to `=0.12.9` (last
-version before it started requiring a newer `idna`/`quinn` chain).
+cannot build. `Cargo.lock` is (and stays) `.gitignore`d for exactly this
+reason.
 
-**This should not carry forward as-is.** `Cargo.lock` is `.gitignore`d for
-exactly this reason — a contributor with a current Rust toolchain should
-get fresh, current dependency versions, not this sandbox's downgraded set.
-Before merging:
+## 2. Real testnet settlement against a live Kite Passport agent — not yet run
 
-- Confirm the crate builds cleanly on current stable Rust with an
-  unconstrained `cargo update`.
-- Reconsider whether `reqwest`'s exact pin (`=0.12.9`) is still needed, or
-  whether it can go back to a normal `"0.12"` range once building outside
-  this sandbox.
-- Decide the crate's real MSRV (this template's `Cargo.toml` currently
-  claims `rust-version = "1.75"` to match the sandbox; verify that's
-  actually still true for the *unpinned* dependency tree, or raise it).
+Everything up to the facilitator boundary is covered by the 23 automated
+tests (mock facilitator + mock upstream). Nobody has yet run this template
+against the **real** Kite testnet facilitator with a real `kpass` sandbox
+agent end to end (the `## Test with a Kite Passport agent` section in the
+root README). That requires a live wallet and network access this
+development environment doesn't have, so it's left for whoever deploys
+this template to confirm before merging/going live — same as any new
+service onboarding per `CONTRIBUTING.md`.
 
-## 2. TypeScript and Go SDKs disagree on facilitator-unreachable status codes
+## 3. ~~TypeScript and Go SDKs disagree on facilitator-unreachable status codes~~ — decision kept
 
 Documented in `kite-x402-axum/src/lib.rs` and inline in `middleware.rs`,
 repeated here because it's a real behavioral choice, not just an
@@ -58,17 +64,14 @@ one-function change (`middleware.rs`'s two `Err(e) => ...` arms) and should
 be revisited with someone who has visibility into what real Kite Passport
 agents expect.
 
-## 3. `cargo clippy` has not been run
+## 4. ~~`cargo clippy` has not been run~~ — resolved
 
-The sandbox's apt-installed Rust 1.75 doesn't have `clippy` available (no
-`rustup component add`). The code has been written clippy-conscious (no
-obvious `.clone()`-happy patterns, `?`-propagation, etc.) but hasn't
-actually been linted. The CI job added in this change (`template-rust` in
-`.github/workflows/ci.yml`) runs `cargo clippy -- -D warnings` on a real
-GitHub Actions Rust toolchain, so the first CI run against this PR will
-either confirm it's clean or surface what needs fixing.
+Ran clean on a real Rust toolchain (see item 1's update). The CI job added
+in this change (`template-rust` in `.github/workflows/ci.yml`) runs
+`cargo clippy --workspace --all-targets -- -D warnings` on every PR going
+forward so this doesn't silently regress.
 
-## 4. No `services/` manifest entry
+## 5. No `services/` manifest entry
 
 `services/README.md` describes onboarding a *deployed* wrapper service
 (with a real `service.yaml` manifest, a live `PAY_TO`, etc.) built from one
@@ -80,7 +83,7 @@ matching `services/` entry either. Adding a deployed service on top of this
 template (its own `service.yaml`, a real upstream, a real wallet) is a
 separate follow-up, not part of "add a Rust/Axum template."
 
-## 5. Payment-requirements matching is single-option only
+## 6. Payment-requirements matching is single-option only
 
 `x402_payment` compares the client's `accepted` field against exactly one
 `PaymentRequirements` built from this route's static config (one price, one

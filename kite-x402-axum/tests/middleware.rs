@@ -526,3 +526,43 @@ fn wire_decode_is_reexported_and_usable() {
     let decoded = decode_payment_payload(&encoded).unwrap();
     assert_eq!(decoded.accepted.amount, "1");
 }
+
+#[test]
+fn upstream_config_debug_redacts_auth_value() {
+    let cfg = UpstreamConfig {
+        http: reqwest::Client::new(),
+        base_url: "https://api.example.com".to_string(),
+        auth_header: "Authorization".to_string(),
+        auth_value: "super-secret-bearer-token".to_string(),
+    };
+    let formatted = format!("{cfg:?}");
+    assert!(!formatted.contains("super-secret-bearer-token"));
+    assert!(formatted.contains("[redacted]"));
+    assert!(formatted.contains("https://api.example.com"));
+    assert!(formatted.contains("Authorization"));
+
+    let empty_cfg = UpstreamConfig {
+        http: reqwest::Client::new(),
+        base_url: "https://api.example.com".to_string(),
+        auth_header: "Authorization".to_string(),
+        auth_value: "".to_string(),
+    };
+    let formatted_empty = format!("{empty_cfg:?}");
+    assert!(formatted_empty.contains("[empty]"));
+}
+
+#[test]
+fn facilitator_client_base_url_getter() {
+    let client = FacilitatorClient::new("https://facilitator.pieverse.io/v2/");
+    assert_eq!(client.base_url(), "https://facilitator.pieverse.io/v2");
+}
+
+#[test]
+fn env_filter_supports_debug_and_custom_directives() {
+    let filter = tracing_subscriber::EnvFilter::new("debug");
+    assert_eq!(filter.to_string(), "debug");
+
+    let filter = tracing_subscriber::EnvFilter::new("kite_x402_service=debug,kite_x402_axum=debug");
+    assert!(filter.to_string().contains("kite_x402_service=debug"));
+    assert!(filter.to_string().contains("kite_x402_axum=debug"));
+}

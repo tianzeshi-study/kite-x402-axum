@@ -26,7 +26,7 @@ use crate::{
 /// Shared configuration for the payment gate on a route (or group of
 /// routes). Build one and pass it to [`axum::middleware::from_fn_with_state`]
 /// wrapped in an [`Arc`].
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PaymentConfig {
     /// The Kite wallet address that receives payments.
     pub pay_to: String,
@@ -136,12 +136,23 @@ pub async fn x402_payment(
         .get::<OriginalUri>()
         .map(|OriginalUri(uri)| uri.to_string())
         .unwrap_or_else(|| req.uri().to_string());
+    let method = req.method().clone();
+
+    tracing::debug!(
+        method = %method,
+        uri = %resource_url,
+        "Processing request through x402 payment gate"
+    );
 
     let requirements = match cfg.requirements() {
         Ok(r) => r,
         Err(msg) => {
+            tracing::error!(
+                error = %msg,
+                "Failed to compute payment requirements (invalid server configuration)"
+            );
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": msg })))
-                .into_response()
+                .into_response();
         }
     };
 
@@ -153,12 +164,30 @@ pub async fn x402_payment(
         .map(str::to_string);
 
     let Some(header_value) = header_value else {
+        tracing::info!(
+            uri = %resource_url,
+            "No payment signature header found; returning 402 Payment Required challenge"
+        );
+        tracing::debug!(
+            uri = %resource_url,
+            requirements = ?requirements,
+            "402 challenge requirements details"
+        );
         return payment_required_response(requirements, resource_url, cfg.description.clone(), None);
     };
+
+    tracing::debug!(
+        uri = %resource_url,
+        "Payment signature header present; decoding payload"
+    );
 
     let payload = match decode_payment_payload(&header_value) {
         Ok(p) => p,
         Err(_) => {
+            tracing::warn!(
+                uri = %resource_url,
+                "Failed to decode payment signature header; returning 402"
+            );
             return payment_required_response(
                 requirements,
                 resource_url,
@@ -169,6 +198,12 @@ pub async fn x402_payment(
     };
 
     if payload.accepted != requirements {
+        tracing::warn!(
+            uri = %resource_url,
+            expected = ?requirements,
+            actual = ?payload.accepted,
+            "Payment requirements mismatch; returning 402"
+        );
         return payment_required_response(
             requirements,
             resource_url,
@@ -177,12 +212,26 @@ pub async fn x402_payment(
         );
     }
 
+    tracing::debug!(
+        uri = %resource_url,
+        facilitator = %cfg.facilitator.base_url(),
+        network = %requirements.network,
+        amount = %requirements.amount,
+        pay_to = %requirements.pay_to,
+        "Calling facilitator to verify payment signature"
+    );
+
     let verify_outcome = cfg.facilitator.verify(&payload, &requirements).await;
     let verify = match verify_outcome {
         Ok(v) => v,
         Err(e) => {
             // Facilitator unreachable / bad response: 402, not 500/502.
             // See the crate-level docs for why.
+            tracing::error!(
+                uri = %resource_url,
+                error = %e,
+                "Facilitator verify unavailable; returning 402"
+            );
             return payment_required_response(
                 requirements,
                 resource_url,
@@ -196,6 +245,12 @@ pub async fn x402_payment(
         let reason = verify
             .invalid_reason
             .unwrap_or_else(|| "Payment invalid".to_string());
+        tracing::warn!(
+            uri = %resource_url,
+            reason = %reason,
+            payer = ?verify.payer,
+            "Payment rejected by facilitator; returning 402"
+        );
         return payment_required_response(
             requirements,
             resource_url,
@@ -204,20 +259,48 @@ pub async fn x402_payment(
         );
     }
 
+    tracing::info!(
+        uri = %resource_url,
+        payer = ?verify.payer,
+        "Payment signature verified successfully by facilitator"
+    );
+
     // Verified: run the protected handler ("authorization" flow — settle
     // happens after, and only on success). This is the rule both official
     // templates call out explicitly: never settle before the upstream call
     // succeeds.
+    tracing::debug!(
+        uri = %resource_url,
+        "Running inner handler (forwarding to upstream)"
+    );
     let response = next.run(req).await;
 
-    if response.status().as_u16() >= 400 {
+    let status = response.status();
+    if status.as_u16() >= 400 {
+        tracing::warn!(
+            uri = %resource_url,
+            status = status.as_u16(),
+            "Upstream returned HTTP status >= 400; skipping settlement"
+        );
         return response;
     }
+
+    tracing::info!(
+        uri = %resource_url,
+        status = status.as_u16(),
+        payer = ?verify.payer,
+        "Upstream succeeded; settling payment with facilitator"
+    );
 
     let settle_outcome = cfg.facilitator.settle(&payload, &requirements).await;
     let settle = match settle_outcome {
         Ok(s) => s,
         Err(e) => {
+            tracing::error!(
+                uri = %resource_url,
+                error = %e,
+                "Facilitator settle unavailable"
+            );
             let failure = crate::types::SettleResponse {
                 success: false,
                 error_reason: Some(format!("facilitator settle unavailable: {e}")),
@@ -232,8 +315,27 @@ pub async fn x402_payment(
     };
 
     if !settle.success {
+        tracing::error!(
+            uri = %resource_url,
+            error_reason = ?settle.error_reason,
+            error_message = ?settle.error_message,
+            "Facilitator settlement failed"
+        );
         return settlement_failure_response(&settle);
     }
+
+    tracing::info!(
+        uri = %resource_url,
+        tx = %settle.transaction,
+        network = %settle.network,
+        payer = ?settle.payer,
+        amount = ?settle.amount,
+        "Payment settled successfully on-chain"
+    );
+    tracing::debug!(
+        settle = ?settle,
+        "Full settlement response details"
+    );
 
     let (mut parts, body) = response.into_parts();
     parts.headers.insert(
