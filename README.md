@@ -61,17 +61,102 @@ RUST_LOG=kite_x402_service=debug,kite_x402_axum=debug cargo run
 cargo test --workspace
 ```
 
-23 tests (13 unit + 10 integration) cover: unpaid requests get a `402` with
-a valid `PAYMENT-REQUIRED` header; a correctly paid request is verified,
-proxied, settled, and gets a `PAYMENT-RESPONSE` header with
-`Cache-Control: private`; an upstream failure is passed through untouched
-and **never settled**; an invalid payment or an unreachable facilitator both
-return `402` (see the error-semantics note above) without ever reaching the
-upstream; a malformed payment header is rejected; and the `/v1` prefix is
-stripped before the request reaches the upstream. See
-`kite-x402-axum/tests/middleware.rs`.
+219 tests pass (plus 4 intentionally `#[ignore]`d regression tests, see
+below), organized in three layers:
 
-See [`TODO.md`](TODO.md) for known follow-ups (dependency versions pinned
+- **Unit tests** (116), inside `src/` next to the code they cover, `#[cfg(test)]`:
+  - `kite-x402-axum/src/kite.rs` — network constants and the `$0.001`-style
+    price parser (decimal edge cases, decimals-per-asset limits, integer
+    math has no float rounding error).
+  - `kite-x402-axum/src/types.rs` / `wire.rs` — x402 wire-type
+    (de)serialization (camelCase field names, optional fields, rejecting
+    malformed JSON) and the base64 header encode/decode round trip
+    (URL-safe alphabet and missing padding are both rejected).
+  - `kite-x402-axum/src/facilitator.rs` — the facilitator HTTP client
+    against an in-process fake server: request shape, response parsing,
+    non-200 status and unparseable-body error mapping, connection-refused
+    and timeout behavior.
+  - `kite-x402-axum/src/middleware.rs` — every branch that returns
+    *before* the facilitator is called (missing header, undecodable
+    header, requirements mismatch, invalid `PRICE_USD`), proven by
+    wrapping the gate around a counting stub inner service.
+  - `kite-x402-axum/src/proxy.rs` — the request-body size cap, hop-by-hop
+    header list, and credential redaction in `Debug` output.
+  - `service/src/main.rs` — `env_or`'s trimming/blank/fallback behavior
+    and the request logger passing every response through unchanged.
+- **Integration tests** (72), in `kite-x402-axum/tests/`, exercising the
+  library's public API against real (mock) HTTP servers over localhost —
+  no part of the request path is stubbed out:
+  - `middleware.rs` *(pre-existing)* — the original core-flow checks.
+  - `payment_flow.rs` — the full challenge → verify → settle contract:
+    header/requirements validation (every field of a tampered
+    `PaymentRequirements` is individually checked), every facilitator
+    verify/settle outcome (invalid, down, slow/timeout, malformed body),
+    that settlement only ever follows a sub-400 upstream response, and
+    concurrent-request safety (25 simultaneous paid requests are each
+    settled exactly once).
+  - `proxy_forwarding.rs` — what the upstream actually receives (method,
+    path, query, headers, body, byte-for-byte) and what the client gets
+    back (status, headers, large/streamed bodies), hop-by-hop stripping,
+    credential injection and override, and failure modes (unreachable/slow
+    upstream, oversized request body).
+  - `known_issues.rs` — see below.
+- **End-to-end tests** (31), in `service/tests/e2e.rs`, spawning the
+  **actual `kite-x402-service` binary** as a child process (configured
+  purely through environment variables, as in a real deployment) and
+  talking to it over real TCP with a real HTTP client: the full pay-per-call
+  flow, every money-safety rule (no charge on a failed upstream, rejected
+  payment, or failed settlement), environment-variable parsing and
+  defaults, startup failures (`PAY_TO`/`UPSTREAM_URL` missing, bad
+  `KITE_NETWORK`, unparseable or taken `PORT`) with their exit codes, and
+  graceful shutdown on `SIGTERM` (an in-flight paid request is allowed to
+  finish, and settle, before the process exits).
+
+For a faster inner loop, run just the library's unit + integration tests
+(skips compiling and spawning the service binary that `service/tests/e2e.rs`
+needs):
+
+```bash
+cargo test -p kite-x402-axum
+```
+
+### Known-issue regression tests
+
+`kite-x402-axum/tests/known_issues.rs` documents four suspected defects as
+`#[ignore]`d tests asserting the *desired* behavior, so they don't fail the
+normal suite but are one command away from proving whether a fix works:
+
+```bash
+cargo test -p kite-x402-axum --test known_issues -- --ignored
+```
+
+1. `proxy` strips a leading `/v1` from the path it forwards, but the path it
+   sees has *already* had the router's `nest("/v1", ..)` prefix stripped —
+   so a request for `/v1/v1/orders` (an upstream resource that itself starts
+   with `/v1`) loses both, and the upstream receives `/orders` instead of
+   `/v1/orders`.
+2. The proxy drops the response's `content-encoding` header, but its
+   `reqwest::Client` has no decompression feature enabled, so the body is
+   still gzip/br-encoded — a client that sent `Accept-Encoding: gzip` (curl
+   `--compressed`, most browsers, Python `requests`) gets encoded bytes with
+   no header saying so.
+3. The gate accepts the legacy `X-PAYMENT` header (for compatibility with
+   older x402 clients), but the proxy only strips `PAYMENT-SIGNATURE` before
+   forwarding — a buyer's signed payment payload sent as `X-PAYMENT` reaches
+   the upstream API.
+4. The proxy's `reqwest::Client` follows redirects by default, and reqwest
+   only strips the *standard* `Authorization`/`Cookie` headers on a
+   cross-host redirect — a custom credential header set via
+   `UPSTREAM_AUTH_HEADER` (e.g. `X-Api-Key`) would still be sent to
+   whatever host the upstream redirects to.
+
+None of these are exploitable from the buyer's side of the payment gate
+(they're all upstream-facing), and none change what gets settled — hence
+"known issue" rather than "blocker" — but items 1 and 3 in particular are
+worth fixing before this template is used with an upstream API that has
+`/v1`-prefixed resources or with clients still sending `X-PAYMENT`.
+
+See [`TODO.md`](TODO.md) for other known follow-ups (dependency versions pinned
 for this sandbox's Rust 1.75, an upstream SDK-disagreement decision that may
 need revisiting, etc.) intentionally deferred out of this first pass.
 

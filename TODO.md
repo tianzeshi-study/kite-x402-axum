@@ -28,8 +28,10 @@ reason.
 
 ## 2. Real testnet settlement against a live Kite Passport agent — not yet run
 
-Everything up to the facilitator boundary is covered by the 23 automated
-tests (mock facilitator + mock upstream). Nobody has yet run this template
+Everything up to the facilitator boundary is covered by the 219 automated
+unit, integration and end-to-end tests (mock facilitator + mock upstream +
+the real service binary spawned as a subprocess — see the root README's
+"Running the tests" section). Nobody has yet run this template
 against the **real** Kite testnet facilitator with a real `kpass` sandbox
 agent end to end (the `## Test with a Kite Passport agent` section in the
 root README). That requires a live wallet and network access this
@@ -82,6 +84,18 @@ and `templates/typescript-express` themselves are — neither of those has a
 matching `services/` entry either. Adding a deployed service on top of this
 template (its own `service.yaml`, a real upstream, a real wallet) is a
 separate follow-up, not part of "add a Rust/Axum template."
+
+## 7. Four proxy edge cases documented as failing tests
+
+Found while writing the test suite; each is a `#[ignore]`d test in
+`kite-x402-axum/tests/known_issues.rs` asserting the desired behavior
+(double `/v1` stripping, `content-encoding` surviving without
+decompression, `X-PAYMENT` leaking to the upstream, and an injected
+upstream credential following cross-host redirects). See the root
+README's "Known-issue regression tests" section for the full writeup of
+each. None are exploitable from the buyer's side of the payment gate, but
+1 and 3 are worth fixing before use with a `/v1`-prefixed upstream or
+clients still on the legacy `X-PAYMENT` header.
 
 ## 6. Payment-requirements matching is single-option only
 

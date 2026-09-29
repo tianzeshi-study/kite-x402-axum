@@ -263,4 +263,74 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
+
+    // ---- env_or -------------------------------------------------------------
+    // Each test uses its own variable name so parallel tests cannot interfere.
+
+    #[test]
+    fn env_or_returns_the_fallback_when_unset() {
+        assert_eq!(env_or("KITE_TEST_ENV_OR_UNSET", "fallback"), "fallback");
+    }
+
+    #[test]
+    fn env_or_returns_the_trimmed_value_when_set() {
+        env::set_var("KITE_TEST_ENV_OR_SET", "  value \n");
+        assert_eq!(env_or("KITE_TEST_ENV_OR_SET", "fallback"), "value");
+    }
+
+    #[test]
+    fn env_or_treats_blank_values_as_unset() {
+        for (i, blank) in ["", "   ", "\t\n"].into_iter().enumerate() {
+            let key = format!("KITE_TEST_ENV_OR_BLANK_{i}");
+            env::set_var(&key, blank);
+            assert_eq!(env_or(&key, "fallback"), "fallback");
+        }
+    }
+
+    #[test]
+    fn env_or_does_not_trim_the_fallback() {
+        assert_eq!(env_or("KITE_TEST_ENV_OR_UNSET_2", " padded "), " padded ");
+    }
+
+    // ---- http_request_logger --------------------------------------------------
+
+    #[tokio::test]
+    async fn logger_passes_every_status_class_through_unchanged() {
+        for status in [200u16, 204, 302, 402, 404, 500, 503] {
+            let app = Router::new()
+                .route(
+                    "/s",
+                    get(move || async move { StatusCode::from_u16(status).unwrap() }),
+                )
+                .layer(middleware::from_fn(http_request_logger));
+            let res = app
+                .oneshot(Request::builder().uri("/s").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status().as_u16(), status);
+        }
+    }
+
+    #[tokio::test]
+    async fn logger_does_not_alter_headers_or_body() {
+        let app = Router::new()
+            .route(
+                "/h",
+                get(|| async { ([("x-thing", "1")], "payload") }),
+            )
+            .layer(middleware::from_fn(http_request_logger));
+        let res = app
+            .oneshot(Request::builder().uri("/h").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.headers()["x-thing"], "1");
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"payload");
+    }
+
+    #[tokio::test]
+    async fn healthz_body_is_status_ok_json() {
+        let Json(v) = healthz().await;
+        assert_eq!(v, json!({ "status": "ok" }));
+    }
 }

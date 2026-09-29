@@ -354,3 +354,306 @@ pub async fn x402_payment(
 
     Response::from_parts(parts, body)
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the parts of the gate that do not need a working
+    //! facilitator: requirement building, the two response builders, and every
+    //! branch that returns before `/verify` is called. The inner service is a
+    //! stub so we can prove it is (not) reached. Full verify/settle flows are
+    //! covered by `tests/payment_flow.rs`.
+
+    use std::{
+        convert::Infallible,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{body::to_bytes, middleware::from_fn_with_state};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde_json::{json, Value};
+    use tower::{service_fn, util::BoxCloneService, ServiceBuilder, ServiceExt};
+
+    use super::*;
+    use crate::{
+        kite::{KITE_MAINNET, KITE_TESTNET},
+        types::{PaymentPayload, SettleResponse},
+    };
+
+    const PAY_TO: &str = "0xC0FFEE0000000000000000000000000000C0FFEE";
+
+    /// Nothing listens on port 1: any facilitator call fails fast with
+    /// "connection refused", which is distinguishable from the branches under test.
+    fn dead_facilitator() -> FacilitatorClient {
+        FacilitatorClient::new("http://127.0.0.1:1")
+    }
+
+    fn config(chain: KiteChain, price: &str) -> Arc<PaymentConfig> {
+        Arc::new(PaymentConfig {
+            pay_to: PAY_TO.to_string(),
+            chain,
+            price_usd: price.to_string(),
+            description: "Unit test service".to_string(),
+            facilitator: dead_facilitator(),
+        })
+    }
+
+    type Svc = BoxCloneService<Request, Response, Infallible>;
+
+    /// The gate wrapped around a stub that counts how often it is reached.
+    fn gate(cfg: Arc<PaymentConfig>) -> (Svc, Arc<AtomicUsize>) {
+        let reached = Arc::new(AtomicUsize::new(0));
+        let counter = reached.clone();
+        let svc = ServiceBuilder::new()
+            .layer(from_fn_with_state(cfg, x402_payment))
+            .service(service_fn(move |_req: Request| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Infallible>((StatusCode::OK, "inner").into_response())
+                }
+            }))
+            .boxed_clone();
+        (svc, reached)
+    }
+
+    fn request(uri: &str, headers: &[(&str, &str)]) -> Request {
+        let mut b = axum::http::Request::builder().uri(uri);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(axum::body::Body::empty()).unwrap()
+    }
+
+    fn decode_header(resp: &Response, name: &str) -> Value {
+        let raw = resp.headers().get(name).unwrap_or_else(|| panic!("no {name} header")).to_str().unwrap();
+        serde_json::from_slice(&STANDARD.decode(raw).unwrap()).unwrap()
+    }
+
+    fn payload_header(requirements: &PaymentRequirements) -> String {
+        let p = PaymentPayload {
+            x402_version: 2,
+            resource: None,
+            accepted: requirements.clone(),
+            payload: json!({}),
+            extensions: None,
+        };
+        STANDARD.encode(serde_json::to_vec(&p).unwrap())
+    }
+
+    // ---- PaymentConfig::requirements --------------------------------------
+
+    #[test]
+    fn requirements_for_testnet() {
+        let r = config(KITE_TESTNET, "0.001").requirements().unwrap();
+        assert_eq!(r.scheme, "exact");
+        assert_eq!(r.network, "eip155:2368");
+        assert_eq!(r.amount, "1000000000000000");
+        assert_eq!(r.asset, KITE_TESTNET.asset_address);
+        assert_eq!(r.pay_to, PAY_TO);
+        assert_eq!(r.max_timeout_seconds, 60);
+        assert_eq!(r.extra, Some(json!({ "name": "pieUSD", "version": "1" })));
+    }
+
+    #[test]
+    fn requirements_for_mainnet() {
+        let r = config(KITE_MAINNET, "$1.50").requirements().unwrap();
+        assert_eq!(r.network, "eip155:2366");
+        assert_eq!(r.amount, "1500000");
+        assert_eq!(r.asset, KITE_MAINNET.asset_address);
+        assert_eq!(r.extra.unwrap()["name"], "Bridged USDC (Kite AI)");
+    }
+
+    #[test]
+    fn requirements_are_deterministic() {
+        let c = config(KITE_TESTNET, "0.25");
+        assert_eq!(c.requirements().unwrap(), c.requirements().unwrap());
+    }
+
+    #[test]
+    fn requirements_report_bad_prices_with_context() {
+        for bad in ["", "abc", "-1", "0", "0.0000001", "1e3"] {
+            let err = config(KITE_MAINNET, bad).requirements().unwrap_err();
+            assert!(err.starts_with("invalid PRICE_USD configured on the server: "), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn config_is_clone_and_debug() {
+        let c = config(KITE_TESTNET, "0.001");
+        let d = (*c).clone();
+        assert_eq!(d.pay_to, PAY_TO);
+        assert!(format!("{d:?}").contains("Unit test service"));
+    }
+
+    // ---- response builders -------------------------------------------------
+
+    fn requirements() -> PaymentRequirements {
+        config(KITE_TESTNET, "0.001").requirements().unwrap()
+    }
+
+    #[tokio::test]
+    async fn payment_required_response_has_status_headers_and_empty_body() {
+        let resp = payment_required_response(requirements(), "/v1/x".into(), "desc".into(), None);
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/json");
+        assert!(resp.headers().get("PAYMENT-RESPONSE").is_none());
+
+        let challenge = decode_header(&resp, "PAYMENT-REQUIRED");
+        assert_eq!(challenge["x402Version"], 2);
+        assert!(challenge.get("error").is_none());
+        assert_eq!(challenge["resource"]["url"], "/v1/x");
+        assert_eq!(challenge["resource"]["description"], "desc");
+        assert_eq!(challenge["resource"]["mimeType"], "application/json");
+        assert_eq!(challenge["accepts"][0]["payTo"], PAY_TO);
+
+        assert_eq!(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()[..], b"{}");
+    }
+
+    #[test]
+    fn payment_required_response_includes_the_error_when_given() {
+        let resp = payment_required_response(requirements(), "/v1/x".into(), "d".into(), Some("because".into()));
+        assert_eq!(decode_header(&resp, "PAYMENT-REQUIRED")["error"], "because");
+    }
+
+    #[test]
+    fn payment_required_response_survives_unusual_text() {
+        // base64 output is always a valid header value, whatever the inputs.
+        let resp = payment_required_response(
+            requirements(),
+            "/v1/ünï?q=\n\t\"x\"".into(),
+            "line1\nline2 — \u{1F4B8}".into(),
+            Some("err\r\nInjected: header".into()),
+        );
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert!(resp.headers().get("Injected").is_none());
+        assert_eq!(decode_header(&resp, "PAYMENT-REQUIRED")["error"], "err\r\nInjected: header");
+    }
+
+    #[tokio::test]
+    async fn settlement_failure_response_shape() {
+        let settle = SettleResponse {
+            success: false,
+            error_reason: Some("reverted".into()),
+            error_message: None,
+            payer: Some("0xp".into()),
+            transaction: String::new(),
+            network: "eip155:2368".into(),
+            amount: None,
+        };
+        let resp = settlement_failure_response(&settle);
+
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(resp.headers().get("PAYMENT-REQUIRED").is_none());
+        let receipt = decode_header(&resp, "PAYMENT-RESPONSE");
+        assert_eq!(receipt["success"], false);
+        assert_eq!(receipt["errorReason"], "reverted");
+        assert_eq!(receipt["payer"], "0xp");
+        assert_eq!(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()[..], b"{}");
+    }
+
+    // ---- branches that return before /verify --------------------------------
+
+    #[tokio::test]
+    async fn missing_header_returns_a_plain_challenge_without_reaching_the_inner_service() {
+        let (svc, reached) = gate(config(KITE_TESTNET, "0.001"));
+        let resp = svc.oneshot(request("/anything", &[])).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert!(decode_header(&resp, "PAYMENT-REQUIRED").get("error").is_none());
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn resource_url_falls_back_to_the_request_uri_without_original_uri() {
+        let (svc, _) = gate(config(KITE_TESTNET, "0.001"));
+        let resp = svc.oneshot(request("/some/path?x=1", &[])).await.unwrap();
+        assert_eq!(decode_header(&resp, "PAYMENT-REQUIRED")["resource"]["url"], "/some/path?x=1");
+    }
+
+    #[tokio::test]
+    async fn resource_url_prefers_the_original_uri_extension() {
+        let (svc, _) = gate(config(KITE_TESTNET, "0.001"));
+        let mut req = request("/stripped", &[]);
+        req.extensions_mut().insert(OriginalUri("/v1/stripped?a=b".parse().unwrap()));
+        let resp = svc.oneshot(req).await.unwrap();
+        assert_eq!(decode_header(&resp, "PAYMENT-REQUIRED")["resource"]["url"], "/v1/stripped?a=b");
+    }
+
+    #[tokio::test]
+    async fn undecodable_header_is_rejected_as_an_invalid_signature() {
+        for name in ["PAYMENT-SIGNATURE", "X-PAYMENT"] {
+            let (svc, reached) = gate(config(KITE_TESTNET, "0.001"));
+            let resp = svc.oneshot(request("/x", &[(name, "%%%not-base64%%%")])).await.unwrap();
+
+            assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED, "{name}");
+            assert_eq!(decode_header(&resp, "PAYMENT-REQUIRED")["error"], "Invalid payment signature", "{name}");
+            assert_eq!(reached.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn requirement_mismatch_is_rejected_before_the_facilitator_is_contacted() {
+        // If the gate had called the (dead) facilitator the error would say
+        // "facilitator verify unavailable" instead.
+        let cfg = config(KITE_TESTNET, "0.001");
+        let mut wrong = cfg.requirements().unwrap();
+        wrong.amount = "1".into();
+        let (svc, reached) = gate(cfg);
+
+        let resp = svc
+            .oneshot(request("/x", &[("PAYMENT-SIGNATURE", &payload_header(&wrong))]))
+            .await
+            .unwrap();
+
+        assert_eq!(decode_header(&resp, "PAYMENT-REQUIRED")["error"], "No matching payment requirements");
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn matching_payment_with_dead_facilitator_is_402_unavailable_and_never_runs_the_handler() {
+        let cfg = config(KITE_TESTNET, "0.001");
+        let good = cfg.requirements().unwrap();
+        let (svc, reached) = gate(cfg);
+
+        let resp = svc
+            .oneshot(request("/x", &[("PAYMENT-SIGNATURE", &payload_header(&good))]))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let err = decode_header(&resp, "PAYMENT-REQUIRED")["error"].as_str().unwrap().to_string();
+        assert!(err.starts_with("facilitator verify unavailable: "), "{err}");
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_server_price_is_a_500_json_error_even_when_a_payment_is_attached() {
+        let (svc, reached) = gate(config(KITE_TESTNET, "not-a-price"));
+        let resp = svc
+            .oneshot(request("/x", &[("PAYMENT-SIGNATURE", "whatever")]))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get("PAYMENT-REQUIRED").is_none());
+        let body: Value = serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert!(body["error"].as_str().unwrap().contains("invalid PRICE_USD"));
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn header_names_are_case_insensitive() {
+        let cfg = config(KITE_TESTNET, "0.001");
+        let mut wrong = cfg.requirements().unwrap();
+        wrong.pay_to = "0xsomeoneelse".into();
+        let (svc, _) = gate(cfg);
+        let resp = svc
+            .oneshot(request("/x", &[("payment-signature", &payload_header(&wrong))]))
+            .await
+            .unwrap();
+        // Read as a payment (and rejected for its content), not ignored as absent.
+        assert_eq!(decode_header(&resp, "PAYMENT-REQUIRED")["error"], "No matching payment requirements");
+    }
+}

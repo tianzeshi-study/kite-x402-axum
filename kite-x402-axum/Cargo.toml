@@ -26,6 +26,6 @@ tracing = "0.1"
 # axum::serve; union with the [dependencies] entry above adds it just for
 # `cargo test`.
 axum = { version = "0.8", default-features = false, features = ["json", "original-uri", "http1", "tokio"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

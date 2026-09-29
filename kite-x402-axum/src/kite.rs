@@ -249,4 +249,174 @@ mod tests {
             );
         }
     }
+
+    // ---- additional coverage ------------------------------------------------
+
+    #[test]
+    fn network_name_is_trimmed_but_case_sensitive() {
+        assert_eq!(kite_chain_by_name("  testnet\n").unwrap(), KITE_TESTNET);
+        assert_eq!(kite_chain_by_name("   ").unwrap(), KITE_MAINNET); // blank == default
+        for bad in ["Mainnet", "TESTNET", "main", "test-net", "eip155:2366"] {
+            assert_eq!(
+                kite_chain_by_name(bad).unwrap_err(),
+                KiteError::UnknownNetwork(bad.to_string()),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn chain_constants_are_internally_consistent() {
+        for chain in [KITE_MAINNET, KITE_TESTNET] {
+            assert!(chain.network.starts_with("eip155:"));
+            assert!(chain.network["eip155:".len()..].parse::<u64>().is_ok());
+            assert!(chain.rpc_url.starts_with("https://"));
+            assert_eq!(chain.asset_address.len(), 42, "{}", chain.asset_address);
+            assert!(chain.asset_address.starts_with("0x"));
+            assert!(chain.asset_address[2..].chars().all(|c| c.is_ascii_hexdigit()));
+            assert!(!chain.eip712_name.is_empty() && !chain.eip712_version.is_empty());
+        }
+        assert_ne!(KITE_MAINNET.network, KITE_TESTNET.network);
+        assert_ne!(KITE_MAINNET.asset_address, KITE_TESTNET.asset_address);
+        assert_eq!((KITE_MAINNET.asset_decimals, KITE_TESTNET.asset_decimals), (6, 18));
+        assert_eq!(KITE_MAINNET.network, "eip155:2366");
+        assert_eq!(KITE_TESTNET.network, "eip155:2368");
+    }
+
+    #[test]
+    fn facilitator_url_keeps_its_version_prefix() {
+        assert!(FACILITATOR_URL.starts_with("https://"));
+        assert!(FACILITATOR_URL.ends_with("/v2"), "the SDKs append /verify to this base");
+    }
+
+    #[test]
+    fn parses_at_the_smallest_representable_unit() {
+        assert_eq!(KITE_MAINNET.parse_price("0.000001").unwrap().amount, "1");
+        assert_eq!(KITE_TESTNET.parse_price("0.000000000000000001").unwrap().amount, "1");
+    }
+
+    #[test]
+    fn accepts_exactly_the_maximum_number_of_decimals_and_no_more() {
+        assert!(KITE_MAINNET.parse_price("1.123456").is_ok());
+        assert!(matches!(
+            KITE_MAINNET.parse_price("1.1234567").unwrap_err(),
+            KiteError::TooManyDecimals { decimals: 6, symbol: "USDC.e", .. }
+        ));
+        assert!(KITE_TESTNET.parse_price("1.123456789012345678").is_ok());
+        assert!(matches!(
+            KITE_TESTNET.parse_price("1.1234567890123456789").unwrap_err(),
+            KiteError::TooManyDecimals { decimals: 18, symbol: "pieUSD", .. }
+        ));
+    }
+
+    #[test]
+    fn trailing_zero_decimals_beyond_the_limit_are_still_too_many() {
+        // "0.0000010" has 7 fractional digits even though the last is zero.
+        assert!(matches!(
+            KITE_MAINNET.parse_price("0.0000010").unwrap_err(),
+            KiteError::TooManyDecimals { .. }
+        ));
+    }
+
+    #[test]
+    fn integer_math_has_no_float_rounding_errors() {
+        // 0.1 + 0.2 style trouble: these would be off by one ulp as f64 * 1e18.
+        assert_eq!(KITE_TESTNET.parse_price("0.3").unwrap().amount, "300000000000000000");
+        assert_eq!(KITE_TESTNET.parse_price("0.1").unwrap().amount, "100000000000000000");
+        assert_eq!(KITE_TESTNET.parse_price("19.99").unwrap().amount, "19990000000000000000");
+        assert_eq!(KITE_MAINNET.parse_price("0.07").unwrap().amount, "70000");
+    }
+
+    #[test]
+    fn huge_values_do_not_overflow() {
+        let big = "123456789012345678901234567890";
+        assert_eq!(
+            KITE_MAINNET.parse_price(big).unwrap().amount,
+            format!("{big}000000")
+        );
+    }
+
+    #[test]
+    fn leading_zeros_are_normalised() {
+        assert_eq!(KITE_MAINNET.parse_price("007").unwrap().amount, "7000000");
+        assert_eq!(KITE_MAINNET.parse_price("0.5").unwrap().amount, "500000");
+        assert_eq!(KITE_MAINNET.parse_price("00.000001").unwrap().amount, "1");
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed_but_inner_whitespace_is_not() {
+        assert_eq!(KITE_MAINNET.parse_price("  0.5  ").unwrap().amount, "500000");
+        assert_eq!(KITE_MAINNET.parse_price(" $0.5 ").unwrap().amount, "500000");
+        for bad in ["$ 0.5", "0. 5", "1 000", "$\t1"] {
+            assert!(matches!(KITE_MAINNET.parse_price(bad), Err(KiteError::InvalidPrice(_))), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_lookalike_and_non_decimal_numerals() {
+        for bad in [
+            "$", "$$1", "$-1", "+1", "1e3", "1E3", "0x10", "1_000", "1,5", "1.5.0", "١٢٣", "１２３", "NaN",
+            "inf", "--1", "1.", ".", "..", "0..1", "1/2",
+        ] {
+            assert!(
+                matches!(KITE_MAINNET.parse_price(bad), Err(KiteError::InvalidPrice(_))),
+                "expected InvalidPrice for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn errors_carry_the_original_input() {
+        assert_eq!(
+            KITE_MAINNET.parse_price("$abc").unwrap_err(),
+            KiteError::InvalidPrice("$abc".to_string())
+        );
+        assert_eq!(
+            KITE_MAINNET.parse_price("$0").unwrap_err(),
+            KiteError::BelowOneUnit { price: "$0".to_string(), symbol: "USDC.e" }
+        );
+        // TooManyDecimals reports the text *after* the '$' is removed.
+        assert_eq!(
+            KITE_MAINNET.parse_price("$0.0000001").unwrap_err(),
+            KiteError::TooManyDecimals { price: "0.0000001".to_string(), decimals: 6, symbol: "USDC.e" }
+        );
+    }
+
+    #[test]
+    fn error_messages_are_human_readable() {
+        assert_eq!(
+            KiteError::UnknownNetwork("devnet".into()).to_string(),
+            "unknown KITE_NETWORK \"devnet\" (want mainnet or testnet)"
+        );
+        assert_eq!(
+            KiteError::InvalidPrice("x".into()).to_string(),
+            "price must be a positive decimal, got \"x\""
+        );
+        assert_eq!(
+            KiteError::TooManyDecimals { price: "0.1234567".into(), decimals: 6, symbol: "USDC.e" }.to_string(),
+            "price 0.1234567 has more than 6 decimals (USDC.e)"
+        );
+        assert_eq!(
+            KiteError::BelowOneUnit { price: "0".into(), symbol: "pieUSD" }.to_string(),
+            "price 0 is below one unit of pieUSD"
+        );
+    }
+
+    #[test]
+    fn asset_amount_carries_the_eip712_domain_the_facilitator_needs() {
+        let a = KITE_TESTNET.parse_price("1").unwrap();
+        assert_eq!(a.asset, KITE_TESTNET.asset_address);
+        assert_eq!(a.extra, serde_json::json!({ "name": "pieUSD", "version": "1" }));
+        assert_eq!(a.amount, "1000000000000000000");
+    }
+
+    #[test]
+    fn plain_decimal_predicate_edge_cases() {
+        for ok in ["0", "1", "10", "0.1", "10.01", "000", "0.000"] {
+            assert!(is_plain_positive_decimal(ok), "{ok}");
+        }
+        for bad in ["", ".", "1.", ".1", "1.1.1", "a", "1a", "-1", " 1", "1 "] {
+            assert!(!is_plain_positive_decimal(bad), "{bad:?}");
+        }
+    }
 }

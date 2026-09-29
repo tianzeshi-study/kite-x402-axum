@@ -197,3 +197,85 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for `proxy` that need no network: the request never leaves
+    //! the process when the upstream is a refused port, so we can check the
+    //! early-return branches, the `Debug` redaction and the constants.
+    //! Forwarding behaviour against a live upstream is in
+    //! `tests/proxy_forwarding.rs`.
+
+    use super::*;
+    use axum::{body::Body, routing::any, Router};
+    use tower::ServiceExt;
+
+    fn cfg(auth_value: &str) -> UpstreamConfig {
+        UpstreamConfig {
+            http: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:1".to_string(), // nothing listens here
+            auth_header: "X-Api-Key".to_string(),
+            auth_value: auth_value.to_string(),
+        }
+    }
+
+    fn app(cfg: UpstreamConfig) -> Router {
+        Router::new().route("/{*path}", any(proxy)).with_state(Arc::new(cfg))
+    }
+
+    #[test]
+    fn hop_by_hop_list_is_lowercase_and_complete() {
+        for h in ["connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "host", "content-length"] {
+            assert!(HOP_BY_HOP.contains(&h), "{h}");
+        }
+        assert!(HOP_BY_HOP.iter().all(|h| *h == h.to_ascii_lowercase()));
+    }
+
+    #[test]
+    fn request_body_cap_is_sixteen_mebibytes() {
+        assert_eq!(MAX_REQUEST_BODY_BYTES, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn debug_never_prints_the_credential() {
+        let dbg = format!("{:?}", cfg("s3cr3t-value"));
+        assert!(!dbg.contains("s3cr3t-value"));
+        assert!(dbg.contains("[redacted]") && dbg.contains("X-Api-Key") && dbg.contains("127.0.0.1:1"));
+        assert!(format!("{:?}", cfg("")).contains("[empty]"));
+    }
+
+    #[test]
+    fn config_is_cloneable() {
+        let c = cfg("v");
+        let d = c.clone();
+        assert_eq!((d.base_url, d.auth_header, d.auth_value), (c.base_url, c.auth_header, c.auth_value));
+    }
+
+    #[tokio::test]
+    async fn refused_upstream_is_a_502_with_error_and_detail() {
+        let resp = app(cfg("")).oneshot(axum::http::Request::get("/v1/x").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "upstream unreachable");
+        assert!(body["detail"].is_string());
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_rejected_with_413_before_any_upstream_call() {
+        // A refused upstream would give 502; getting 413 proves the body cap
+        // is enforced first.
+        let req = axum::http::Request::post("/v1/x")
+            .body(Body::from(vec![0u8; MAX_REQUEST_BODY_BYTES + 1]))
+            .unwrap();
+        let resp = app(cfg("")).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn unknown_methods_do_not_panic() {
+        let req = axum::http::Request::builder().method("PURGE").uri("/v1/x").body(Body::empty()).unwrap();
+        let resp = app(cfg("")).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY); // reached the (refused) upstream
+    }
+}
