@@ -10,10 +10,12 @@ on them.
 `cargo clippy` both ran clean outside this sandbox. `Cargo.toml` no longer
 pins `reqwest` to an exact version (`reqwest = "0.12"`, a normal range);
 that pin was only ever a workaround for building in this container. The
-`Cargo.lock` this sandbox generates locally (quinn/rand/idna_adapter/etc.
-downgraded to versions Rust 1.75 can compile) stays out of git — a
-contributor with a current toolchain gets normal, current dependency
-resolution.
+`Cargo.lock` this sandbox generated back then (quinn/rand/idna_adapter/etc.
+downgraded to versions Rust 1.75 can compile) was kept out of git. That is
+no longer the case: the lock file is committed and resolved with a current
+toolchain, and CI builds with `--locked`. The real minimum supported Rust
+version turned out to be 1.88 (set by `icu_*`, pulled in through `reqwest`),
+and `rust-version` in `Cargo.toml` now says so.
 
 Original context, kept for the record:
 
@@ -23,12 +25,12 @@ newer toolchain). Several transitive dependencies of `axum` 0.8 / `reqwest`
 0.12 (`litemap`, `zeroize`, `idna_adapter`, the `quinn`/`rand` stack used by
 reqwest's HTTP/3 support) now require Rust 1.81+ or the unstable
 `edition2024` feature in their newest published versions, which 1.75
-cannot build. `Cargo.lock` is (and stays) `.gitignore`d for exactly this
-reason.
+cannot build. (`Cargo.lock` was `.gitignore`d for exactly this reason; see
+the update above.)
 
 ## 2. Real testnet settlement against a live Kite Passport agent — not yet run
 
-Everything up to the facilitator boundary is covered by the 219 automated
+Everything up to the facilitator boundary is covered by the 235 automated
 unit, integration and end-to-end tests (mock facilitator + mock upstream +
 the real service binary spawned as a subprocess — see the root README's
 "Running the tests" section). Nobody has yet run this template
@@ -68,10 +70,10 @@ agents expect.
 
 ## 4. ~~`cargo clippy` has not been run~~ — resolved
 
-Ran clean on a real Rust toolchain (see item 1's update). The CI job added
-in this change (`template-rust` in `.github/workflows/ci.yml`) runs
-`cargo clippy --workspace --all-targets -- -D warnings` on every PR going
-forward so this doesn't silently regress.
+Ran clean on a real Rust toolchain (see item 1's update). The `clippy` job in
+`.github/workflows/ci.yml` runs
+`cargo clippy --workspace --all-targets --locked -- -D warnings` on every PR so
+this doesn't silently regress.
 
 ## 5. No `services/` manifest entry
 
@@ -85,17 +87,15 @@ matching `services/` entry either. Adding a deployed service on top of this
 template (its own `service.yaml`, a real upstream, a real wallet) is a
 separate follow-up, not part of "add a Rust/Axum template."
 
-## 7. Four proxy edge cases documented as failing tests
+## 7. ~~Four proxy edge cases documented as failing tests~~ — resolved
 
-Found while writing the test suite; each is a `#[ignore]`d test in
-`kite-x402-axum/tests/known_issues.rs` asserting the desired behavior
-(double `/v1` stripping, `content-encoding` surviving without
-decompression, `X-PAYMENT` leaking to the upstream, and an injected
-upstream credential following cross-host redirects). See the root
-README's "Known-issue regression tests" section for the full writeup of
-each. None are exploitable from the buyer's side of the payment gate, but
-1 and 3 are worth fixing before use with a `/v1`-prefixed upstream or
-clients still on the legacy `X-PAYMENT` header.
+The four proxy defects (double `/v1` stripping, `content-encoding` dropped
+from an encoded body, `X-PAYMENT` leaking to the upstream, an injected
+credential following cross-host redirects) are fixed, and their tests are now
+ordinary regression tests in `kite-x402-axum/tests/proxy_regressions.rs`. A
+fifth defect found while fixing them — `..` / `%2e%2e` path segments escaping
+the upstream base path — is fixed and covered there too. See the root README's
+"Proxy regression tests" section.
 
 ## 6. Payment-requirements matching is single-option only
 

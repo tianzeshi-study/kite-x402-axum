@@ -34,7 +34,11 @@ const PAY_TO: &str = "0xE2E0000000000000000000000000000000000E2E";
 // ---------------------------------------------------------------------------
 
 fn free_port() -> u16 {
-    StdListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    StdListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// A running service process, killed on drop so a failing test never leaks it.
@@ -58,7 +62,11 @@ impl Service {
     }
 
     async fn start(env: Vec<(String, String)>) -> Service {
-        let port: u16 = env.iter().find(|(k, _)| k == "PORT").map(|(_, v)| v.parse().unwrap()).unwrap();
+        let port: u16 = env
+            .iter()
+            .find(|(k, _)| k == "PORT")
+            .map(|(_, v)| v.parse().unwrap())
+            .unwrap();
         let child = Command::new(BIN)
             .env_clear()
             .envs(env)
@@ -93,12 +101,18 @@ impl Service {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
-                panic!("service exited during startup with {status}: {}", self.stderr_so_far());
+                panic!(
+                    "service exited during startup with {status}: {}",
+                    self.stderr_so_far()
+                );
             }
             if self.http.get(self.url("/healthz")).send().await.is_ok() {
                 return;
             }
-            assert!(Instant::now() < deadline, "service did not become ready in 20s");
+            assert!(
+                Instant::now() < deadline,
+                "service did not become ready in 20s"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
@@ -142,14 +156,20 @@ impl Service {
     /// Asks the process to stop like a container runtime would and waits for it.
     #[cfg(unix)]
     fn terminate(&mut self) -> ExitStatus {
-        let status = Command::new("kill").args(["-TERM", &self.child.id().to_string()]).status().unwrap();
+        let status = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status()
+            .unwrap();
         assert!(status.success());
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(s) = self.child.try_wait().unwrap() {
                 return s;
             }
-            assert!(Instant::now() < deadline, "service did not stop within 10s of SIGTERM");
+            assert!(
+                Instant::now() < deadline,
+                "service did not stop within 10s of SIGTERM"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -163,7 +183,12 @@ impl Drop for Service {
 }
 
 fn header_json(resp: &reqwest::Response, name: &str) -> Value {
-    let raw = resp.headers().get(name).unwrap_or_else(|| panic!("missing {name}")).to_str().unwrap();
+    let raw = resp
+        .headers()
+        .get(name)
+        .unwrap_or_else(|| panic!("missing {name}"))
+        .to_str()
+        .unwrap();
     serde_json::from_slice(&STANDARD.decode(raw).unwrap()).unwrap()
 }
 
@@ -176,7 +201,10 @@ fn run_expecting_failure(env: Vec<(&str, &str)>) -> (ExitStatus, String) {
         .stderr(Stdio::piped())
         .output()
         .expect("spawn service binary");
-    (out.status, String::from_utf8_lossy(&out.stderr).into_owned())
+    (
+        out.status,
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 // ===========================================================================
@@ -190,7 +218,10 @@ async fn healthz_is_free_and_never_contacts_the_backends() {
 
     let resp = svc.get("/healthz").await;
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.json::<Value>().await.unwrap(), json!({ "status": "ok" }));
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({ "status": "ok" })
+    );
     assert!(mocks.timeline().is_empty());
 }
 
@@ -214,13 +245,20 @@ async fn full_pay_per_call_flow_over_real_http() {
     assert_eq!(unpaid.status(), 402);
     assert_eq!(unpaid.headers()["cache-control"], "no-store");
     let challenge = header_json(&unpaid, "payment-required");
-    assert_eq!(challenge["resource"]["url"], "/v1/forecast?latitude=52.52&longitude=13.41");
+    assert_eq!(
+        challenge["resource"]["url"],
+        "/v1/forecast?latitude=52.52&longitude=13.41"
+    );
     assert_eq!(challenge["accepts"][0]["payTo"], PAY_TO);
     assert_eq!(challenge["accepts"][0]["network"], "eip155:2368");
-    assert!(mocks.timeline().is_empty(), "a challenge must be free of side effects");
+    assert!(
+        mocks.timeline().is_empty(),
+        "a challenge must be free of side effects"
+    );
 
     // 2. paid request -> 200 + receipt + upstream body
-    let reqs: PaymentRequirements = serde_json::from_value(challenge["accepts"][0].clone()).unwrap();
+    let reqs: PaymentRequirements =
+        serde_json::from_value(challenge["accepts"][0].clone()).unwrap();
     let paid = svc
         .http
         .get(svc.url("/v1/forecast?latitude=52.52&longitude=13.41"))
@@ -234,7 +272,10 @@ async fn full_pay_per_call_flow_over_real_http() {
     assert_eq!(receipt["success"], true);
     assert_eq!(receipt["transaction"], TX_HASH);
     assert_eq!(receipt["payer"], PAYER);
-    assert_eq!(paid.json::<Value>().await.unwrap(), json!({ "upstream": true }));
+    assert_eq!(
+        paid.json::<Value>().await.unwrap(),
+        json!({ "upstream": true })
+    );
 
     // 3. side effects, in the right order, exactly once each
     assert_eq!(mocks.timeline(), vec!["verify", "upstream", "settle"]);
@@ -267,7 +308,11 @@ async fn post_bodies_and_headers_travel_through_the_whole_stack() {
     assert_eq!(seen.method, "POST");
     assert_eq!(seen.body, br#"{"sku":"A1","qty":3}"#);
     assert_eq!(seen.header("x-trace"), Some("e2e-42"));
-    assert_eq!(seen.header("payment-signature"), None, "the payment must not reach the upstream");
+    assert_eq!(
+        seen.header("payment-signature"),
+        None,
+        "the payment must not reach the upstream"
+    );
 }
 
 #[tokio::test]
@@ -317,19 +362,27 @@ async fn an_unreachable_upstream_is_a_502_and_never_charged() {
 
     let resp = svc.pay_get("/v1/forecast").await;
     assert_eq!(resp.status(), 502);
-    assert_eq!(resp.json::<Value>().await.unwrap()["error"], "upstream unreachable");
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["error"],
+        "upstream unreachable"
+    );
     assert_eq!(mocks.facilitator.settle_count(), 0);
 }
 
 #[tokio::test]
 async fn a_rejected_payment_is_a_402_and_the_upstream_is_never_called() {
     let mocks = Mocks::start().await;
-    mocks.facilitator.set_verify(verify_invalid(Some("insufficient_funds")));
+    mocks
+        .facilitator
+        .set_verify(verify_invalid(Some("insufficient_funds")));
     let svc = Service::start_with(&mocks).await;
 
     let resp = svc.pay_get("/v1/forecast").await;
     assert_eq!(resp.status(), 402);
-    assert_eq!(header_json(&resp, "payment-required")["error"], "insufficient_funds");
+    assert_eq!(
+        header_json(&resp, "payment-required")["error"],
+        "insufficient_funds"
+    );
     assert_eq!(mocks.upstream.count(), 0);
     assert_eq!(mocks.facilitator.settle_count(), 0);
 }
@@ -337,12 +390,17 @@ async fn a_rejected_payment_is_a_402_and_the_upstream_is_never_called() {
 #[tokio::test]
 async fn a_failed_settlement_withholds_the_upstream_data() {
     let mocks = Mocks::start().await;
-    mocks.facilitator.set_settle(settle_failed("nonce_already_used", "eip155:2368"));
+    mocks
+        .facilitator
+        .set_settle(settle_failed("nonce_already_used", "eip155:2368"));
     let svc = Service::start_with(&mocks).await;
 
     let resp = svc.pay_get("/v1/forecast").await;
     assert_eq!(resp.status(), 402);
-    assert_eq!(header_json(&resp, "payment-response")["errorReason"], "nonce_already_used");
+    assert_eq!(
+        header_json(&resp, "payment-response")["errorReason"],
+        "nonce_already_used"
+    );
     assert_eq!(resp.json::<Value>().await.unwrap(), json!({}));
 }
 
@@ -382,7 +440,10 @@ async fn a_payment_for_the_wrong_amount_is_rejected_without_calling_the_facilita
         .unwrap();
 
     assert_eq!(resp.status(), 402);
-    assert_eq!(header_json(&resp, "payment-required")["error"], "No matching payment requirements");
+    assert_eq!(
+        header_json(&resp, "payment-required")["error"],
+        "No matching payment requirements"
+    );
     assert!(mocks.timeline().is_empty());
 }
 
@@ -454,7 +515,10 @@ async fn blank_optional_variables_fall_back_to_their_defaults() {
     let svc = Service::start(env).await;
 
     let reqs = svc.requirements("/v1/x").await;
-    assert_eq!((reqs.network.as_str(), reqs.amount.as_str()), ("eip155:2366", "1000"));
+    assert_eq!(
+        (reqs.network.as_str(), reqs.amount.as_str()),
+        ("eip155:2366", "1000")
+    );
 }
 
 #[tokio::test]
@@ -465,7 +529,10 @@ async fn service_description_appears_in_the_challenge() {
     let svc = Service::start(env).await;
 
     let resp = svc.get("/v1/x").await;
-    assert_eq!(header_json(&resp, "payment-required")["resource"]["description"], "Weather forecasts");
+    assert_eq!(
+        header_json(&resp, "payment-required")["resource"]["description"],
+        "Weather forecasts"
+    );
 }
 
 #[tokio::test]
@@ -496,7 +563,10 @@ async fn upstream_credential_is_injected_under_the_configured_header() {
         .await
         .unwrap();
 
-    assert_eq!(mocks.upstream.last().header_all("x-api-key"), vec!["k-12345"]);
+    assert_eq!(
+        mocks.upstream.last().header_all("x-api-key"),
+        vec!["k-12345"]
+    );
 }
 
 #[tokio::test]
@@ -507,7 +577,10 @@ async fn upstream_credential_defaults_to_the_authorization_header() {
     let svc = Service::start(env).await;
 
     svc.pay_get("/v1/x").await;
-    assert_eq!(mocks.upstream.last().header("authorization"), Some("Bearer tok"));
+    assert_eq!(
+        mocks.upstream.last().header("authorization"),
+        Some("Bearer tok")
+    );
 }
 
 #[tokio::test]
@@ -530,7 +603,11 @@ async fn upstream_url_trailing_slash_is_trimmed() {
     let svc = Service::start(env).await;
 
     svc.pay_get("/v1/forecast").await;
-    assert_eq!(mocks.upstream.last().path_and_query, "/forecast", "no '//forecast'");
+    assert_eq!(
+        mocks.upstream.last().path_and_query,
+        "/forecast",
+        "no '//forecast'"
+    );
 }
 
 #[tokio::test]
@@ -547,7 +624,11 @@ async fn facilitator_url_is_used_verbatim_including_its_version_prefix() {
     let svc = Service::start(env).await;
 
     let resp = svc.pay_get("/v1/forecast").await;
-    assert_eq!(resp.status(), 402, "a wrong facilitator path must never let a request through");
+    assert_eq!(
+        resp.status(),
+        402,
+        "a wrong facilitator path must never let a request through"
+    );
     assert_eq!(mocks.upstream.count(), 0);
 }
 
@@ -563,7 +644,10 @@ async fn an_invalid_price_starts_fine_but_fails_every_metered_request_with_500()
     assert_eq!(svc.get("/healthz").await.status(), 200);
     let resp = svc.get("/v1/x").await;
     assert_eq!(resp.status(), 500);
-    assert!(resp.json::<Value>().await.unwrap()["error"].as_str().unwrap().contains("invalid PRICE_USD"));
+    assert!(resp.json::<Value>().await.unwrap()["error"]
+        .as_str()
+        .unwrap()
+        .contains("invalid PRICE_USD"));
 }
 
 // ===========================================================================
@@ -572,7 +656,10 @@ async fn an_invalid_price_starts_fine_but_fails_every_metered_request_with_500()
 
 #[test]
 fn refuses_to_start_without_pay_to() {
-    let (status, stderr) = run_expecting_failure(vec![("UPSTREAM_URL", "http://localhost:1"), ("RUST_LOG", "off")]);
+    let (status, stderr) = run_expecting_failure(vec![
+        ("UPSTREAM_URL", "http://localhost:1"),
+        ("RUST_LOG", "off"),
+    ]);
     assert!(!status.success());
     assert!(stderr.contains("PAY_TO is required"), "{stderr}");
 }
@@ -608,7 +695,10 @@ fn refuses_a_non_numeric_port() {
             ("RUST_LOG", "off"),
         ]);
         assert!(!status.success(), "PORT={bad:?}");
-        assert!(stderr.contains("PORT must be a number"), "PORT={bad:?}: {stderr}");
+        assert!(
+            stderr.contains("PORT must be a number"),
+            "PORT={bad:?}: {stderr}"
+        );
     }
 }
 
@@ -639,7 +729,10 @@ async fn sigterm_shuts_the_service_down_gracefully_with_exit_code_zero() {
 
     let status = svc.terminate();
     assert!(status.success(), "expected a clean exit, got {status}");
-    assert!(svc.http.get(svc.url("/healthz")).send().await.is_err(), "the port must be closed");
+    assert!(
+        svc.http.get(svc.url("/healthz")).send().await.is_err(),
+        "the port must be closed"
+    );
 }
 
 #[cfg(unix)]
@@ -666,14 +759,24 @@ async fn an_in_flight_paid_request_completes_before_shutdown() {
     // Wait until the upstream has the request, then ask the service to stop.
     let deadline = Instant::now() + Duration::from_secs(5);
     while mocks.upstream.count() == 0 {
-        assert!(Instant::now() < deadline, "request never reached the upstream");
+        assert!(
+            Instant::now() < deadline,
+            "request never reached the upstream"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let status = svc.terminate();
 
     let resp = in_flight.await.unwrap();
-    assert_eq!(resp.status(), 200, "graceful shutdown must let the paid request finish");
-    assert!(resp.headers().contains_key("payment-response"), "and settle it");
+    assert_eq!(
+        resp.status(),
+        200,
+        "graceful shutdown must let the paid request finish"
+    );
+    assert!(
+        resp.headers().contains_key("payment-response"),
+        "and settle it"
+    );
     assert_eq!(mocks.facilitator.settle_count(), 1);
     assert!(status.success());
 }

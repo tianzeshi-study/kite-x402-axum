@@ -29,7 +29,10 @@ async fn forwards_path_and_query_with_v1_prefix_stripped() {
     let resp = send(&app, get_req("/v1/forecast?latitude=52.52&longitude=13.41")).await;
 
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(mocks.upstream.last().path_and_query, "/forecast?latitude=52.52&longitude=13.41");
+    assert_eq!(
+        mocks.upstream.last().path_and_query,
+        "/forecast?latitude=52.52&longitude=13.41"
+    );
 }
 
 #[tokio::test]
@@ -38,7 +41,10 @@ async fn forwards_deep_paths_trailing_slashes_and_encoded_characters_untouched()
         ("/v1/a/b/c", "/a/b/c"),
         ("/v1/forecast/", "/forecast/"),
         ("/v1/a%20b/c", "/a%20b/c"),
-        ("/v1/search?q=a%20b&x=%E2%9C%93", "/search?q=a%20b&x=%E2%9C%93"),
+        (
+            "/v1/search?q=a%20b&x=%E2%9C%93",
+            "/search?q=a%20b&x=%E2%9C%93",
+        ),
         ("/v1/list?tag=a&tag=b", "/list?tag=a&tag=b"),
     ];
     for (incoming, expected) in cases {
@@ -74,13 +80,21 @@ async fn forwards_request_bodies_byte_for_byte() {
     let binary: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
     send(
         &app,
-        req_with("POST", "/v1/upload", &[("content-type", "application/octet-stream")], binary.clone()),
+        req_with(
+            "POST",
+            "/v1/upload",
+            &[("content-type", "application/octet-stream")],
+            binary.clone(),
+        ),
     )
     .await;
 
     let seen = mocks.upstream.last();
     assert_eq!(seen.body, binary);
-    assert_eq!(seen.header("content-type"), Some("application/octet-stream"));
+    assert_eq!(
+        seen.header("content-type"),
+        Some("application/octet-stream")
+    );
     assert_eq!(seen.header("content-length"), Some("10000"));
 }
 
@@ -89,7 +103,12 @@ async fn forwards_json_post_bodies() {
     let (mocks, app) = proxied(|_| {}).await;
     send(
         &app,
-        req_with("POST", "/v1/echo", &[("content-type", "application/json")], br#"{"a":[1,2,3]}"#.to_vec()),
+        req_with(
+            "POST",
+            "/v1/echo",
+            &[("content-type", "application/json")],
+            br#"{"a":[1,2,3]}"#.to_vec(),
+        ),
     )
     .await;
     let seen: Value = serde_json::from_slice(&mocks.upstream.last().body).unwrap();
@@ -114,7 +133,11 @@ async fn forwards_ordinary_headers_including_multi_valued_ones() {
     let mut req = req_with(
         "GET",
         "/v1/x",
-        &[("accept", "application/json"), ("x-custom", "one"), ("user-agent", "tester/1.0")],
+        &[
+            ("accept", "application/json"),
+            ("x-custom", "one"),
+            ("user-agent", "tester/1.0"),
+        ],
         vec![],
     );
     req.headers_mut().append("x-multi", header_value(b"a"));
@@ -162,20 +185,40 @@ async fn never_forwards_the_payment_signature_header() {
     let (mocks, app) = proxied(|_| {}).await;
     send(
         &app,
-        req_with("GET", "/v1/x", &[("PAYMENT-SIGNATURE", "secret-signed-payload")], vec![]),
+        req_with(
+            "GET",
+            "/v1/x",
+            &[("PAYMENT-SIGNATURE", "secret-signed-payload")],
+            vec![],
+        ),
     )
     .await;
 
     let seen = mocks.upstream.last();
     assert_eq!(seen.header("payment-signature"), None);
-    assert!(!seen.headers.iter().any(|(_, v)| v.contains("secret-signed-payload")));
+    assert!(!seen
+        .headers
+        .iter()
+        .any(|(_, v)| v.contains("secret-signed-payload")));
 }
 
 #[tokio::test]
 async fn client_authorization_is_forwarded_when_no_upstream_credential_is_configured() {
     let (mocks, app) = proxied(|_| {}).await;
-    send(&app, req_with("GET", "/v1/x", &[("authorization", "Bearer client-token")], vec![])).await;
-    assert_eq!(mocks.upstream.last().header("authorization"), Some("Bearer client-token"));
+    send(
+        &app,
+        req_with(
+            "GET",
+            "/v1/x",
+            &[("authorization", "Bearer client-token")],
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(
+        mocks.upstream.last().header("authorization"),
+        Some("Bearer client-token")
+    );
 }
 
 #[tokio::test]
@@ -186,7 +229,10 @@ async fn configured_upstream_credential_is_injected() {
     })
     .await;
     send(&app, get_req("/v1/x")).await;
-    assert_eq!(mocks.upstream.last().header("x-api-key"), Some("upstream-secret"));
+    assert_eq!(
+        mocks.upstream.last().header("x-api-key"),
+        Some("upstream-secret")
+    );
 }
 
 #[tokio::test]
@@ -195,10 +241,22 @@ async fn configured_upstream_credential_overrides_a_client_supplied_one() {
         c.auth_value = "Bearer upstream-secret".into();
     })
     .await;
-    send(&app, req_with("GET", "/v1/x", &[("Authorization", "Bearer evil-client")], vec![])).await;
+    send(
+        &app,
+        req_with(
+            "GET",
+            "/v1/x",
+            &[("Authorization", "Bearer evil-client")],
+            vec![],
+        ),
+    )
+    .await;
 
     let seen = mocks.upstream.last();
-    assert_eq!(seen.header_all("authorization"), vec!["Bearer upstream-secret"]);
+    assert_eq!(
+        seen.header_all("authorization"),
+        vec!["Bearer upstream-secret"]
+    );
 }
 
 #[tokio::test]
@@ -238,7 +296,10 @@ async fn passes_status_and_body_through_for_any_upstream_status() {
         mocks.upstream.set_reply(reply.clone());
         // Redirect statuses are exercised in known_issues.rs; keep the client
         // from following the 301 here.
-        let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
         let mut cfg = upstream_cfg(&mocks.upstream_url);
         cfg.http = client;
         let app = build_proxy_only(cfg);
@@ -253,15 +314,26 @@ async fn passes_status_and_body_through_for_any_upstream_status() {
 async fn passes_response_headers_through_including_repeated_ones() {
     let (mocks, app) = proxied(|_| {}).await;
     let mut reply = UpstreamReply::json(200);
-    reply.headers.push(("x-ratelimit-remaining".into(), "41".into()));
-    reply.headers.push(("set-cookie".into(), "a=1; Path=/".into()));
-    reply.headers.push(("set-cookie".into(), "b=2; Path=/".into()));
+    reply
+        .headers
+        .push(("x-ratelimit-remaining".into(), "41".into()));
+    reply
+        .headers
+        .push(("set-cookie".into(), "a=1; Path=/".into()));
+    reply
+        .headers
+        .push(("set-cookie".into(), "b=2; Path=/".into()));
     mocks.upstream.set_reply(reply);
 
     let resp = send(&app, get_req("/v1/x")).await;
     assert_eq!(resp.headers()["x-ratelimit-remaining"], "41");
     assert_eq!(resp.headers()["content-type"], "application/json");
-    let cookies: Vec<_> = resp.headers().get_all("set-cookie").iter().map(|v| v.to_str().unwrap()).collect();
+    let cookies: Vec<_> = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap())
+        .collect();
     assert_eq!(cookies, vec!["a=1; Path=/", "b=2; Path=/"]);
 }
 
@@ -269,7 +341,9 @@ async fn passes_response_headers_through_including_repeated_ones() {
 async fn strips_hop_by_hop_headers_from_the_response() {
     let (mocks, app) = proxied(|_| {}).await;
     let mut reply = UpstreamReply::json(200);
-    reply.headers.push(("keep-alive".into(), "timeout=5".into()));
+    reply
+        .headers
+        .push(("keep-alive".into(), "timeout=5".into()));
     reply.headers.push(("x-kept".into(), "yes".into()));
     mocks.upstream.set_reply(reply);
 
@@ -315,7 +389,10 @@ async fn slow_upstream_hits_the_client_timeout_and_is_a_502() {
     mocks.upstream.set_reply(reply);
 
     let mut cfg = upstream_cfg(&mocks.upstream_url);
-    cfg.http = reqwest::Client::builder().timeout(Duration::from_millis(100)).build().unwrap();
+    cfg.http = reqwest::Client::builder()
+        .timeout(Duration::from_millis(100))
+        .build()
+        .unwrap();
     let app = build_proxy_only(cfg);
 
     let resp = send(&app, get_req("/v1/x")).await;
@@ -330,7 +407,10 @@ async fn oversized_request_body_is_a_413_and_never_reaches_upstream() {
     let resp = send(&app, req_with("POST", "/v1/upload", &[], too_big)).await;
 
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(body_json(resp).await["error"], "request body too large to proxy");
+    assert_eq!(
+        body_json(resp).await["error"],
+        "request body too large to proxy"
+    );
     assert_eq!(mocks.upstream.count(), 0);
 }
 

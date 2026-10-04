@@ -20,7 +20,7 @@ use kite_x402_axum::{
     facilitator::FacilitatorClient,
     kite::{kite_chain_by_name, FACILITATOR_URL},
     middleware::{x402_payment, PaymentConfig},
-    proxy::{proxy, UpstreamConfig},
+    proxy::{proxy, same_origin_redirect_policy, UpstreamConfig},
 };
 use serde_json::json;
 
@@ -69,8 +69,11 @@ async fn main() {
         "Configured kite-x402 wrapper"
     );
 
+    // Never follow a redirect to another host: the injected upstream
+    // credential would go with it. See `same_origin_redirect_policy`.
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(same_origin_redirect_policy())
         .build()
         .expect("reqwest client");
 
@@ -314,17 +317,16 @@ mod tests {
     #[tokio::test]
     async fn logger_does_not_alter_headers_or_body() {
         let app = Router::new()
-            .route(
-                "/h",
-                get(|| async { ([("x-thing", "1")], "payload") }),
-            )
+            .route("/h", get(|| async { ([("x-thing", "1")], "payload") }))
             .layer(middleware::from_fn(http_request_logger));
         let res = app
             .oneshot(Request::builder().uri("/h").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(res.headers()["x-thing"], "1");
-        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(&bytes[..], b"payload");
     }
 

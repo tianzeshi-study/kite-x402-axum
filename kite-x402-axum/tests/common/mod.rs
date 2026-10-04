@@ -29,7 +29,7 @@ use kite_x402_axum::{
     facilitator::FacilitatorClient,
     kite::{KiteChain, KITE_TESTNET},
     middleware::{x402_payment, PaymentConfig},
-    proxy::{proxy, UpstreamConfig},
+    proxy::{proxy, same_origin_redirect_policy, UpstreamConfig},
     types::{PaymentPayload, PaymentRequirements},
 };
 use serde_json::{json, Value};
@@ -122,7 +122,9 @@ impl MockFacilitator {
 async fn render(reply: Reply) -> Response {
     match reply {
         Reply::Json(v) => Json(v).into_response(),
-        Reply::Raw { status, body } => (StatusCode::from_u16(status).unwrap(), body).into_response(),
+        Reply::Raw { status, body } => {
+            (StatusCode::from_u16(status).unwrap(), body).into_response()
+        }
         Reply::Delayed(d, v) => {
             tokio::time::sleep(d).await;
             Json(v).into_response()
@@ -130,14 +132,20 @@ async fn render(reply: Reply) -> Response {
     }
 }
 
-async fn verify_handler(State(s): State<Arc<MockFacilitator>>, Json(body): Json<Value>) -> Response {
+async fn verify_handler(
+    State(s): State<Arc<MockFacilitator>>,
+    Json(body): Json<Value>,
+) -> Response {
     s.timeline.lock().unwrap().push("verify".into());
     s.verify_requests.lock().unwrap().push(body);
     let reply = s.verify_reply.lock().unwrap().clone();
     render(reply).await
 }
 
-async fn settle_handler(State(s): State<Arc<MockFacilitator>>, Json(body): Json<Value>) -> Response {
+async fn settle_handler(
+    State(s): State<Arc<MockFacilitator>>,
+    Json(body): Json<Value>,
+) -> Response {
     s.timeline.lock().unwrap().push("settle".into());
     s.settle_requests.lock().unwrap().push(body);
     let reply = s.settle_reply.lock().unwrap().clone();
@@ -243,7 +251,12 @@ async fn upstream_handler(State(s): State<Arc<MockUpstream>>, req: Request) -> R
         headers: parts
             .headers
             .iter()
-            .map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_string(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
             .collect(),
         body,
     };
@@ -305,9 +318,20 @@ impl Mocks {
                 .with_state(facilitator.clone()),
         )
         .await;
-        let upstream_url = serve(Router::new().fallback(upstream_handler).with_state(upstream.clone())).await;
+        let upstream_url = serve(
+            Router::new()
+                .fallback(upstream_handler)
+                .with_state(upstream.clone()),
+        )
+        .await;
 
-        Self { facilitator, upstream, facilitator_url, upstream_url, timeline }
+        Self {
+            facilitator,
+            upstream,
+            facilitator_url,
+            upstream_url,
+            timeline,
+        }
     }
 
     pub fn timeline(&self) -> Vec<String> {
@@ -316,7 +340,11 @@ impl Mocks {
 
     /// The app under test with default options, wired to these mocks.
     pub fn app(&self) -> Router {
-        build_app(&self.facilitator_url, &self.upstream_url, &AppOptions::default())
+        build_app(
+            &self.facilitator_url,
+            &self.upstream_url,
+            &AppOptions::default(),
+        )
     }
 
     pub fn app_with(&self, opts: &AppOptions) -> Router {
@@ -362,7 +390,7 @@ pub fn build_app(facilitator_url: &str, upstream_url: &str, o: &AppOptions) -> R
         facilitator,
     });
     let upstream_cfg = Arc::new(UpstreamConfig {
-        http: o.upstream_client.clone().unwrap_or_default(),
+        http: o.upstream_client.clone().unwrap_or_else(upstream_client),
         base_url: upstream_url.trim_end_matches('/').to_string(),
         auth_header: o.auth_header.clone(),
         auth_value: o.auth_value.clone(),
@@ -373,7 +401,10 @@ pub fn build_app(facilitator_url: &str, upstream_url: &str, o: &AppOptions) -> R
         .layer(middleware::from_fn_with_state(payment_cfg, x402_payment));
 
     Router::new()
-        .route("/healthz", get(|| async { Json(json!({ "status": "ok" })) }))
+        .route(
+            "/healthz",
+            get(|| async { Json(json!({ "status": "ok" })) }),
+        )
         .nest("/v1", paid)
 }
 
@@ -387,9 +418,17 @@ pub fn build_proxy_only(upstream_cfg: UpstreamConfig) -> Router {
     )
 }
 
+/// The HTTP client the service builds for the upstream (see `service/src/main.rs`).
+pub fn upstream_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(same_origin_redirect_policy())
+        .build()
+        .expect("reqwest client")
+}
+
 pub fn upstream_cfg(base_url: &str) -> UpstreamConfig {
     UpstreamConfig {
-        http: reqwest::Client::new(),
+        http: upstream_client(),
         base_url: base_url.trim_end_matches('/').to_string(),
         auth_header: "Authorization".into(),
         auth_value: String::new(),
@@ -417,7 +456,10 @@ pub async fn send(app: &Router, req: Request<Body>) -> Response {
 }
 
 pub async fn body_bytes(resp: Response) -> Vec<u8> {
-    to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()
+    to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec()
 }
 
 pub async fn body_json(resp: Response) -> Value {
@@ -443,7 +485,11 @@ pub fn requirements_of(resp: &Response) -> PaymentRequirements {
 /// Hits `uri` unpaid to learn the exact requirements the server wants.
 pub async fn probe_requirements(app: &Router, uri: &str) -> PaymentRequirements {
     let resp = send(app, get_req(uri)).await;
-    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED, "probe must be challenged");
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYMENT_REQUIRED,
+        "probe must be challenged"
+    );
     requirements_of(&resp)
 }
 
@@ -470,7 +516,11 @@ pub fn payment_header(requirements: &PaymentRequirements) -> String {
 pub async fn pay(app: &Router, method: &str, uri: &str, body: Vec<u8>) -> Response {
     let reqs = probe_requirements(app, uri).await;
     let header = payment_header(&reqs);
-    send(app, req_with(method, uri, &[("PAYMENT-SIGNATURE", &header)], body)).await
+    send(
+        app,
+        req_with(method, uri, &[("PAYMENT-SIGNATURE", &header)], body),
+    )
+    .await
 }
 
 pub async fn pay_get(app: &Router, uri: &str) -> Response {

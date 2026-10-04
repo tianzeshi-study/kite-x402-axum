@@ -14,11 +14,7 @@ pub struct ResourceInfo {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(
-        rename = "mimeType",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
 }
 
@@ -159,7 +155,14 @@ mod tests {
 
     #[test]
     fn requirements_reject_missing_required_fields() {
-        for missing in ["scheme", "network", "amount", "asset", "payTo", "maxTimeoutSeconds"] {
+        for missing in [
+            "scheme",
+            "network",
+            "amount",
+            "asset",
+            "payTo",
+            "maxTimeoutSeconds",
+        ] {
             let mut v = serde_json::to_value(requirements()).unwrap();
             v.as_object_mut().unwrap().remove(missing);
             assert!(
@@ -184,7 +187,10 @@ mod tests {
     fn requirements_ignore_unknown_fields() {
         let mut v = serde_json::to_value(requirements()).unwrap();
         v["somethingNew"] = json!(true);
-        assert_eq!(serde_json::from_value::<PaymentRequirements>(v).unwrap(), requirements());
+        assert_eq!(
+            serde_json::from_value::<PaymentRequirements>(v).unwrap(),
+            requirements()
+        );
     }
 
     #[test]
@@ -219,8 +225,15 @@ mod tests {
             json!({ "url": "/v1/x", "description": "d", "mimeType": "application/json" })
         );
 
-        let bare = ResourceInfo { url: "/v1/x".into(), description: None, mime_type: None };
-        assert_eq!(serde_json::to_value(&bare).unwrap(), json!({ "url": "/v1/x" }));
+        let bare = ResourceInfo {
+            url: "/v1/x".into(),
+            description: None,
+            mime_type: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap(),
+            json!({ "url": "/v1/x" })
+        );
     }
 
     #[test]
@@ -228,7 +241,11 @@ mod tests {
         let pr = PaymentRequired {
             x402_version: 2,
             error: Some("nope".into()),
-            resource: ResourceInfo { url: "/v1/x".into(), description: None, mime_type: None },
+            resource: ResourceInfo {
+                url: "/v1/x".into(),
+                description: None,
+                mime_type: None,
+            },
             accepts: vec![requirements()],
         };
         let json = serde_json::to_string(&pr).unwrap();
@@ -244,7 +261,11 @@ mod tests {
         let pr = PaymentRequired {
             x402_version: 2,
             error: None,
-            resource: ResourceInfo { url: "u".into(), description: None, mime_type: None },
+            resource: ResourceInfo {
+                url: "u".into(),
+                description: None,
+                mime_type: None,
+            },
             accepts: vec![],
         };
         assert!(serde_json::to_value(&pr).unwrap().get("error").is_none());
@@ -283,8 +304,14 @@ mod tests {
     #[test]
     fn payload_requires_accepted_and_payload() {
         let accepted = serde_json::to_value(requirements()).unwrap();
-        assert!(serde_json::from_value::<PaymentPayload>(json!({ "x402Version": 2, "payload": {} })).is_err());
-        assert!(serde_json::from_value::<PaymentPayload>(json!({ "x402Version": 2, "accepted": accepted })).is_err());
+        assert!(serde_json::from_value::<PaymentPayload>(
+            json!({ "x402Version": 2, "payload": {} })
+        )
+        .is_err());
+        assert!(serde_json::from_value::<PaymentPayload>(
+            json!({ "x402Version": 2, "accepted": accepted })
+        )
+        .is_err());
     }
 
     // ---- VerifyResponse ---------------------------------------------------
@@ -313,8 +340,10 @@ mod tests {
 
     #[test]
     fn verify_response_accepts_explicit_nulls() {
-        let v: VerifyResponse =
-            serde_json::from_value(json!({ "isValid": false, "invalidReason": null, "payer": null })).unwrap();
+        let v: VerifyResponse = serde_json::from_value(
+            json!({ "isValid": false, "invalidReason": null, "payer": null }),
+        )
+        .unwrap();
         assert!(v.invalid_reason.is_none() && v.payer.is_none());
     }
 
@@ -365,7 +394,13 @@ mod tests {
 
     #[test]
     fn settle_response_requires_transaction_and_network() {
-        assert!(serde_json::from_value::<SettleResponse>(json!({ "success": true, "network": "n" })).is_err());
-        assert!(serde_json::from_value::<SettleResponse>(json!({ "success": true, "transaction": "t" })).is_err());
+        assert!(serde_json::from_value::<SettleResponse>(
+            json!({ "success": true, "network": "n" })
+        )
+        .is_err());
+        assert!(serde_json::from_value::<SettleResponse>(
+            json!({ "success": true, "transaction": "t" })
+        )
+        .is_err());
     }
 }

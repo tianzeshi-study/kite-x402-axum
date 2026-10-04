@@ -1,12 +1,13 @@
 //! A minimal reverse proxy for paid requests: strips the `/v1` prefix,
-//! drops the `PAYMENT-SIGNATURE` header, injects an upstream credential if
-//! configured, and forwards everything else to `UPSTREAM_URL` as-is.
+//! drops the buyer's payment headers (`PAYMENT-SIGNATURE` / legacy
+//! `X-PAYMENT`), injects an upstream credential if configured, and forwards
+//! everything else to `UPSTREAM_URL` as-is.
 
 use std::sync::Arc;
 
 use axum::{
     body::{to_bytes, Body},
-    extract::{Request, State},
+    extract::{NestedPath, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -25,6 +26,15 @@ const HOP_BY_HOP: &[&str] = &[
     "content-length",
 ];
 
+/// Request headers that carry the buyer's signed payment authorization. The
+/// gate accepts both (`X-PAYMENT` is the legacy x402 v1 name), so the proxy
+/// must drop both: the upstream API has no business seeing a payment payload.
+const PAYMENT_HEADERS: &[&str] = &["payment-signature", "x-payment"];
+
+/// Maximum number of same-origin redirects [`same_origin_redirect_policy`]
+/// will follow.
+const MAX_REDIRECTS: usize = 10;
+
 /// Cap on how much of the incoming request body the proxy will buffer
 /// before forwarding it upstream (16 MiB). Large uploads are rare for a
 /// metered API wrapper; this bound exists so a misbehaving client can't
@@ -35,6 +45,12 @@ const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Clone)]
 pub struct UpstreamConfig {
     /// HTTP client used to call the upstream.
+    ///
+    /// Build it with `.redirect(`[`same_origin_redirect_policy()`]`)`: reqwest
+    /// only strips the standard `Authorization` / `Cookie` headers when a
+    /// redirect leaves the host, so with its default policy a custom
+    /// credential header (`UPSTREAM_AUTH_HEADER=X-Api-Key`) would be sent to
+    /// whatever host the upstream redirects to.
     pub http: reqwest::Client,
     /// Upstream origin with no trailing slash, e.g. `https://api.example.com`.
     pub base_url: String,
@@ -62,9 +78,85 @@ impl std::fmt::Debug for UpstreamConfig {
     }
 }
 
-/// Reverse-proxies a request to `cfg.base_url`, stripping the `/v1` prefix
-/// the route matched under. Use as the handler behind the `/v1/{*path}`
-/// route, inside the group guarded by [`crate::middleware::x402_payment`].
+/// A redirect policy that is safe to use together with an injected upstream
+/// credential: it follows redirects that stay on the same origin (e.g. a
+/// trailing-slash redirect, or an `http` → `https` upgrade of the same host)
+/// and stops at any other. When it stops, the upstream's `3xx` response is
+/// handed back to the buyer unchanged, so the credential never leaves the
+/// host it was configured for.
+pub fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        let follow = attempt
+            .previous()
+            .last()
+            .is_some_and(|from| is_same_origin_hop(from, attempt.url()));
+        if follow {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+/// `true` if a redirect from `from` to `to` keeps the request on the same
+/// origin (scheme, host and port), or merely upgrades `http` to `https` on
+/// the same host. Never true for a downgrade or for a different host/port.
+fn is_same_origin_hop(from: &reqwest::Url, to: &reqwest::Url) -> bool {
+    if from.host_str() != to.host_str() {
+        return false;
+    }
+    let upgrade = from.scheme() == "http" && to.scheme() == "https";
+    let same_origin =
+        from.scheme() == to.scheme() && from.port_or_known_default() == to.port_or_known_default();
+    same_origin || upgrade
+}
+
+/// Strips one leading `/v1` path segment from `path_and_query`, but only
+/// when it really is a whole segment (`/v1`, `/v1/..`, `/v1?..`) — never
+/// from `/v1beta/..` or `/v10`.
+fn strip_v1_prefix(path_and_query: &str) -> &str {
+    match path_and_query.strip_prefix("/v1") {
+        Some(rest) if rest.is_empty() || rest.starts_with(['/', '?']) => rest,
+        _ => path_and_query,
+    }
+}
+
+/// `true` if the path (query string excluded) has a `.` or `..` segment,
+/// including percent-encoded (`%2e`) and backslash-separated forms, which
+/// URL parsers normalize just like the plain ones.
+///
+/// Such a path would be resolved *after* it was appended to `base_url`, so
+/// `/v1/../admin` could climb out of an upstream base path like
+/// `https://host/public` — with the injected credential attached.
+fn has_dot_segment(path_and_query: &str) -> bool {
+    let path = path_and_query.split('?').next().unwrap_or_default();
+    path.split(['/', '\\']).any(|segment| {
+        let decoded = segment.replace("%2e", ".").replace("%2E", ".");
+        decoded == "." || decoded == ".."
+    })
+}
+
+/// Reverse-proxies a request to `cfg.base_url`, without the `/v1` prefix the
+/// route matched under. Use as the handler behind the `/v1/{*path}` route,
+/// inside the group guarded by [`crate::middleware::x402_payment`].
+///
+/// The prefix is removed exactly once, whichever way the route is mounted:
+///
+/// - **Nested** (`Router::nest("/v1", ..)`, as in `service/`): axum has
+///   already removed the prefix before the handler runs, so the path is
+///   forwarded as it arrives. (`/v1/v1/orders` reaches the upstream as
+///   `/v1/orders`.)
+/// - **Not nested** (`.route("/v1/{*path}", ..)` or `.route("/{*path}", ..)`):
+///   one leading `/v1` segment is stripped here.
+///
+/// Requests whose path contains a `.` / `..` segment (also when written
+/// `%2e` / `%2E`) are rejected with `400`: they would otherwise be resolved
+/// after being appended to `base_url` and could leave the upstream's base
+/// path. A `400` is never settled by the payment gate, so the buyer is not
+/// charged for it.
 pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Response {
     let path_and_query = req
         .uri()
@@ -73,12 +165,25 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
         .unwrap_or("/")
         .to_string();
 
-    let forwarded = path_and_query
-        .strip_prefix("/v1")
-        .unwrap_or(&path_and_query)
-        .to_string();
+    if has_dot_segment(&path_and_query) {
+        tracing::warn!(path = %path_and_query, "Rejected request with dot segments in the path");
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "error": "invalid request path" })),
+        )
+            .into_response();
+    }
+
+    // `Router::nest` records the prefix it stripped as `NestedPath`; its
+    // presence means the `/v1` is already gone from `req.uri()`.
+    let already_stripped = req.extensions().get::<NestedPath>().is_some();
+    let forwarded = if already_stripped {
+        path_and_query.as_str()
+    } else {
+        strip_v1_prefix(&path_and_query)
+    };
     let forwarded = if forwarded.starts_with('/') {
-        forwarded
+        forwarded.to_string()
     } else {
         format!("/{forwarded}")
     };
@@ -117,7 +222,7 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
     let mut out_headers = reqwest::header::HeaderMap::new();
     for (name, value) in parts.headers.iter() {
         let lower = name.as_str().to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&lower.as_str()) || lower == "payment-signature" {
+        if HOP_BY_HOP.contains(&lower.as_str()) || PAYMENT_HEADERS.contains(&lower.as_str()) {
             continue;
         }
         if let (Ok(hn), Ok(hv)) = (
@@ -169,8 +274,8 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
         }
     };
 
-    let status =
-        StatusCode::from_u16(upstream_response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status = StatusCode::from_u16(upstream_response.status().as_u16())
+        .unwrap_or(StatusCode::BAD_GATEWAY);
 
     tracing::debug!(
         url = %url,
@@ -178,10 +283,13 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
         "Received response from upstream API"
     );
 
+    // `content-encoding` is deliberately passed through: the body below is
+    // streamed exactly as received (the client is not expected to decompress),
+    // so the header is the only thing telling the buyer how to decode it.
     let mut builder = Response::builder().status(status);
     for (name, value) in upstream_response.headers().iter() {
         let lower = name.as_str().to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&lower.as_str()) || lower == "content-encoding" {
+        if HOP_BY_HOP.contains(&lower.as_str()) {
             continue;
         }
         if let (Ok(hn), Ok(hv)) = (
@@ -220,15 +328,126 @@ mod tests {
     }
 
     fn app(cfg: UpstreamConfig) -> Router {
-        Router::new().route("/{*path}", any(proxy)).with_state(Arc::new(cfg))
+        Router::new()
+            .route("/{*path}", any(proxy))
+            .with_state(Arc::new(cfg))
     }
 
     #[test]
     fn hop_by_hop_list_is_lowercase_and_complete() {
-        for h in ["connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "host", "content-length"] {
+        for h in [
+            "connection",
+            "keep-alive",
+            "transfer-encoding",
+            "te",
+            "trailer",
+            "upgrade",
+            "host",
+            "content-length",
+        ] {
             assert!(HOP_BY_HOP.contains(&h), "{h}");
         }
         assert!(HOP_BY_HOP.iter().all(|h| *h == h.to_ascii_lowercase()));
+    }
+
+    #[test]
+    fn payment_headers_cover_the_current_and_the_legacy_name() {
+        assert_eq!(PAYMENT_HEADERS, ["payment-signature", "x-payment"]);
+        assert!(PAYMENT_HEADERS.iter().all(|h| *h == h.to_ascii_lowercase()));
+    }
+
+    #[test]
+    fn strip_v1_prefix_removes_only_a_whole_leading_segment() {
+        for (input, expected) in [
+            ("/v1/orders", "/orders"),
+            ("/v1/orders?a=1", "/orders?a=1"),
+            ("/v1/v1/orders", "/v1/orders"),
+            ("/v1", ""),
+            ("/v1?a=1", "?a=1"),
+            ("/v1beta/orders", "/v1beta/orders"),
+            ("/v10", "/v10"),
+            ("/orders/v1", "/orders/v1"),
+            ("/", "/"),
+        ] {
+            assert_eq!(strip_v1_prefix(input), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn dot_segments_are_detected_in_every_spelling() {
+        for bad in [
+            "/..",
+            "/.",
+            "/a/../b",
+            "/a/./b",
+            "/a/..",
+            "/%2e%2e/x",
+            "/%2E%2E/x",
+            "/.%2e/x",
+            "/%2e./x",
+            "/%2e/x",
+            "/a\\..\\b",
+            "/..?q=1",
+            "/a/%2e%2E/b",
+        ] {
+            assert!(has_dot_segment(bad), "{bad}");
+        }
+        for ok in [
+            "/",
+            "/a/b",
+            "/a.b",
+            "/a..b",
+            "/...",
+            "/.hidden",
+            "/file.json",
+            "/x?next=../y",
+            "/x?a=%2e%2e",
+            "/a%2fb",
+            "/..a",
+            "/a..",
+        ] {
+            assert!(!has_dot_segment(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn redirect_hops_stay_on_the_same_origin() {
+        let u = |s: &str| reqwest::Url::parse(s).unwrap();
+        // same origin
+        assert!(is_same_origin_hop(
+            &u("https://api.example.com/a"),
+            &u("https://api.example.com/b?x=1")
+        ));
+        assert!(is_same_origin_hop(
+            &u("http://127.0.0.1:8080/a"),
+            &u("http://127.0.0.1:8080/b")
+        ));
+        // an upgrade of the same host is fine, whatever the ports
+        assert!(is_same_origin_hop(
+            &u("http://api.example.com/a"),
+            &u("https://api.example.com/a")
+        ));
+        // everything else is a different origin
+        assert!(!is_same_origin_hop(
+            &u("https://api.example.com/a"),
+            &u("http://api.example.com/a")
+        )); // downgrade
+        assert!(!is_same_origin_hop(
+            &u("https://api.example.com/a"),
+            &u("https://evil.example.net/a")
+        ));
+        assert!(!is_same_origin_hop(
+            &u("https://api.example.com/a"),
+            &u("https://api.example.com.evil.net/a")
+        ));
+        assert!(!is_same_origin_hop(
+            &u("https://api.example.com/a"),
+            &u("https://sub.api.example.com/a")
+        ));
+        assert!(!is_same_origin_hop(
+            &u("http://127.0.0.1:8080/a"),
+            &u("http://127.0.0.1:9090/a")
+        ));
     }
 
     #[test]
@@ -240,7 +459,9 @@ mod tests {
     fn debug_never_prints_the_credential() {
         let dbg = format!("{:?}", cfg("s3cr3t-value"));
         assert!(!dbg.contains("s3cr3t-value"));
-        assert!(dbg.contains("[redacted]") && dbg.contains("X-Api-Key") && dbg.contains("127.0.0.1:1"));
+        assert!(
+            dbg.contains("[redacted]") && dbg.contains("X-Api-Key") && dbg.contains("127.0.0.1:1")
+        );
         assert!(format!("{:?}", cfg("")).contains("[empty]"));
     }
 
@@ -248,12 +469,22 @@ mod tests {
     fn config_is_cloneable() {
         let c = cfg("v");
         let d = c.clone();
-        assert_eq!((d.base_url, d.auth_header, d.auth_value), (c.base_url, c.auth_header, c.auth_value));
+        assert_eq!(
+            (d.base_url, d.auth_header, d.auth_value),
+            (c.base_url, c.auth_header, c.auth_value)
+        );
     }
 
     #[tokio::test]
     async fn refused_upstream_is_a_502_with_error_and_detail() {
-        let resp = app(cfg("")).oneshot(axum::http::Request::get("/v1/x").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app(cfg(""))
+            .oneshot(
+                axum::http::Request::get("/v1/x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
@@ -274,7 +505,11 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_methods_do_not_panic() {
-        let req = axum::http::Request::builder().method("PURGE").uri("/v1/x").body(Body::empty()).unwrap();
+        let req = axum::http::Request::builder()
+            .method("PURGE")
+            .uri("/v1/x")
+            .body(Body::empty())
+            .unwrap();
         let resp = app(cfg("")).oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY); // reached the (refused) upstream
     }

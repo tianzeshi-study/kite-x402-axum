@@ -107,13 +107,7 @@ impl FacilitatorClient {
         let url = format!("{}/{op}", self.base_url);
         tracing::debug!(op = %op, url = %url, "Sending HTTP request to facilitator");
 
-        let response = match self
-            .http
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-        {
+        let response = match self.http.post(&url).json(&body).send().await {
             Ok(resp) => resp,
             Err(err) => {
                 tracing::error!(op = %op, url = %url, error = %err, "Facilitator HTTP request failed");
@@ -202,7 +196,8 @@ mod tests {
                 verify: Mutex::new((200, json!({ "isValid": true }).to_string())),
                 settle: Mutex::new((
                     200,
-                    json!({ "success": true, "transaction": "0xtx", "network": "eip155:2368" }).to_string(),
+                    json!({ "success": true, "transaction": "0xtx", "network": "eip155:2368" })
+                        .to_string(),
                 )),
                 delay: Mutex::new(None),
                 seen: Mutex::new(vec![]),
@@ -285,10 +280,22 @@ mod tests {
 
     #[test]
     fn base_url_has_trailing_slashes_trimmed_but_keeps_the_version_prefix() {
-        assert_eq!(FacilitatorClient::new("https://f.example/v2").base_url(), "https://f.example/v2");
-        assert_eq!(FacilitatorClient::new("https://f.example/v2/").base_url(), "https://f.example/v2");
-        assert_eq!(FacilitatorClient::new("https://f.example/v2///").base_url(), "https://f.example/v2");
-        assert_eq!(FacilitatorClient::new(String::from("http://x")).base_url(), "http://x");
+        assert_eq!(
+            FacilitatorClient::new("https://f.example/v2").base_url(),
+            "https://f.example/v2"
+        );
+        assert_eq!(
+            FacilitatorClient::new("https://f.example/v2/").base_url(),
+            "https://f.example/v2"
+        );
+        assert_eq!(
+            FacilitatorClient::new("https://f.example/v2///").base_url(),
+            "https://f.example/v2"
+        );
+        assert_eq!(
+            FacilitatorClient::new(String::from("http://x")).base_url(),
+            "http://x"
+        );
     }
 
     #[test]
@@ -304,27 +311,50 @@ mod tests {
     #[tokio::test]
     async fn verify_posts_json_to_slash_verify() {
         let (url, fake) = start().await;
-        FacilitatorClient::new(&url).verify(&payload(), &requirements()).await.unwrap();
+        FacilitatorClient::new(&url)
+            .verify(&payload(), &requirements())
+            .await
+            .unwrap();
 
         let seen = fake.seen();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].path, "/verify");
-        assert!(seen[0].content_type.as_deref().unwrap().starts_with("application/json"));
+        assert!(seen[0]
+            .content_type
+            .as_deref()
+            .unwrap()
+            .starts_with("application/json"));
         assert_eq!(seen[0].body["x402Version"], 2);
-        assert_eq!(seen[0].body["paymentPayload"]["payload"]["signature"], "0xsig");
-        assert_eq!(seen[0].body["paymentPayload"]["accepted"]["payTo"], "0xpayto");
+        assert_eq!(
+            seen[0].body["paymentPayload"]["payload"]["signature"],
+            "0xsig"
+        );
+        assert_eq!(
+            seen[0].body["paymentPayload"]["accepted"]["payTo"],
+            "0xpayto"
+        );
         assert_eq!(seen[0].body["paymentRequirements"]["amount"], "1000");
-        assert_eq!(seen[0].body.as_object().unwrap().len(), 3, "exactly three top-level keys");
+        assert_eq!(
+            seen[0].body.as_object().unwrap().len(),
+            3,
+            "exactly three top-level keys"
+        );
     }
 
     #[tokio::test]
     async fn settle_posts_json_to_slash_settle() {
         let (url, fake) = start().await;
-        FacilitatorClient::new(&url).settle(&payload(), &requirements()).await.unwrap();
+        FacilitatorClient::new(&url)
+            .settle(&payload(), &requirements())
+            .await
+            .unwrap();
 
         let seen = fake.seen();
         assert_eq!(seen[0].path, "/settle");
-        assert_eq!(seen[0].body["paymentRequirements"]["network"], "eip155:2368");
+        assert_eq!(
+            seen[0].body["paymentRequirements"]["network"],
+            "eip155:2368"
+        );
     }
 
     #[tokio::test]
@@ -343,14 +373,20 @@ mod tests {
         let (url, fake) = start().await;
         let mut p = payload();
         p.x402_version = 1;
-        FacilitatorClient::new(&url).verify(&p, &requirements()).await.unwrap();
+        FacilitatorClient::new(&url)
+            .verify(&p, &requirements())
+            .await
+            .unwrap();
         assert_eq!(fake.seen()[0].body["x402Version"], 1);
     }
 
     #[tokio::test]
     async fn optional_fields_that_are_none_are_not_sent() {
         let (url, fake) = start().await;
-        FacilitatorClient::new(&url).verify(&payload(), &requirements()).await.unwrap();
+        FacilitatorClient::new(&url)
+            .verify(&payload(), &requirements())
+            .await
+            .unwrap();
         let body = &fake.seen()[0].body;
         assert!(body["paymentRequirements"].get("extra").is_none());
         assert!(body["paymentPayload"].get("resource").is_none());
@@ -363,7 +399,10 @@ mod tests {
     async fn verify_parses_a_valid_answer() {
         let (url, fake) = start().await;
         fake.set_verify(200, r#"{"isValid":true,"payer":"0xabc"}"#);
-        let v = FacilitatorClient::new(&url).verify(&payload(), &requirements()).await.unwrap();
+        let v = FacilitatorClient::new(&url)
+            .verify(&payload(), &requirements())
+            .await
+            .unwrap();
         assert!(v.is_valid);
         assert_eq!(v.payer.as_deref(), Some("0xabc"));
     }
@@ -371,8 +410,14 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_payment_is_an_ok_value_not_an_error() {
         let (url, fake) = start().await;
-        fake.set_verify(200, r#"{"isValid":false,"invalidReason":"expired","invalidMessage":"too late"}"#);
-        let v = FacilitatorClient::new(&url).verify(&payload(), &requirements()).await.unwrap();
+        fake.set_verify(
+            200,
+            r#"{"isValid":false,"invalidReason":"expired","invalidMessage":"too late"}"#,
+        );
+        let v = FacilitatorClient::new(&url)
+            .verify(&payload(), &requirements())
+            .await
+            .unwrap();
         assert!(!v.is_valid);
         assert_eq!(v.invalid_reason.as_deref(), Some("expired"));
         assert_eq!(v.invalid_message.as_deref(), Some("too late"));
@@ -385,7 +430,10 @@ mod tests {
             200,
             r#"{"success":false,"errorReason":"reverted","errorMessage":"boom","transaction":"","network":"eip155:2368"}"#,
         );
-        let s = FacilitatorClient::new(&url).settle(&payload(), &requirements()).await.unwrap();
+        let s = FacilitatorClient::new(&url)
+            .settle(&payload(), &requirements())
+            .await
+            .unwrap();
         assert!(!s.success);
         assert_eq!(s.error_reason.as_deref(), Some("reverted"));
         assert_eq!(s.error_message.as_deref(), Some("boom"));
@@ -398,9 +446,15 @@ mod tests {
             200,
             r#"{"success":true,"transaction":"0xhash","network":"eip155:2368","payer":"0xp","amount":"1000"}"#,
         );
-        let s = FacilitatorClient::new(&url).settle(&payload(), &requirements()).await.unwrap();
+        let s = FacilitatorClient::new(&url)
+            .settle(&payload(), &requirements())
+            .await
+            .unwrap();
         assert!(s.success);
-        assert_eq!((s.transaction.as_str(), s.amount.as_deref()), ("0xhash", Some("1000")));
+        assert_eq!(
+            (s.transaction.as_str(), s.amount.as_deref()),
+            ("0xhash", Some("1000"))
+        );
     }
 
     // ---- error mapping -----------------------------------------------------
@@ -413,14 +467,33 @@ mod tests {
             fake.set_settle(status, "settle said no");
             let client = FacilitatorClient::new(&url);
 
-            match client.verify(&payload(), &requirements()).await.unwrap_err() {
-                FacilitatorError::BadResponse { op, status: s, body } => {
-                    assert_eq!((op, s, body.as_str()), ("verify", status, "upstream said no"));
+            match client
+                .verify(&payload(), &requirements())
+                .await
+                .unwrap_err()
+            {
+                FacilitatorError::BadResponse {
+                    op,
+                    status: s,
+                    body,
+                } => {
+                    assert_eq!(
+                        (op, s, body.as_str()),
+                        ("verify", status, "upstream said no")
+                    );
                 }
                 other => panic!("expected BadResponse, got {other:?}"),
             }
-            match client.settle(&payload(), &requirements()).await.unwrap_err() {
-                FacilitatorError::BadResponse { op, status: s, body } => {
+            match client
+                .settle(&payload(), &requirements())
+                .await
+                .unwrap_err()
+            {
+                FacilitatorError::BadResponse {
+                    op,
+                    status: s,
+                    body,
+                } => {
                     assert_eq!((op, s, body.as_str()), ("settle", status, "settle said no"));
                 }
                 other => panic!("expected BadResponse, got {other:?}"),
@@ -431,12 +504,29 @@ mod tests {
     #[tokio::test]
     async fn unparseable_success_body_becomes_bad_response() {
         let (url, fake) = start().await;
-        for body in ["", "<html>hi</html>", "null", "[]", r#"{"isValid":"yes"}"#, r#"{"other":1}"#] {
+        for body in [
+            "",
+            "<html>hi</html>",
+            "null",
+            "[]",
+            r#"{"isValid":"yes"}"#,
+            r#"{"other":1}"#,
+        ] {
             fake.set_verify(200, body);
-            let err = FacilitatorClient::new(&url).verify(&payload(), &requirements()).await.unwrap_err();
+            let err = FacilitatorClient::new(&url)
+                .verify(&payload(), &requirements())
+                .await
+                .unwrap_err();
             match err {
-                FacilitatorError::BadResponse { op: "verify", status: 200, body } => {
-                    assert!(body.starts_with("could not parse facilitator verify response"), "{body}");
+                FacilitatorError::BadResponse {
+                    op: "verify",
+                    status: 200,
+                    body,
+                } => {
+                    assert!(
+                        body.starts_with("could not parse facilitator verify response"),
+                        "{body}"
+                    );
                 }
                 other => panic!("expected BadResponse for {body:?}, got {other:?}"),
             }
@@ -447,8 +537,18 @@ mod tests {
     async fn settle_body_missing_required_fields_becomes_bad_response() {
         let (url, fake) = start().await;
         fake.set_settle(200, r#"{"success":true}"#); // no transaction / network
-        let err = FacilitatorClient::new(&url).settle(&payload(), &requirements()).await.unwrap_err();
-        assert!(matches!(err, FacilitatorError::BadResponse { op: "settle", status: 200, .. }));
+        let err = FacilitatorClient::new(&url)
+            .settle(&payload(), &requirements())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            FacilitatorError::BadResponse {
+                op: "settle",
+                status: 200,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -474,7 +574,10 @@ mod tests {
 
         let client = FacilitatorClient::with_timeout(&url, Duration::from_millis(80));
         let started = std::time::Instant::now();
-        let err = client.settle(&payload(), &requirements()).await.unwrap_err();
+        let err = client
+            .settle(&payload(), &requirements())
+            .await
+            .unwrap_err();
 
         assert!(started.elapsed() < Duration::from_millis(500));
         match err {
@@ -493,7 +596,11 @@ mod tests {
 
     #[test]
     fn error_messages_name_the_operation_status_and_body() {
-        let e = FacilitatorError::BadResponse { op: "verify", status: 503, body: "down".into() };
+        let e = FacilitatorError::BadResponse {
+            op: "verify",
+            status: 503,
+            body: "down".into(),
+        };
         assert_eq!(e.to_string(), "facilitator verify returned 503: down");
     }
 
@@ -506,7 +613,10 @@ mod tests {
             .verify(&payload(), &requirements())
             .await
             .unwrap_err();
-        assert!(err.to_string().starts_with("facilitator request failed:"), "{err}");
+        assert!(
+            err.to_string().starts_with("facilitator request failed:"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -516,7 +626,12 @@ mod tests {
         let tasks: Vec<_> = (0..20)
             .map(|_| {
                 let c = client.clone();
-                tokio::spawn(async move { c.verify(&payload(), &requirements()).await.unwrap().is_valid })
+                tokio::spawn(async move {
+                    c.verify(&payload(), &requirements())
+                        .await
+                        .unwrap()
+                        .is_valid
+                })
             })
             .collect();
         for t in tasks {

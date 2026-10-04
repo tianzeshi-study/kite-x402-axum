@@ -107,8 +107,17 @@ mod tests {
 
     #[test]
     fn decode_rejects_json_of_the_wrong_shape() {
-        for body in ["[]", "42", "null", r#"{"x402Version":2}"#, r#"{"accepted":{},"payload":{}}"#] {
-            assert!(decode_payment_payload(&STANDARD.encode(body)).is_err(), "{body}");
+        for body in [
+            "[]",
+            "42",
+            "null",
+            r#"{"x402Version":2}"#,
+            r#"{"accepted":{},"payload":{}}"#,
+        ] {
+            assert!(
+                decode_payment_payload(&STANDARD.encode(body)).is_err(),
+                "{body}"
+            );
         }
     }
 
@@ -129,7 +138,10 @@ mod tests {
             .into_iter()
             .find(|e| e.contains('+') || e.contains('/'))
             .expect("some variant must use '+' or '/'");
-        assert!(decode_payment_payload(&with_special).is_ok(), "standard form decodes");
+        assert!(
+            decode_payment_payload(&with_special).is_ok(),
+            "standard form decodes"
+        );
 
         let url_safe = with_special.replace('+', "-").replace('/', "_");
         assert_ne!(url_safe, with_special);
@@ -156,7 +168,11 @@ mod tests {
     #[test]
     fn decode_keeps_optional_sections() {
         let mut p = sample_payload();
-        p.resource = Some(ResourceInfo { url: "/v1/x".into(), description: None, mime_type: None });
+        p.resource = Some(ResourceInfo {
+            url: "/v1/x".into(),
+            description: None,
+            mime_type: None,
+        });
         p.extensions = Some(json!({"a": 1}));
         let d = decode_payment_payload(&b64(&p)).unwrap();
         assert_eq!(d.resource.unwrap().url, "/v1/x");
@@ -170,7 +186,11 @@ mod tests {
         let pr = PaymentRequired {
             x402_version: 2,
             error: None,
-            resource: ResourceInfo { url: "https://example.com/v1/forecast".into(), description: None, mime_type: None },
+            resource: ResourceInfo {
+                url: "https://example.com/v1/forecast".into(),
+                description: None,
+                mime_type: None,
+            },
             accepts: vec![],
         };
         let decoded = STANDARD.decode(encode_payment_required(&pr)).unwrap();
@@ -183,11 +203,18 @@ mod tests {
         let pr = PaymentRequired {
             x402_version: 2,
             error: Some("~~~???>>>".into()), // provokes '+' and '/' in the encoding
-            resource: ResourceInfo { url: "/v1/x?a=~~~".into(), description: None, mime_type: None },
+            resource: ResourceInfo {
+                url: "/v1/x?a=~~~".into(),
+                description: None,
+                mime_type: None,
+            },
             accepts: vec![sample_requirements()],
         };
         let enc = encode_payment_required(&pr);
-        assert!(!enc.contains('-') && !enc.contains('_'), "must be standard, not URL-safe: {enc}");
+        assert!(
+            !enc.contains('-') && !enc.contains('_'),
+            "must be standard, not URL-safe: {enc}"
+        );
         assert_eq!(enc.len() % 4, 0, "must be padded to a multiple of 4");
         assert!(enc.is_ascii() && !enc.contains(char::is_whitespace));
     }
@@ -204,7 +231,9 @@ mod tests {
             },
             accepts: vec![sample_requirements()],
         };
-        let back: PaymentRequired = serde_json::from_slice(&STANDARD.decode(encode_payment_required(&pr)).unwrap()).unwrap();
+        let back: PaymentRequired =
+            serde_json::from_slice(&STANDARD.decode(encode_payment_required(&pr)).unwrap())
+                .unwrap();
         assert_eq!(back.error.as_deref(), Some("Invalid payment signature"));
         assert_eq!(back.resource.url, "/v1/forecast?q=ü");
         assert_eq!(back.accepts, vec![sample_requirements()]);
@@ -223,7 +252,8 @@ mod tests {
             network: "eip155:2368".into(),
             amount: Some("1000".into()),
         };
-        let back: SettleResponse = serde_json::from_slice(&STANDARD.decode(encode_settle_response(&sr)).unwrap()).unwrap();
+        let back: SettleResponse =
+            serde_json::from_slice(&STANDARD.decode(encode_settle_response(&sr)).unwrap()).unwrap();
         assert!(back.success);
         assert_eq!(back.transaction, "0xtx");
         assert_eq!(back.amount.as_deref(), Some("1000"));
@@ -240,7 +270,8 @@ mod tests {
             network: "n".into(),
             amount: None,
         };
-        let v: serde_json::Value = serde_json::from_slice(&STANDARD.decode(encode_settle_response(&sr)).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&STANDARD.decode(encode_settle_response(&sr)).unwrap()).unwrap();
         assert_eq!(v["success"], false);
         assert_eq!(v["errorReason"], "nonce_used");
         assert_eq!(v["errorMessage"], "already spent");
@@ -249,8 +280,13 @@ mod tests {
     #[test]
     fn encoded_values_are_valid_header_values() {
         let sr = SettleResponse {
-            success: true, error_reason: None, error_message: None, payer: None,
-            transaction: "0xtx".into(), network: "n".into(), amount: None,
+            success: true,
+            error_reason: None,
+            error_message: None,
+            payer: None,
+            transaction: "0xtx".into(),
+            network: "n".into(),
+            amount: None,
         };
         assert!(axum::http::HeaderValue::from_str(&encode_settle_response(&sr)).is_ok());
     }

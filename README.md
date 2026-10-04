@@ -61,10 +61,9 @@ RUST_LOG=kite_x402_service=debug,kite_x402_axum=debug cargo run
 cargo test --workspace
 ```
 
-219 tests pass (plus 4 intentionally `#[ignore]`d regression tests, see
-below), organized in three layers:
+235 tests pass, organized in three layers:
 
-- **Unit tests** (116), inside `src/` next to the code they cover, `#[cfg(test)]`:
+- **Unit tests** (120), inside `src/` next to the code they cover, `#[cfg(test)]`:
   - `kite-x402-axum/src/kite.rs` — network constants and the `$0.001`-style
     price parser (decimal edge cases, decimals-per-asset limits, integer
     math has no float rounding error).
@@ -84,7 +83,7 @@ below), organized in three layers:
     header list, and credential redaction in `Debug` output.
   - `service/src/main.rs` — `env_or`'s trimming/blank/fallback behavior
     and the request logger passing every response through unchanged.
-- **Integration tests** (72), in `kite-x402-axum/tests/`, exercising the
+- **Integration tests** (84), in `kite-x402-axum/tests/`, exercising the
   library's public API against real (mock) HTTP servers over localhost —
   no part of the request path is stubbed out:
   - `middleware.rs` *(pre-existing)* — the original core-flow checks.
@@ -100,7 +99,7 @@ below), organized in three layers:
     back (status, headers, large/streamed bodies), hop-by-hop stripping,
     credential injection and override, and failure modes (unreachable/slow
     upstream, oversized request body).
-  - `known_issues.rs` — see below.
+  - `proxy_regressions.rs` — see below.
 - **End-to-end tests** (31), in `service/tests/e2e.rs`, spawning the
   **actual `kite-x402-service` binary** as a child process (configured
   purely through environment variables, as in a real deployment) and
@@ -120,45 +119,55 @@ needs):
 cargo test -p kite-x402-axum
 ```
 
-### Known-issue regression tests
+### Proxy regression tests
 
-`kite-x402-axum/tests/known_issues.rs` documents four suspected defects as
-`#[ignore]`d tests asserting the *desired* behavior, so they don't fail the
-normal suite but are one command away from proving whether a fix works:
+`kite-x402-axum/tests/proxy_regressions.rs` pins down defects that were found
+in the reverse proxy and then fixed; each test's doc comment says what used to
+go wrong:
 
-```bash
-cargo test -p kite-x402-axum --test known_issues -- --ignored
-```
+1. **`/v1` was stripped twice.** The router's `nest("/v1", ..)` already removes
+   the prefix, so `/v1/v1/orders` reached the upstream as `/orders`. The proxy
+   now strips nothing itself when it runs under `Router::nest` (it checks for
+   axum's `NestedPath`), and strips exactly one whole `/v1` segment otherwise.
+2. **`content-encoding` was dropped from a still-encoded body.** The header is
+   now passed through, since nothing in the proxy decompresses.
+3. **The legacy `X-PAYMENT` header reached the upstream.** Both payment
+   headers are now removed before forwarding.
+4. **An injected credential followed cross-host redirects.** The service builds
+   its upstream client with `proxy::same_origin_redirect_policy()`, which
+   follows same-origin redirects and returns any other `3xx` to the buyer.
+   If you supply your own `reqwest::Client`, build it the same way.
+5. **Dot segments could climb out of the upstream base path.** With
+   `UPSTREAM_URL=https://host/public`, a request for `/v1/../secret` (or
+   `%2e%2e`) used to be forwarded to `/secret` with the credential attached.
+   Such paths are now rejected with `400`, which the payment gate never settles.
 
-1. `proxy` strips a leading `/v1` from the path it forwards, but the path it
-   sees has *already* had the router's `nest("/v1", ..)` prefix stripped —
-   so a request for `/v1/v1/orders` (an upstream resource that itself starts
-   with `/v1`) loses both, and the upstream receives `/orders` instead of
-   `/v1/orders`.
-2. The proxy drops the response's `content-encoding` header, but its
-   `reqwest::Client` has no decompression feature enabled, so the body is
-   still gzip/br-encoded — a client that sent `Accept-Encoding: gzip` (curl
-   `--compressed`, most browsers, Python `requests`) gets encoded bytes with
-   no header saying so.
-3. The gate accepts the legacy `X-PAYMENT` header (for compatibility with
-   older x402 clients), but the proxy only strips `PAYMENT-SIGNATURE` before
-   forwarding — a buyer's signed payment payload sent as `X-PAYMENT` reaches
-   the upstream API.
-4. The proxy's `reqwest::Client` follows redirects by default, and reqwest
-   only strips the *standard* `Authorization`/`Cookie` headers on a
-   cross-host redirect — a custom credential header set via
-   `UPSTREAM_AUTH_HEADER` (e.g. `X-Api-Key`) would still be sent to
-   whatever host the upstream redirects to.
+See [`TODO.md`](TODO.md) for other known follow-ups (an upstream
+SDK-disagreement decision that may need revisiting, a live testnet run, etc.).
 
-None of these are exploitable from the buyer's side of the payment gate
-(they're all upstream-facing), and none change what gets settled — hence
-"known issue" rather than "blocker" — but items 1 and 3 in particular are
-worth fixing before this template is used with an upstream API that has
-`/v1`-prefixed resources or with clients still sending `X-PAYMENT`.
+## Continuous integration
 
-See [`TODO.md`](TODO.md) for other known follow-ups (dependency versions pinned
-for this sandbox's Rust 1.75, an upstream SDK-disagreement decision that may
-need revisiting, etc.) intentionally deferred out of this first pass.
+`.github/workflows/ci.yml` runs on every push to `main` and every pull
+request; the same commands work locally:
+
+| Job | Command |
+| --- | --- |
+| rustfmt | `cargo fmt --all -- --check` |
+| clippy | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
+| test | `cargo test --workspace --locked` |
+| msrv | `cargo check --workspace --all-targets --locked` on Rust 1.88 |
+| rustdoc | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked` |
+| package | `cargo package -p kite-x402-axum --locked` |
+| scripts | `python -m py_compile service/scripts/kite_x402_client.py` |
+
+Mark **CI success** as the required check in branch protection; it passes only
+if all of the jobs above pass. `.github/workflows/audit.yml` checks
+`Cargo.lock` against the RustSec advisory database weekly and whenever
+dependencies change, and Dependabot proposes cargo and GitHub Actions updates
+weekly. `Cargo.lock` is committed (the workspace ships a binary), so CI builds
+use the exact dependency versions you have tested. The minimum supported Rust
+version is 1.88, set by the dependency tree (`icu_*` via `reqwest`); keep
+`rust-version` in `Cargo.toml` and the `msrv` job in step.
 
 See the repository [README](../../README.md) for the full flow and how to
 test with a Kite Passport agent.

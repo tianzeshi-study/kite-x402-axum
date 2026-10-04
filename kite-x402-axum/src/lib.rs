@@ -39,7 +39,7 @@
 //! - [`middleware`] — the [`axum::middleware::from_fn_with_state`]-shaped
 //!   payment gate: verify before the handler runs, settle only after a
 //!   successful (`< 400`) response.
-//! - [`proxy`] — a minimal reverse-proxy handler that forwards a paid
+//! - [`mod@proxy`] — a minimal reverse-proxy handler that forwards a paid
 //!   request to `UPSTREAM_URL` with the `/v1` prefix stripped and an
 //!   upstream credential injected.
 //!

@@ -151,7 +151,10 @@ pub async fn x402_payment(
                 error = %msg,
                 "Failed to compute payment requirements (invalid server configuration)"
             );
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": msg })))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": msg })),
+            )
                 .into_response();
         }
     };
@@ -173,7 +176,12 @@ pub async fn x402_payment(
             requirements = ?requirements,
             "402 challenge requirements details"
         );
-        return payment_required_response(requirements, resource_url, cfg.description.clone(), None);
+        return payment_required_response(
+            requirements,
+            resource_url,
+            cfg.description.clone(),
+            None,
+        );
     };
 
     tracing::debug!(
@@ -343,13 +351,18 @@ pub async fn x402_payment(
         HeaderValue::from_str(&encode_settle_response(&settle))
             .unwrap_or_else(|_| HeaderValue::from_static("")),
     );
-    let cache_control = match parts.headers.get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok()) {
+    let cache_control = match parts
+        .headers
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+    {
         Some(existing) if !existing.is_empty() => format!("{existing}, private"),
         _ => "private".to_string(),
     };
     parts.headers.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_str(&cache_control).unwrap_or_else(|_| HeaderValue::from_static("private")),
+        HeaderValue::from_str(&cache_control)
+            .unwrap_or_else(|_| HeaderValue::from_static("private")),
     );
 
     Response::from_parts(parts, body)
@@ -425,7 +438,12 @@ mod tests {
     }
 
     fn decode_header(resp: &Response, name: &str) -> Value {
-        let raw = resp.headers().get(name).unwrap_or_else(|| panic!("no {name} header")).to_str().unwrap();
+        let raw = resp
+            .headers()
+            .get(name)
+            .unwrap_or_else(|| panic!("no {name} header"))
+            .to_str()
+            .unwrap();
         serde_json::from_slice(&STANDARD.decode(raw).unwrap()).unwrap()
     }
 
@@ -473,7 +491,10 @@ mod tests {
     fn requirements_report_bad_prices_with_context() {
         for bad in ["", "abc", "-1", "0", "0.0000001", "1e3"] {
             let err = config(KITE_MAINNET, bad).requirements().unwrap_err();
-            assert!(err.starts_with("invalid PRICE_USD configured on the server: "), "{bad:?}: {err}");
+            assert!(
+                err.starts_with("invalid PRICE_USD configured on the server: "),
+                "{bad:?}: {err}"
+            );
         }
     }
 
@@ -507,12 +528,20 @@ mod tests {
         assert_eq!(challenge["resource"]["mimeType"], "application/json");
         assert_eq!(challenge["accepts"][0]["payTo"], PAY_TO);
 
-        assert_eq!(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()[..], b"{}");
+        assert_eq!(
+            &to_bytes(resp.into_body(), usize::MAX).await.unwrap()[..],
+            b"{}"
+        );
     }
 
     #[test]
     fn payment_required_response_includes_the_error_when_given() {
-        let resp = payment_required_response(requirements(), "/v1/x".into(), "d".into(), Some("because".into()));
+        let resp = payment_required_response(
+            requirements(),
+            "/v1/x".into(),
+            "d".into(),
+            Some("because".into()),
+        );
         assert_eq!(decode_header(&resp, "PAYMENT-REQUIRED")["error"], "because");
     }
 
@@ -527,7 +556,10 @@ mod tests {
         );
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
         assert!(resp.headers().get("Injected").is_none());
-        assert_eq!(decode_header(&resp, "PAYMENT-REQUIRED")["error"], "err\r\nInjected: header");
+        assert_eq!(
+            decode_header(&resp, "PAYMENT-REQUIRED")["error"],
+            "err\r\nInjected: header"
+        );
     }
 
     #[tokio::test]
@@ -550,7 +582,10 @@ mod tests {
         assert_eq!(receipt["success"], false);
         assert_eq!(receipt["errorReason"], "reverted");
         assert_eq!(receipt["payer"], "0xp");
-        assert_eq!(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()[..], b"{}");
+        assert_eq!(
+            &to_bytes(resp.into_body(), usize::MAX).await.unwrap()[..],
+            b"{}"
+        );
     }
 
     // ---- branches that return before /verify --------------------------------
@@ -561,7 +596,9 @@ mod tests {
         let resp = svc.oneshot(request("/anything", &[])).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
-        assert!(decode_header(&resp, "PAYMENT-REQUIRED").get("error").is_none());
+        assert!(decode_header(&resp, "PAYMENT-REQUIRED")
+            .get("error")
+            .is_none());
         assert_eq!(reached.load(Ordering::SeqCst), 0);
     }
 
@@ -569,26 +606,40 @@ mod tests {
     async fn resource_url_falls_back_to_the_request_uri_without_original_uri() {
         let (svc, _) = gate(config(KITE_TESTNET, "0.001"));
         let resp = svc.oneshot(request("/some/path?x=1", &[])).await.unwrap();
-        assert_eq!(decode_header(&resp, "PAYMENT-REQUIRED")["resource"]["url"], "/some/path?x=1");
+        assert_eq!(
+            decode_header(&resp, "PAYMENT-REQUIRED")["resource"]["url"],
+            "/some/path?x=1"
+        );
     }
 
     #[tokio::test]
     async fn resource_url_prefers_the_original_uri_extension() {
         let (svc, _) = gate(config(KITE_TESTNET, "0.001"));
         let mut req = request("/stripped", &[]);
-        req.extensions_mut().insert(OriginalUri("/v1/stripped?a=b".parse().unwrap()));
+        req.extensions_mut()
+            .insert(OriginalUri("/v1/stripped?a=b".parse().unwrap()));
         let resp = svc.oneshot(req).await.unwrap();
-        assert_eq!(decode_header(&resp, "PAYMENT-REQUIRED")["resource"]["url"], "/v1/stripped?a=b");
+        assert_eq!(
+            decode_header(&resp, "PAYMENT-REQUIRED")["resource"]["url"],
+            "/v1/stripped?a=b"
+        );
     }
 
     #[tokio::test]
     async fn undecodable_header_is_rejected_as_an_invalid_signature() {
         for name in ["PAYMENT-SIGNATURE", "X-PAYMENT"] {
             let (svc, reached) = gate(config(KITE_TESTNET, "0.001"));
-            let resp = svc.oneshot(request("/x", &[(name, "%%%not-base64%%%")])).await.unwrap();
+            let resp = svc
+                .oneshot(request("/x", &[(name, "%%%not-base64%%%")]))
+                .await
+                .unwrap();
 
             assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED, "{name}");
-            assert_eq!(decode_header(&resp, "PAYMENT-REQUIRED")["error"], "Invalid payment signature", "{name}");
+            assert_eq!(
+                decode_header(&resp, "PAYMENT-REQUIRED")["error"],
+                "Invalid payment signature",
+                "{name}"
+            );
             assert_eq!(reached.load(Ordering::SeqCst), 0);
         }
     }
@@ -603,27 +654,40 @@ mod tests {
         let (svc, reached) = gate(cfg);
 
         let resp = svc
-            .oneshot(request("/x", &[("PAYMENT-SIGNATURE", &payload_header(&wrong))]))
+            .oneshot(request(
+                "/x",
+                &[("PAYMENT-SIGNATURE", &payload_header(&wrong))],
+            ))
             .await
             .unwrap();
 
-        assert_eq!(decode_header(&resp, "PAYMENT-REQUIRED")["error"], "No matching payment requirements");
+        assert_eq!(
+            decode_header(&resp, "PAYMENT-REQUIRED")["error"],
+            "No matching payment requirements"
+        );
         assert_eq!(reached.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn matching_payment_with_dead_facilitator_is_402_unavailable_and_never_runs_the_handler() {
+    async fn matching_payment_with_dead_facilitator_is_402_unavailable_and_never_runs_the_handler()
+    {
         let cfg = config(KITE_TESTNET, "0.001");
         let good = cfg.requirements().unwrap();
         let (svc, reached) = gate(cfg);
 
         let resp = svc
-            .oneshot(request("/x", &[("PAYMENT-SIGNATURE", &payload_header(&good))]))
+            .oneshot(request(
+                "/x",
+                &[("PAYMENT-SIGNATURE", &payload_header(&good))],
+            ))
             .await
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
-        let err = decode_header(&resp, "PAYMENT-REQUIRED")["error"].as_str().unwrap().to_string();
+        let err = decode_header(&resp, "PAYMENT-REQUIRED")["error"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(err.starts_with("facilitator verify unavailable: "), "{err}");
         assert_eq!(reached.load(Ordering::SeqCst), 0);
     }
@@ -638,8 +702,12 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(resp.headers().get("PAYMENT-REQUIRED").is_none());
-        let body: Value = serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
-        assert!(body["error"].as_str().unwrap().contains("invalid PRICE_USD"));
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid PRICE_USD"));
         assert_eq!(reached.load(Ordering::SeqCst), 0);
     }
 
@@ -650,10 +718,16 @@ mod tests {
         wrong.pay_to = "0xsomeoneelse".into();
         let (svc, _) = gate(cfg);
         let resp = svc
-            .oneshot(request("/x", &[("payment-signature", &payload_header(&wrong))]))
+            .oneshot(request(
+                "/x",
+                &[("payment-signature", &payload_header(&wrong))],
+            ))
             .await
             .unwrap();
         // Read as a payment (and rejected for its content), not ignored as absent.
-        assert_eq!(decode_header(&resp, "PAYMENT-REQUIRED")["error"], "No matching payment requirements");
+        assert_eq!(
+            decode_header(&resp, "PAYMENT-REQUIRED")["error"],
+            "No matching payment requirements"
+        );
     }
 }

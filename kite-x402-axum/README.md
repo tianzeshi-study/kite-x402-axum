@@ -35,7 +35,7 @@ use kite_x402_axum::{
     facilitator::FacilitatorClient,
     kite::{kite_chain_by_name, FACILITATOR_URL},
     middleware::{x402_payment, PaymentConfig},
-    proxy::{proxy, UpstreamConfig},
+    proxy::{proxy, same_origin_redirect_policy, UpstreamConfig},
 };
 
 let payment_cfg = Arc::new(PaymentConfig {
@@ -45,8 +45,13 @@ let payment_cfg = Arc::new(PaymentConfig {
     description: "Paid API access".to_string(),
     facilitator: FacilitatorClient::new(FACILITATOR_URL),
 });
+// Don't follow redirects to other hosts: the injected credential would go along.
+let http = reqwest::Client::builder()
+    .redirect(same_origin_redirect_policy())
+    .build()
+    .unwrap();
 let upstream_cfg = Arc::new(UpstreamConfig {
-    http: reqwest::Client::new(),
+    http,
     base_url: "https://api.example.com".to_string(),
     auth_header: "Authorization".to_string(),
     auth_value: String::new(),

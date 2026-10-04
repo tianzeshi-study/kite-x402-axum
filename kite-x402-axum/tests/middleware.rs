@@ -109,10 +109,7 @@ async fn spawn_upstream(status: StatusCode) -> String {
     async fn handler(status: StatusCode) -> impl IntoResponse {
         (status, Json(json!({ "upstream": true })))
     }
-    let app = Router::new().route(
-        "/forecast",
-        any(move || handler(status)),
-    );
+    let app = Router::new().route("/forecast", any(move || handler(status)));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -225,10 +222,7 @@ async fn unpaid_request_returns_402_with_payment_required_header() {
     let requirements = requirements_from_402(response.headers());
     assert_eq!(requirements.network, "eip155:2368");
     assert_eq!(requirements.amount, "1000000000000000"); // 0.001 * 10^18
-    assert_eq!(
-        response.headers().get("cache-control").unwrap(),
-        "no-store"
-    );
+    assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
 }
 
 #[tokio::test]
@@ -316,7 +310,9 @@ async fn upstream_failure_is_not_settled() {
 #[tokio::test]
 async fn verify_invalid_returns_402_without_calling_upstream_or_settling() {
     let (facilitator_base, facilitator_state) = spawn_facilitator().await;
-    facilitator_state.verify_valid.store(false, Ordering::SeqCst);
+    facilitator_state
+        .verify_valid
+        .store(false, Ordering::SeqCst);
     *facilitator_state.verify_reason.lock().unwrap() = Some("insufficient_funds".to_string());
     let upstream_base = spawn_upstream(StatusCode::OK).await;
     let app = build_app(&facilitator_base, &upstream_base);
@@ -357,7 +353,9 @@ async fn verify_invalid_returns_402_without_calling_upstream_or_settling() {
 #[tokio::test]
 async fn settlement_failure_returns_402_with_payment_response_header() {
     let (facilitator_base, facilitator_state) = spawn_facilitator().await;
-    facilitator_state.settle_success.store(false, Ordering::SeqCst);
+    facilitator_state
+        .settle_success
+        .store(false, Ordering::SeqCst);
     let upstream_base = spawn_upstream(StatusCode::OK).await;
     let app = build_app(&facilitator_base, &upstream_base);
 
@@ -411,7 +409,9 @@ async fn facilitator_unreachable_during_verify_returns_402_not_5xx() {
         asset: KITE_TESTNET.asset_address.to_string(),
         pay_to: "0xC0FFEE0000000000000000000000000000C0FFEE".to_string(),
         max_timeout_seconds: 60,
-        extra: Some(json!({ "name": KITE_TESTNET.eip712_name, "version": KITE_TESTNET.eip712_version })),
+        extra: Some(
+            json!({ "name": KITE_TESTNET.eip712_name, "version": KITE_TESTNET.eip712_version }),
+        ),
     };
     let header = build_payment_header(&requirements);
 

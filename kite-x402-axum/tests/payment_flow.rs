@@ -40,7 +40,10 @@ async fn challenge_payload_describes_resource_and_single_payment_option() {
     let challenge = header_json(resp.headers(), "PAYMENT-REQUIRED");
 
     assert_eq!(challenge["x402Version"], 2);
-    assert!(challenge.get("error").is_none(), "a plain challenge carries no error");
+    assert!(
+        challenge.get("error").is_none(),
+        "a plain challenge carries no error"
+    );
 
     // The resource URL is the *original* URI (with /v1 and the query), not the
     // prefix-stripped one the proxy handler sees.
@@ -98,12 +101,18 @@ async fn challenge_never_touches_facilitator_or_upstream() {
 #[tokio::test]
 async fn challenge_invalid_server_price_is_a_500_not_a_402() {
     let mocks = Mocks::start().await;
-    let app = mocks.app_with(&AppOptions { price_usd: "free".into(), ..AppOptions::default() });
+    let app = mocks.app_with(&AppOptions {
+        price_usd: "free".into(),
+        ..AppOptions::default()
+    });
     let resp = send(&app, get_req("/v1/forecast")).await;
 
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let body = body_json(resp).await;
-    assert!(body["error"].as_str().unwrap().contains("invalid PRICE_USD"));
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("invalid PRICE_USD"));
     assert!(mocks.timeline().is_empty());
 }
 
@@ -121,11 +130,19 @@ async fn routes_outside_v1_are_never_gated() {
 
 /// Asserts a `402` whose challenge carries `error == expected`, and that
 /// neither the facilitator nor the upstream was contacted.
-async fn assert_rejected_before_facilitator(mocks: &Mocks, resp: axum::response::Response, expected: &str) {
+async fn assert_rejected_before_facilitator(
+    mocks: &Mocks,
+    resp: axum::response::Response,
+    expected: &str,
+) {
     assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
     let challenge = header_json(resp.headers(), "PAYMENT-REQUIRED");
     assert_eq!(challenge["error"], expected);
-    assert!(mocks.timeline().is_empty(), "nothing downstream may be called: {:?}", mocks.timeline());
+    assert!(
+        mocks.timeline().is_empty(),
+        "nothing downstream may be called: {:?}",
+        mocks.timeline()
+    );
 }
 
 #[tokio::test]
@@ -142,7 +159,11 @@ async fn validation_undecodable_headers_are_rejected_as_invalid_signature() {
         wrong_shape_b64.as_str(),
     ];
     for bad in cases {
-        let resp = send(&app, req_with("GET", "/v1/forecast", &[("PAYMENT-SIGNATURE", bad)], vec![])).await;
+        let resp = send(
+            &app,
+            req_with("GET", "/v1/forecast", &[("PAYMENT-SIGNATURE", bad)], vec![]),
+        )
+        .await;
         assert_rejected_before_facilitator(&mocks, resp, "Invalid payment signature").await;
     }
 }
@@ -151,7 +172,8 @@ async fn validation_undecodable_headers_are_rejected_as_invalid_signature() {
 async fn validation_non_utf8_header_is_treated_as_absent() {
     let mocks = Mocks::start().await;
     let mut req = get_req("/v1/forecast");
-    req.headers_mut().insert("PAYMENT-SIGNATURE", header_value(b"\xff\xfe"));
+    req.headers_mut()
+        .insert("PAYMENT-SIGNATURE", header_value(b"\xff\xfe"));
     let resp = send(&mocks.app(), req).await;
 
     assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
@@ -161,29 +183,62 @@ async fn validation_non_utf8_header_is_treated_as_absent() {
 
 #[tokio::test]
 async fn validation_any_mismatch_with_server_requirements_is_rejected() {
+    /// One named way of tampering with the requirements the server issued.
+    type Mutation = (
+        &'static str,
+        Box<dyn Fn(&mut kite_x402_axum::types::PaymentRequirements)>,
+    );
+
     let mocks = Mocks::start().await;
     let app = mocks.app();
     let good = probe_requirements(&app, "/v1/forecast").await;
 
-    let mutations: Vec<(&str, Box<dyn Fn(&mut kite_x402_axum::types::PaymentRequirements)>)> = vec![
+    let mutations: Vec<Mutation> = vec![
         ("scheme", Box::new(|r| r.scheme = "upto".into())),
-        ("network", Box::new(|r| r.network = KITE_MAINNET.network.into())),
+        (
+            "network",
+            Box::new(|r| r.network = KITE_MAINNET.network.into()),
+        ),
         ("amount (cheaper)", Box::new(|r| r.amount = "1".into())),
-        ("asset", Box::new(|r| r.asset = "0x0000000000000000000000000000000000000001".into())),
-        ("payTo", Box::new(|r| r.pay_to = "0xAttacker000000000000000000000000000000".into())),
-        ("maxTimeoutSeconds", Box::new(|r| r.max_timeout_seconds = 3600)),
+        (
+            "asset",
+            Box::new(|r| r.asset = "0x0000000000000000000000000000000000000001".into()),
+        ),
+        (
+            "payTo",
+            Box::new(|r| r.pay_to = "0xAttacker000000000000000000000000000000".into()),
+        ),
+        (
+            "maxTimeoutSeconds",
+            Box::new(|r| r.max_timeout_seconds = 3600),
+        ),
         ("extra dropped", Box::new(|r| r.extra = None)),
-        ("extra domain", Box::new(|r| r.extra = Some(json!({ "name": "evil", "version": "1" })))),
+        (
+            "extra domain",
+            Box::new(|r| r.extra = Some(json!({ "name": "evil", "version": "1" }))),
+        ),
     ];
 
     for (what, mutate) in mutations {
         let mut tampered = good.clone();
         mutate(&mut tampered);
         let header = payment_header(&tampered);
-        let resp = send(&app, req_with("GET", "/v1/forecast", &[("PAYMENT-SIGNATURE", &header)], vec![])).await;
+        let resp = send(
+            &app,
+            req_with(
+                "GET",
+                "/v1/forecast",
+                &[("PAYMENT-SIGNATURE", &header)],
+                vec![],
+            ),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED, "{what}");
         let challenge = header_json(resp.headers(), "PAYMENT-REQUIRED");
-        assert_eq!(challenge["error"], "No matching payment requirements", "{what}");
+        assert_eq!(
+            challenge["error"], "No matching payment requirements",
+            "{what}"
+        );
         // The rejection re-issues the *correct* requirements.
         assert_eq!(challenge["accepts"][0]["amount"], good.amount, "{what}");
     }
@@ -196,7 +251,11 @@ async fn validation_legacy_x_payment_header_is_accepted() {
     let app = mocks.app();
     let header = payment_header(&probe_requirements(&app, "/v1/forecast").await);
 
-    let resp = send(&app, req_with("GET", "/v1/forecast", &[("X-PAYMENT", &header)], vec![])).await;
+    let resp = send(
+        &app,
+        req_with("GET", "/v1/forecast", &[("X-PAYMENT", &header)], vec![]),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(mocks.facilitator.settle_count(), 1);
 }
@@ -210,7 +269,12 @@ async fn validation_payment_signature_takes_precedence_over_x_payment() {
     // Valid PAYMENT-SIGNATURE + garbage X-PAYMENT -> paid.
     let resp = send(
         &app,
-        req_with("GET", "/v1/forecast", &[("PAYMENT-SIGNATURE", &good), ("X-PAYMENT", "garbage")], vec![]),
+        req_with(
+            "GET",
+            "/v1/forecast",
+            &[("PAYMENT-SIGNATURE", &good), ("X-PAYMENT", "garbage")],
+            vec![],
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -218,7 +282,12 @@ async fn validation_payment_signature_takes_precedence_over_x_payment() {
     // Garbage PAYMENT-SIGNATURE + valid X-PAYMENT -> rejected.
     let resp = send(
         &app,
-        req_with("GET", "/v1/forecast", &[("PAYMENT-SIGNATURE", "garbage"), ("X-PAYMENT", &good)], vec![]),
+        req_with(
+            "GET",
+            "/v1/forecast",
+            &[("PAYMENT-SIGNATURE", "garbage"), ("X-PAYMENT", &good)],
+            vec![],
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
@@ -236,18 +305,35 @@ async fn verify_receives_the_payload_and_the_server_requirements() {
     let payload = payload_for(&reqs);
     let header = encode_payload(&payload);
 
-    send(&app, req_with("GET", "/v1/forecast", &[("PAYMENT-SIGNATURE", &header)], vec![])).await;
+    send(
+        &app,
+        req_with(
+            "GET",
+            "/v1/forecast",
+            &[("PAYMENT-SIGNATURE", &header)],
+            vec![],
+        ),
+    )
+    .await;
 
     let sent = mocks.facilitator.verify_requests.lock().unwrap()[0].clone();
     assert_eq!(sent["x402Version"], 2);
-    assert_eq!(sent["paymentPayload"], serde_json::to_value(&payload).unwrap());
-    assert_eq!(sent["paymentRequirements"], serde_json::to_value(&reqs).unwrap());
+    assert_eq!(
+        sent["paymentPayload"],
+        serde_json::to_value(&payload).unwrap()
+    );
+    assert_eq!(
+        sent["paymentRequirements"],
+        serde_json::to_value(&reqs).unwrap()
+    );
 }
 
 #[tokio::test]
 async fn verify_invalid_with_reason_puts_the_reason_in_the_challenge() {
     let mocks = Mocks::start().await;
-    mocks.facilitator.set_verify(verify_invalid(Some("insufficient_funds")));
+    mocks
+        .facilitator
+        .set_verify(verify_invalid(Some("insufficient_funds")));
     let resp = pay_get(&mocks.app(), "/v1/forecast").await;
 
     assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
@@ -282,11 +368,41 @@ async fn verify_invalid_response_body_hides_upstream_data() {
 #[tokio::test]
 async fn verify_facilitator_errors_are_402_with_unavailable_message() {
     let cases: Vec<(&str, Reply)> = vec![
-        ("http 500", Reply::Raw { status: 500, body: "boom".into() }),
-        ("http 502", Reply::Raw { status: 502, body: "bad gateway".into() }),
-        ("http 503", Reply::Raw { status: 503, body: "".into() }),
-        ("http 404", Reply::Raw { status: 404, body: "no route".into() }),
-        ("200 but not json", Reply::Raw { status: 200, body: "<html>oops</html>".into() }),
+        (
+            "http 500",
+            Reply::Raw {
+                status: 500,
+                body: "boom".into(),
+            },
+        ),
+        (
+            "http 502",
+            Reply::Raw {
+                status: 502,
+                body: "bad gateway".into(),
+            },
+        ),
+        (
+            "http 503",
+            Reply::Raw {
+                status: 503,
+                body: "".into(),
+            },
+        ),
+        (
+            "http 404",
+            Reply::Raw {
+                status: 404,
+                body: "no route".into(),
+            },
+        ),
+        (
+            "200 but not json",
+            Reply::Raw {
+                status: 200,
+                body: "<html>oops</html>".into(),
+            },
+        ),
         ("200 but wrong shape", Reply::Json(json!({ "ok": true }))),
     ];
     for (what, reply) in cases {
@@ -297,7 +413,10 @@ async fn verify_facilitator_errors_are_402_with_unavailable_message() {
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED, "{what}");
         let challenge = header_json(resp.headers(), "PAYMENT-REQUIRED");
         let err = challenge["error"].as_str().unwrap();
-        assert!(err.starts_with("facilitator verify unavailable"), "{what}: {err}");
+        assert!(
+            err.starts_with("facilitator verify unavailable"),
+            "{what}: {err}"
+        );
         assert_eq!(mocks.upstream.count(), 0, "{what}");
         assert_eq!(mocks.facilitator.settle_count(), 0, "{what}");
     }
@@ -306,10 +425,16 @@ async fn verify_facilitator_errors_are_402_with_unavailable_message() {
 #[tokio::test]
 async fn verify_http_error_includes_status_and_body_in_the_message() {
     let mocks = Mocks::start().await;
-    mocks.facilitator.set_verify(Reply::Raw { status: 503, body: "maintenance window".into() });
+    mocks.facilitator.set_verify(Reply::Raw {
+        status: 503,
+        body: "maintenance window".into(),
+    });
     let resp = pay_get(&mocks.app(), "/v1/forecast").await;
 
-    let err = header_json(resp.headers(), "PAYMENT-REQUIRED")["error"].as_str().unwrap().to_string();
+    let err = header_json(resp.headers(), "PAYMENT-REQUIRED")["error"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert!(err.contains("503"), "{err}");
     assert!(err.contains("maintenance window"), "{err}");
 }
@@ -324,7 +449,10 @@ async fn verify_unreachable_facilitator_is_402() {
     // The probe itself does not need the facilitator, so `pay_get` gets as far
     // as verify and lands here.
     assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
-    let err = header_json(resp.headers(), "PAYMENT-REQUIRED")["error"].as_str().unwrap().to_string();
+    let err = header_json(resp.headers(), "PAYMENT-REQUIRED")["error"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert!(err.starts_with("facilitator verify unavailable"), "{err}");
     assert_eq!(mocks.upstream.count(), 0);
 }
@@ -344,7 +472,10 @@ async fn verify_slow_facilitator_times_out_as_402() {
     let resp = pay_get(&app, "/v1/forecast").await;
 
     assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
-    assert!(started.elapsed() < Duration::from_millis(700), "must not wait for the slow reply");
+    assert!(
+        started.elapsed() < Duration::from_millis(700),
+        "must not wait for the slow reply"
+    );
     assert_eq!(mocks.upstream.count(), 0);
 }
 
@@ -391,18 +522,25 @@ async fn settle_adds_private_to_cache_control() {
 async fn settle_appends_private_to_an_existing_cache_control() {
     let mocks = Mocks::start().await;
     let mut reply = UpstreamReply::json(200);
-    reply.headers.push(("cache-control".into(), "public, max-age=60".into()));
+    reply
+        .headers
+        .push(("cache-control".into(), "public, max-age=60".into()));
     mocks.upstream.set_reply(reply);
 
     let resp = pay_get(&mocks.app(), "/v1/forecast").await;
-    assert_eq!(resp.headers()[header::CACHE_CONTROL], "public, max-age=60, private");
+    assert_eq!(
+        resp.headers()[header::CACHE_CONTROL],
+        "public, max-age=60, private"
+    );
 }
 
 #[tokio::test]
 async fn settle_keeps_upstream_headers_alongside_payment_response() {
     let mocks = Mocks::start().await;
     let mut reply = UpstreamReply::json(200);
-    reply.headers.push(("x-request-id".into(), "abc-123".into()));
+    reply
+        .headers
+        .push(("x-request-id".into(), "abc-123".into()));
     mocks.upstream.set_reply(reply);
 
     let resp = pay_get(&mocks.app(), "/v1/forecast").await;
@@ -430,10 +568,18 @@ async fn settle_never_happens_for_status_400_and_above() {
         mocks.upstream.set_status(status);
         let resp = pay_get(&mocks.app(), "/v1/forecast").await;
 
-        assert_eq!(resp.status().as_u16(), status, "upstream status passes through");
+        assert_eq!(
+            resp.status().as_u16(),
+            status,
+            "upstream status passes through"
+        );
         assert!(!resp.headers().contains_key("PAYMENT-RESPONSE"), "{status}");
         assert_eq!(mocks.facilitator.settle_count(), 0, "{status}");
-        assert_eq!(body_json(resp).await, json!({ "upstream": true }), "{status}");
+        assert_eq!(
+            body_json(resp).await,
+            json!({ "upstream": true }),
+            "{status}"
+        );
     }
 }
 
@@ -452,7 +598,9 @@ async fn settle_is_skipped_when_upstream_is_unreachable() {
 #[tokio::test]
 async fn settle_rejected_by_facilitator_yields_402_with_failed_receipt() {
     let mocks = Mocks::start().await;
-    mocks.facilitator.set_settle(settle_failed("nonce_already_used", KITE_TESTNET.network));
+    mocks
+        .facilitator
+        .set_settle(settle_failed("nonce_already_used", KITE_TESTNET.network));
     let resp = pay_get(&mocks.app(), "/v1/forecast").await;
 
     assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
@@ -463,14 +611,30 @@ async fn settle_rejected_by_facilitator_yields_402_with_failed_receipt() {
     assert_eq!(receipt["errorReason"], "nonce_already_used");
     // The buyer must not receive the upstream data they were not charged for.
     assert_eq!(body_json(resp).await, json!({}));
-    assert_eq!(mocks.upstream.count(), 1, "upstream was called before settlement");
+    assert_eq!(
+        mocks.upstream.count(),
+        1,
+        "upstream was called before settlement"
+    );
 }
 
 #[tokio::test]
 async fn settle_facilitator_errors_yield_402_with_unavailable_receipt() {
     let cases: Vec<(&str, Reply)> = vec![
-        ("http 500", Reply::Raw { status: 500, body: "settle exploded".into() }),
-        ("200 not json", Reply::Raw { status: 200, body: "nope".into() }),
+        (
+            "http 500",
+            Reply::Raw {
+                status: 500,
+                body: "settle exploded".into(),
+            },
+        ),
+        (
+            "200 not json",
+            Reply::Raw {
+                status: 200,
+                body: "nope".into(),
+            },
+        ),
         ("200 wrong shape", Reply::Json(json!({ "hello": "world" }))),
     ];
     for (what, reply) in cases {
@@ -482,7 +646,10 @@ async fn settle_facilitator_errors_yield_402_with_unavailable_receipt() {
         let receipt = header_json(resp.headers(), "PAYMENT-RESPONSE");
         assert_eq!(receipt["success"], false, "{what}");
         assert!(
-            receipt["errorReason"].as_str().unwrap().starts_with("facilitator settle unavailable"),
+            receipt["errorReason"]
+                .as_str()
+                .unwrap()
+                .starts_with("facilitator settle unavailable"),
             "{what}: {receipt}"
         );
         assert_eq!(receipt["transaction"], "", "{what}");
@@ -493,8 +660,14 @@ async fn settle_facilitator_errors_yield_402_with_unavailable_receipt() {
 #[tokio::test]
 async fn settle_receipt_uses_the_configured_chain_when_facilitator_is_down() {
     let mocks = Mocks::start().await;
-    mocks.facilitator.set_settle(Reply::Raw { status: 500, body: "x".into() });
-    let app = mocks.app_with(&AppOptions { chain: KITE_MAINNET, ..AppOptions::default() });
+    mocks.facilitator.set_settle(Reply::Raw {
+        status: 500,
+        body: "x".into(),
+    });
+    let app = mocks.app_with(&AppOptions {
+        chain: KITE_MAINNET,
+        ..AppOptions::default()
+    });
     let resp = pay_get(&app, "/v1/forecast").await;
 
     let receipt = header_json(resp.headers(), "PAYMENT-RESPONSE");
@@ -557,7 +730,10 @@ async fn concurrency_many_paid_requests_are_each_settled_exactly_once() {
         tasks.push(tokio::spawn(async move {
             let uri = format!("/v1/item/{i}");
             let resp = pay_get(&app, &uri).await;
-            (resp.status(), resp.headers().contains_key("PAYMENT-RESPONSE"))
+            (
+                resp.status(),
+                resp.headers().contains_key("PAYMENT-RESPONSE"),
+            )
         }));
     }
     for t in tasks {
