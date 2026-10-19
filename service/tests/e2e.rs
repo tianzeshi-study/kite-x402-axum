@@ -716,6 +716,23 @@ fn refuses_to_start_when_the_port_is_already_taken() {
     assert!(stderr.contains("could not bind"), "{stderr}");
 }
 
+#[test]
+fn refuses_a_non_numeric_shutdown_timeout() {
+    for bad in ["abc", "-1", "not_a_number"] {
+        let (status, stderr) = run_expecting_failure(vec![
+            ("PAY_TO", PAY_TO),
+            ("UPSTREAM_URL", "http://localhost:1"),
+            ("SHUTDOWN_TIMEOUT_SECONDS", bad),
+            ("RUST_LOG", "off"),
+        ]);
+        assert!(!status.success(), "SHUTDOWN_TIMEOUT_SECONDS={bad:?}");
+        assert!(
+            stderr.contains("SHUTDOWN_TIMEOUT_SECONDS must be a number"),
+            "SHUTDOWN_TIMEOUT_SECONDS={bad:?}: {stderr}"
+        );
+    }
+}
+
 // ===========================================================================
 // shutdown
 // ===========================================================================
@@ -779,6 +796,98 @@ async fn an_in_flight_paid_request_completes_before_shutdown() {
     );
     assert_eq!(mocks.facilitator.settle_count(), 1);
     assert!(status.success());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_timeout_forces_exit_when_exceeded() {
+    let mocks = Mocks::start().await;
+    let mut reply = UpstreamReply::json(200);
+    // Upstream delay is 5s, but shutdown timeout is 1s
+    reply.delay = Some(Duration::from_millis(5000));
+    mocks.upstream.set_reply(reply);
+
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push(("SHUTDOWN_TIMEOUT_SECONDS".into(), "1".into()));
+    let mut svc = Service::start(env).await;
+
+    let reqs = svc.requirements("/v1/stuck").await;
+    let client = svc.http.clone();
+    let url = svc.url("/v1/stuck");
+    tokio::spawn(async move {
+        let _ = client
+            .get(url)
+            .header("PAYMENT-SIGNATURE", payment_header(&reqs))
+            .send()
+            .await;
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while mocks.upstream.count() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "request never reached the upstream"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let start = Instant::now();
+    let status = svc.terminate();
+    let elapsed = start.elapsed();
+
+    // The shutdown timeout was 1s, so the process must exit well before the 5s upstream delay
+    assert!(
+        elapsed < Duration::from_millis(3500),
+        "shutdown should have timed out and terminated within ~1-2s, took {elapsed:?}"
+    );
+    assert!(status.success());
+}
+
+// ===========================================================================
+// security headers
+// ===========================================================================
+
+#[tokio::test]
+async fn security_headers_present_on_all_responses() {
+    let mocks = Mocks::start().await;
+    let svc = Service::start_with(&mocks).await;
+
+    // Check on free /healthz (200)
+    let resp = svc.get("/healthz").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(resp.headers()["x-frame-options"], "DENY");
+    assert_eq!(resp.headers()["x-xss-protection"], "0");
+    assert_eq!(
+        resp.headers()["referrer-policy"],
+        "strict-origin-when-cross-origin"
+    );
+
+    // Check on /v1/metered unauthenticated (402)
+    let resp402 = svc.get("/v1/metered").await;
+    assert_eq!(resp402.status(), 402);
+    assert_eq!(resp402.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(resp402.headers()["x-frame-options"], "DENY");
+    assert_eq!(resp402.headers()["x-xss-protection"], "0");
+    assert_eq!(
+        resp402.headers()["referrer-policy"],
+        "strict-origin-when-cross-origin"
+    );
+}
+
+#[tokio::test]
+async fn security_headers_can_be_disabled() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push(("SECURITY_HEADERS_ENABLED".into(), "false".into()));
+    let svc = Service::start(env).await;
+
+    let resp = svc.get("/healthz").await;
+    assert_eq!(resp.status(), 200);
+    assert!(!resp.headers().contains_key("x-content-type-options"));
+    assert!(!resp.headers().contains_key("x-frame-options"));
+    assert!(!resp.headers().contains_key("x-xss-protection"));
+    assert!(!resp.headers().contains_key("referrer-policy"));
 }
 
 // Keep the import used on non-unix targets too.

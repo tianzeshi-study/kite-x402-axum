@@ -55,15 +55,24 @@ RUST_LOG=kite_x402_service=debug,kite_x402_axum=debug cargo run
 - **`WARN` / `ERROR`**: Client errors, payment signature decode failures, requirement mismatches, upstream errors, facilitator connectivity issues or settlement rejections.
 - **Sensitive data protection**: Secret tokens such as `UPSTREAM_AUTH_VALUE` are automatically redacted from logs.
 
+## Security & Reliability
+
+- **HTTP Security Headers**: When enabled (`SECURITY_HEADERS_ENABLED=true`, default), the service automatically attaches OWASP-recommended security headers to all responses (including 402 challenges and error responses) without overriding custom headers already supplied by the upstream API:
+  - `X-Content-Type-Options: nosniff`
+  - `X-Frame-Options: DENY`
+  - `X-XSS-Protection: 0`
+  - `Referrer-Policy: strict-origin-when-cross-origin`
+- **Bounded Graceful Shutdown**: Configurable via `SHUTDOWN_TIMEOUT_SECONDS` (defaults to `30`). Upon receiving `SIGTERM` or `Ctrl+C`, the service stops accepting new connections and permits active in-flight requests to complete their upstream processing and on-chain settlement. If requests take longer than the timeout, the service logs a warning and terminates cleanly, preventing hanging processes in containerized environments (such as Kubernetes or Docker).
+
 ## Running the tests
 
 ```bash
 cargo test --workspace
 ```
 
-235 tests pass, organized in three layers:
+241 tests pass, organized in three layers:
 
-- **Unit tests** (120), inside `src/` next to the code they cover, `#[cfg(test)]`:
+- **Unit tests** (122), inside `src/` next to the code they cover, `#[cfg(test)]`:
   - `kite-x402-axum/src/kite.rs` — network constants and the `$0.001`-style
     price parser (decimal edge cases, decimals-per-asset limits, integer
     math has no float rounding error).
@@ -81,8 +90,8 @@ cargo test --workspace
     wrapping the gate around a counting stub inner service.
   - `kite-x402-axum/src/proxy.rs` — the request-body size cap, hop-by-hop
     header list, and credential redaction in `Debug` output.
-  - `service/src/main.rs` — `env_or`'s trimming/blank/fallback behavior
-    and the request logger passing every response through unchanged.
+  - `service/src/main.rs` — `env_or`'s trimming/blank/fallback behavior,
+    security headers injection/preservation, and the request logger passing every response through unchanged.
 - **Integration tests** (84), in `kite-x402-axum/tests/`, exercising the
   library's public API against real (mock) HTTP servers over localhost —
   no part of the request path is stubbed out:
@@ -100,16 +109,16 @@ cargo test --workspace
     credential injection and override, and failure modes (unreachable/slow
     upstream, oversized request body).
   - `proxy_regressions.rs` — see below.
-- **End-to-end tests** (31), in `service/tests/e2e.rs`, spawning the
+- **End-to-end tests** (35), in `service/tests/e2e.rs`, spawning the
   **actual `kite-x402-service` binary** as a child process (configured
   purely through environment variables, as in a real deployment) and
   talking to it over real TCP with a real HTTP client: the full pay-per-call
   flow, every money-safety rule (no charge on a failed upstream, rejected
   payment, or failed settlement), environment-variable parsing and
   defaults, startup failures (`PAY_TO`/`UPSTREAM_URL` missing, bad
-  `KITE_NETWORK`, unparseable or taken `PORT`) with their exit codes, and
-  graceful shutdown on `SIGTERM` (an in-flight paid request is allowed to
-  finish, and settle, before the process exits).
+  `KITE_NETWORK`, unparseable or taken `PORT`, invalid `SHUTDOWN_TIMEOUT_SECONDS`),
+  security headers verification, and graceful shutdown on `SIGTERM` (an in-flight paid request is allowed to
+  finish, and settle, before the process exits, bounded by `SHUTDOWN_TIMEOUT_SECONDS`).
 
 For a faster inner loop, run just the library's unit + integration tests
 (skips compiling and spawning the service binary that `service/tests/e2e.rs`

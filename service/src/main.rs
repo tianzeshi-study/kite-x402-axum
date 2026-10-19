@@ -55,6 +55,15 @@ async fn main() {
     let description = env_or("SERVICE_DESCRIPTION", "Paid API access via Kite x402");
     let upstream_auth_header = env_or("UPSTREAM_AUTH_HEADER", "Authorization");
     let upstream_auth_value = env_or("UPSTREAM_AUTH_VALUE", "");
+    let shutdown_timeout_secs: u64 = env_or("SHUTDOWN_TIMEOUT_SECONDS", "30")
+        .parse()
+        .expect("SHUTDOWN_TIMEOUT_SECONDS must be a number");
+    let security_headers_enabled: bool = matches!(
+        env_or("SECURITY_HEADERS_ENABLED", "true")
+            .to_ascii_lowercase()
+            .as_str(),
+        "true" | "1" | "yes" | "on"
+    );
 
     tracing::info!(
         port = port,
@@ -66,6 +75,8 @@ async fn main() {
         upstream_url = %upstream_url,
         facilitator_url = %facilitator_url,
         auth_injected = !upstream_auth_value.is_empty(),
+        shutdown_timeout_secs = shutdown_timeout_secs,
+        security_headers = security_headers_enabled,
         "Configured kite-x402 wrapper"
     );
 
@@ -98,10 +109,15 @@ async fn main() {
         .with_state(upstream_cfg)
         .layer(middleware::from_fn_with_state(payment_cfg, x402_payment));
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/healthz", axum::routing::get(healthz))
-        .nest("/v1", paid)
-        .layer(middleware::from_fn(http_request_logger));
+        .nest("/v1", paid);
+
+    if security_headers_enabled {
+        app = app.layer(middleware::from_fn(security_headers));
+    }
+
+    let app = app.layer(middleware::from_fn(http_request_logger));
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
@@ -112,12 +128,30 @@ async fn main() {
         "kite-x402 wrapper listening on 0.0.0.0:{port} (network={network_name})"
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .expect("server error");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(());
+    });
 
-    tracing::info!("Server shut down gracefully");
+    tokio::select! {
+        res = server => {
+            res.expect("server error");
+            tracing::info!("Server shut down gracefully");
+        }
+        _ = async {
+            if shutdown_rx.await.is_ok() {
+                tokio::time::sleep(Duration::from_secs(shutdown_timeout_secs)).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            tracing::warn!(
+                timeout_secs = shutdown_timeout_secs,
+                "Graceful shutdown timeout exceeded; forcing exit"
+            );
+        }
+    }
 }
 
 async fn http_request_logger(req: Request, next: Next) -> Response {
@@ -186,6 +220,36 @@ async fn http_request_logger(req: Request, next: Next) -> Response {
 async fn healthz() -> Json<serde_json::Value> {
     tracing::debug!("Handling /healthz request");
     Json(json!({ "status": "ok" }))
+}
+
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+
+    headers
+        .entry(axum::http::header::HeaderName::from_static(
+            "x-content-type-options",
+        ))
+        .or_insert(axum::http::HeaderValue::from_static("nosniff"));
+    headers
+        .entry(axum::http::header::HeaderName::from_static(
+            "x-frame-options",
+        ))
+        .or_insert(axum::http::HeaderValue::from_static("DENY"));
+    headers
+        .entry(axum::http::header::HeaderName::from_static(
+            "x-xss-protection",
+        ))
+        .or_insert(axum::http::HeaderValue::from_static("0"));
+    headers
+        .entry(axum::http::header::HeaderName::from_static(
+            "referrer-policy",
+        ))
+        .or_insert(axum::http::HeaderValue::from_static(
+            "strict-origin-when-cross-origin",
+        ));
+
+    response
 }
 
 fn env_or(key: &str, fallback: &str) -> String {
@@ -334,5 +398,64 @@ mod tests {
     async fn healthz_body_is_status_ok_json() {
         let Json(v) = healthz().await;
         assert_eq!(v, json!({ "status": "ok" }));
+    }
+
+    // ---- security_headers ----------------------------------------------------
+
+    #[tokio::test]
+    async fn security_headers_injects_expected_defaults() {
+        let app = Router::new()
+            .route("/test", get(|| async { (StatusCode::OK, "ok") }))
+            .layer(middleware::from_fn(security_headers));
+
+        let res = app
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(res.headers()["x-frame-options"], "DENY");
+        assert_eq!(res.headers()["x-xss-protection"], "0");
+        assert_eq!(
+            res.headers()["referrer-policy"],
+            "strict-origin-when-cross-origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn security_headers_preserves_existing_headers() {
+        let app = Router::new()
+            .route(
+                "/custom",
+                get(|| async {
+                    (
+                        [
+                            ("x-frame-options", "SAMEORIGIN"),
+                            ("referrer-policy", "no-referrer"),
+                        ],
+                        "custom",
+                    )
+                }),
+            )
+            .layer(middleware::from_fn(security_headers));
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/custom")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        // Custom headers are preserved
+        assert_eq!(res.headers()["x-frame-options"], "SAMEORIGIN");
+        assert_eq!(res.headers()["referrer-policy"], "no-referrer");
+        // Missing ones are injected
+        assert_eq!(res.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(res.headers()["x-xss-protection"], "0");
     }
 }
