@@ -62,6 +62,7 @@
 //! also guarantees — is untouched: a request is only settled after the
 //! upstream responds with a status below 400.
 
+pub mod audit_logger;
 pub mod circuit_breaker;
 pub mod expiration;
 pub mod facilitator;
@@ -77,6 +78,7 @@ pub mod settlement_ledger;
 pub mod types;
 pub mod wire;
 
+pub use audit_logger::{AuditAction, AuditEntry, AuditLoggerConfig, PaymentAuditLogger};
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError, CircuitBreakerSnapshot, CircuitState,
 };
