@@ -168,37 +168,53 @@ impl FacilitatorClient {
         self.call("settle", payload, requirements).await
     }
 
-    /// Checks connectivity to the facilitator. Returns `Ok(())` if the facilitator
-    /// responds with status < 500, or a [`FacilitatorError`] on connection failure or 5xx.
+    /// Checks that the facilitator advertises a valid x402 v2 exact capability.
     pub async fn probe(&self) -> Result<(), FacilitatorError> {
+        self.probe_capability(None).await
+    }
+
+    /// Checks x402 v2 exact support for the configured CAIP-2 network.
+    /// This is a readiness check, not proof of successful settlement.
+    pub async fn probe_network(&self, network: &str) -> Result<(), FacilitatorError> {
+        self.probe_capability(Some(network)).await
+    }
+
+    async fn probe_capability(&self, network: Option<&str>) -> Result<(), FacilitatorError> {
+        #[derive(Deserialize)]
+        struct Supported {
+            kinds: Vec<Kind>,
+        }
+        #[derive(Deserialize)]
+        struct Kind {
+            #[serde(rename = "x402Version")]
+            version: u32,
+            scheme: String,
+            network: String,
+        }
         let url = format!("{}/supported", self.base_url);
-        tracing::debug!(url = %url, "Probing facilitator readiness");
-
-        let response = match self.http.get(&url).send().await {
-            Ok(resp) => resp,
-            Err(err) => {
-                let base_resp = self.http.get(&self.base_url).send().await;
-                match base_resp {
-                    Ok(r) if r.status().as_u16() < 500 => return Ok(()),
-                    _ => {
-                        tracing::error!(url = %url, error = %err, "Facilitator probe failed");
-                        return Err(FacilitatorError::Request(err));
-                    }
-                }
-            }
-        };
-
+        let response = self.http.get(&url).send().await?;
         let status = response.status();
-        if status.as_u16() < 500 {
-            Ok(())
-        } else {
-            let body = response.text().await.unwrap_or_default();
-            Err(FacilitatorError::BadResponse {
+        if !status.is_success() {
+            return Err(FacilitatorError::BadResponse {
                 op: "probe",
                 status: status.as_u16(),
-                body,
-            })
+                body: "supported endpoint rejected readiness check".into(),
+            });
         }
+        let supported = response.json::<Supported>().await?;
+        if supported.kinds.iter().any(|kind| {
+            kind.version == 2
+                && kind.scheme == "exact"
+                && !kind.network.is_empty()
+                && network.is_none_or(|expected| expected == kind.network)
+        }) {
+            return Ok(());
+        }
+        Err(FacilitatorError::BadResponse {
+            op: "probe",
+            status: status.as_u16(),
+            body: "configured x402 v2 exact capability is not offered".into(),
+        })
     }
 
     async fn call<T: serde::de::DeserializeOwned>(
@@ -388,7 +404,13 @@ mod tests {
         if let Some(d) = delay {
             tokio::time::sleep(d).await;
         }
-        let (status, body) = if path.ends_with("/verify") {
+        let (status, body) = if path.ends_with("/supported") {
+            (
+                200,
+                json!({"kinds":[{"x402Version":2,"scheme":"exact","network":"eip155:2368"}]})
+                    .to_string(),
+            )
+        } else if path.ends_with("/verify") {
             fake.verify.lock().unwrap().clone()
         } else {
             let mut seq = fake.settle_sequence.lock().unwrap();
@@ -825,6 +847,50 @@ mod tests {
         drop(listener);
         let client = FacilitatorClient::new(format!("http://{addr}"));
         assert!(client.probe().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_successful_supported_json_and_matching_capability() {
+        for (status, body, expected) in [
+            (404, "{}", false),
+            (401, "{}", false),
+            (200, "<html>ok</html>", false),
+            (200, "{}", false),
+            (200, r#"{"kinds":[]}"#, false),
+            (
+                200,
+                r#"{"kinds":[{"x402Version":1,"scheme":"exact","network":"eip155:2368"}]}"#,
+                false,
+            ),
+            (
+                200,
+                r#"{"kinds":[{"x402Version":2,"scheme":"upto","network":"eip155:2368"}]}"#,
+                false,
+            ),
+            (
+                200,
+                r#"{"kinds":[{"x402Version":2,"scheme":"exact","network":"eip155:2366"}]}"#,
+                false,
+            ),
+            (
+                200,
+                r#"{"kinds":[{"x402Version":2,"scheme":"exact","network":"eip155:2368"}]}"#,
+                true,
+            ),
+        ] {
+            let app = Router::new()
+                .fallback(move || async move { (StatusCode::from_u16(status).unwrap(), body) });
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let result = FacilitatorClient::new(format!("http://{addr}"))
+                .probe_network("eip155:2368")
+                .await;
+            assert_eq!(result.is_ok(), expected, "{status}: {body}");
+            task.abort();
+        }
     }
 
     #[test]
