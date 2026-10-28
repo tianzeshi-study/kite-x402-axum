@@ -1355,6 +1355,25 @@ fn refuses_invalid_timeout_configurations() {
         "{stderr2}"
     );
 }
+
+#[test]
+fn refuses_unsafe_or_invalid_facilitator_retry_configuration() {
+    for (key, value) in [
+        ("FACILITATOR_SETTLE_RETRIES", "2"),
+        ("FACILITATOR_SETTLE_RETRIES", "oops"),
+        ("FACILITATOR_VERIFY_RETRIES", "6"),
+        ("FACILITATOR_VERIFY_BACKOFF_MS", "0"),
+    ] {
+        let (status, stderr) = run_expecting_failure(vec![
+            ("PAY_TO", PAY_TO),
+            ("UPSTREAM_URL", "http://localhost:1"),
+            ("RUST_LOG", "off"),
+            (key, value),
+        ]);
+        assert!(!status.success());
+        assert!(stderr.contains(key), "{stderr}");
+    }
+}
 // ===========================================================================
 // shutdown
 // ===========================================================================

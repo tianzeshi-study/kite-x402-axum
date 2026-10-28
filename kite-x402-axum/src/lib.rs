@@ -57,8 +57,8 @@
 //! facilitator is unreachable — is reported as `402 Payment Required` with
 //! the reason in `error` (verify) or `PAYMENT-RESPONSE`'s `errorReason`
 //! (settle), never a `500`/`502`. This keeps the contract simple and
-//! predictable for callers: any `402` is retryable, nothing else needs
-//! special-casing. What both official SDKs agree on — and what this crate
+//! predictable for callers. A settlement transport failure can have an unknown
+//! outcome: reconcile it before retrying or issuing a new payment. What both official SDKs agree on — and what this crate
 //! also guarantees — is untouched: a request is only settled after the
 //! upstream responds with a status below 400.
 
