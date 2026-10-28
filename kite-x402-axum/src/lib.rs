@@ -63,6 +63,7 @@
 //! upstream responds with a status below 400.
 
 pub mod circuit_breaker;
+pub mod currency;
 pub mod expiration;
 pub mod facilitator;
 pub mod firewall;
@@ -82,6 +83,7 @@ pub mod wire;
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError, CircuitBreakerSnapshot, CircuitState,
 };
+pub use currency::{CurrencyConverter, CurrencySymbol};
 pub use expiration::{ExpirationError, ExpirationGuardConfig};
 pub use facilitator::{FacilitatorClient, FacilitatorError, RetryConfig};
 pub use firewall::{FirewallRule, IpFilterAction, IpFirewall, IpFirewallConfig};
