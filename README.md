@@ -121,8 +121,12 @@ retention TTL. It does not replace on-chain authorization checks, provide a shar
 cache across replicas, or guarantee exactly-once business effects. Transport errors
 can leave an upstream operation's result unknown even when no settlement occurs.
 Use a new authorization or reconcile an uncertain settlement rather than clearing
-the guard to retry it blindly. The facilitator client's configured settlement
-retry policy is unchanged by this guard.
+the guard to retry it blindly. Settlement is sent once: a timeout, malformed reply,
+or server error can conceal a successful charge. Reconcile the original payment
+before issuing another authorization. `FACILITATOR_SETTLE_RETRIES` must be 0;
+nonzero legacy settings fail startup. `FACILITATOR_VERIFY_RETRIES` optionally
+enables 0–5 bounded retries for transient verification failures (default 0).
+The library's `RetryConfig` now applies only to verification.
 
 ## Health, Liveness & Diagnostics
 

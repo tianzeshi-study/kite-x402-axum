@@ -130,16 +130,28 @@ async fn main() {
     }
     let concurrency_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
 
-    let settle_retries: u32 = env_or("FACILITATOR_SETTLE_RETRIES", "2")
+    let settle_retries: u32 = env_or("FACILITATOR_SETTLE_RETRIES", "0")
         .parse()
-        .unwrap_or(2);
-    let settle_backoff_ms: u64 = env_or("FACILITATOR_SETTLE_BACKOFF_MS", "150")
+        .expect("FACILITATOR_SETTLE_RETRIES must be 0");
+    let verify_backoff_ms: u64 = env_or("FACILITATOR_VERIFY_BACKOFF_MS", "150")
         .parse()
-        .unwrap_or(150);
+        .expect("FACILITATOR_VERIFY_BACKOFF_MS must be an integer");
+    assert!(
+        (1..=3000).contains(&verify_backoff_ms),
+        "FACILITATOR_VERIFY_BACKOFF_MS must be between 1 and 3000"
+    );
 
+    assert_eq!(settle_retries, 0, "FACILITATOR_SETTLE_RETRIES must be 0; reconcile unknown settlements instead of retrying them");
+    let verify_retries: u32 = env_or("FACILITATOR_VERIFY_RETRIES", "0")
+        .parse()
+        .expect("FACILITATOR_VERIFY_RETRIES must be an integer");
+    assert!(
+        verify_retries <= 5,
+        "FACILITATOR_VERIFY_RETRIES must be between 0 and 5"
+    );
     let retry_cfg = RetryConfig::new(
-        settle_retries,
-        Duration::from_millis(settle_backoff_ms),
+        verify_retries,
+        Duration::from_millis(verify_backoff_ms),
         Duration::from_secs(3),
     );
 

@@ -14,10 +14,11 @@ use crate::types::{PaymentPayload, PaymentRequirements, SettleResponse, VerifyRe
 /// Default per-request timeout for facilitator HTTP calls.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Configuration for retrying transient facilitator communication failures.
+/// Retry policy for verification only. Settlement outcomes may be unknown after
+/// a transport or server error, so settlement is never automatically repeated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetryConfig {
-    /// Maximum number of retries for transient failures. 0 disables retries.
+    /// Maximum retries for transient verification failures. 0 disables retries.
     pub max_retries: u32,
     /// Initial backoff delay for the first retry.
     pub initial_backoff: Duration,
@@ -49,8 +50,8 @@ impl RetryConfig {
     /// Calculates backoff duration for the given 0-indexed attempt using exponential backoff.
     #[must_use]
     pub fn calculate_backoff(&self, attempt: u32) -> Duration {
-        let factor = 2u64.saturating_pow(attempt);
-        let backoff = self.initial_backoff.saturating_mul(factor as u32);
+        let factor = 2u32.saturating_pow(attempt);
+        let backoff = self.initial_backoff.saturating_mul(factor);
         std::cmp::min(backoff, self.max_backoff)
     }
 }
@@ -207,7 +208,7 @@ impl FacilitatorClient {
         payload: &PaymentPayload,
         requirements: &PaymentRequirements,
     ) -> Result<T, FacilitatorError> {
-        let max_retries = if op == "settle" {
+        let max_retries = if op == "verify" {
             self.retry_config.max_retries
         } else {
             0
@@ -219,7 +220,9 @@ impl FacilitatorClient {
                 Ok(resp) => return Ok(resp),
                 Err(err) => {
                     let is_transient = match &err {
-                        FacilitatorError::Request(_) => true,
+                        FacilitatorError::Request(error) => {
+                            error.is_connect() || error.is_timeout()
+                        }
                         FacilitatorError::BadResponse { status, .. } => {
                             *status >= 500 && *status < 600
                         }
@@ -838,7 +841,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settle_retries_transient_503_and_recovers() {
+    async fn settle_does_not_repeat_an_indeterminate_503() {
         let (url, fake) = start().await;
         fake.set_settle_sequence(vec![
             (503, "Service Unavailable".into()),
@@ -852,10 +855,8 @@ mod tests {
         let retry = RetryConfig::new(2, Duration::from_millis(10), Duration::from_millis(50));
         let client = FacilitatorClient::new(&url).with_retry_config(retry);
 
-        let res = client.settle(&payload(), &requirements()).await.unwrap();
-        assert!(res.success);
-        assert_eq!(res.transaction, "0xretry_tx");
-        assert_eq!(fake.seen().len(), 2);
+        assert!(client.settle(&payload(), &requirements()).await.is_err());
+        assert_eq!(fake.seen().len(), 1);
     }
 
     #[tokio::test]
@@ -880,7 +881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_does_not_retry_by_default() {
+    async fn verification_retries_are_bounded_and_explicit() {
         let (url, fake) = start().await;
         fake.set_verify(503, "Facilitator Unavailable");
 
@@ -897,6 +898,18 @@ mod tests {
                 panic!("expected BadResponse 503, got: {other:?}")
             }
         }
+        assert_eq!(fake.seen().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn settlement_timeout_is_not_retried_even_with_a_retry_policy() {
+        let (url, fake) = start().await;
+        *fake.delay.lock().unwrap() = Some(Duration::from_millis(100));
+        let client =
+            FacilitatorClient::with_timeout(url, Duration::from_millis(20)).with_retry_config(
+                RetryConfig::new(3, Duration::from_millis(1), Duration::from_millis(2)),
+            );
+        assert!(client.settle(&payload(), &requirements()).await.is_err());
         assert_eq!(fake.seen().len(), 1);
     }
 }
