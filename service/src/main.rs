@@ -612,7 +612,11 @@ async fn readyz(
     State(payment_cfg): State<Arc<PaymentConfig>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     tracing::debug!("Handling /readyz request");
-    match payment_cfg.facilitator.probe().await {
+    match payment_cfg
+        .facilitator
+        .probe_network(payment_cfg.chain.network)
+        .await
+    {
         Ok(()) => Ok(Json(json!({
             "status": "ready",
             "facilitator": "ok",

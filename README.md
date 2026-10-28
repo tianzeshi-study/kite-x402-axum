@@ -209,7 +209,7 @@ The service exposes lightweight Kubernetes-compatible health endpoints outside t
 
 - **`GET /healthz`** (Liveness probe): Returns `200 OK` (`"ok"`) immediately without contacting backends. Free and unmetered.
 - **`GET /readyz`** (Readiness probe): Probes downstream dependencies by pinging the configured Kite facilitator `/verify` endpoint with a zero-budget probe.
-  - Returns `200 OK` with JSON `{"status":"ok","facilitator":"ok"}` when the facilitator is reachable and operational.
+  - Returns `200 OK` with JSON `{"status":"ready","facilitator":"ok","network":"…"}` only when `/supported` returns valid JSON advertising x402 v2, `exact`, and the configured network. A reachable 404, malformed body, or incompatible capability returns 503. This does not prove that a funded payment will settle.
   - Returns `503 Service Unavailable` with JSON `{"status":"unavailable","facilitator":"error","error":"..."}` if the facilitator cannot be reached. Useful for load balancers and orchestrators to avoid routing traffic before the settlement gateway is operational.
 ## Browser CORS support
 
