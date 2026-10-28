@@ -53,6 +53,9 @@ const MAX_REDIRECTS: usize = 10;
 /// exhaust memory.
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+/// Finite paid responses are buffered before the gate can begin settlement.
+const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 /// Configuration for forwarding a paid request to the wrapped API.
 #[derive(Clone)]
 pub struct UpstreamConfig {
@@ -280,7 +283,7 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
         .send()
         .await;
 
-    let upstream_response = match upstream_response {
+    let mut upstream_response = match upstream_response {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(
@@ -330,9 +333,33 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
         }
     }
 
-    let stream = upstream_response.bytes_stream();
+    let mut bytes = Vec::new();
+    loop {
+        match upstream_response.chunk().await {
+            Ok(Some(chunk))
+                if chunk.len() <= MAX_RESPONSE_BODY_BYTES.saturating_sub(bytes.len()) =>
+            {
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(Some(_)) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    axum::Json(json!({"error": "upstream response too large"})),
+                )
+                    .into_response()
+            }
+            Ok(None) => break,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    axum::Json(json!({"error": "upstream response incomplete"})),
+                )
+                    .into_response()
+            }
+        }
+    }
     builder
-        .body(Body::from_stream(stream))
+        .body(Body::from(bytes))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 

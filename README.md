@@ -205,6 +205,12 @@ The service emits structured JSON error bodies:
 
 ## Health and Readiness Probes
 
+Paid proxy responses are finite and buffered up to 16 MiB before settlement.
+An incomplete, oversized, or timed-out upstream body returns 502 without a
+settlement call. Configure the upstream client's timeout to bound body reads.
+This template does not support indefinite/SSE streams. Buffering verifies upstream
+completion; it cannot guarantee that a disconnected buyer receives every byte.
+
 The service exposes lightweight Kubernetes-compatible health endpoints outside the metered `/v1/*` namespace:
 
 - **`GET /healthz`** (Liveness probe): Returns `200 OK` (`"ok"`) immediately without contacting backends. Free and unmetered.
