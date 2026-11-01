@@ -316,6 +316,15 @@ impl Mocks {
             Router::new()
                 .route("/verify", post(verify_handler))
                 .route("/settle", post(settle_handler))
+                .route(
+                    "/supported",
+                    get(|| async {
+                        Json(json!({"kinds": [
+                            {"x402Version": 2, "scheme": "exact", "network": "eip155:2368"},
+                            {"x402Version": 2, "scheme": "exact", "network": "eip155:2366"}
+                        ]}))
+                    }),
+                )
                 .with_state(facilitator.clone()),
         )
         .await;
