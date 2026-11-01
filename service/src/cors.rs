@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Request, State},
-    http::{header, HeaderValue, Method, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -76,6 +76,20 @@ impl CorsConfig {
     }
 }
 
+fn vary_origin(headers: &mut HeaderMap) {
+    let present = headers.get_all(header::VARY).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value.split(',').any(|token| {
+                let token = token.trim();
+                token == "*" || token.eq_ignore_ascii_case("origin")
+            })
+        })
+    });
+    if !present {
+        headers.append(header::VARY, HeaderValue::from_static("Origin"));
+    }
+}
+
 /// Axum middleware for handling CORS preflights and attaching access control headers.
 pub(crate) async fn cors_middleware(
     State(cors): State<Arc<CorsConfig>>,
@@ -98,6 +112,9 @@ pub(crate) async fn cors_middleware(
     // Handle browser CORS preflight requests (OPTIONS with Origin header)
     if is_options && origin_header.is_some() {
         let mut response = StatusCode::NO_CONTENT.into_response();
+        if matches!(cors.as_ref(), CorsConfig::Origins(_)) {
+            vary_origin(response.headers_mut());
+        }
         if let Some(ref origin) = matched_origin {
             let headers = response.headers_mut();
             headers.insert(
@@ -118,14 +135,15 @@ pub(crate) async fn cors_middleware(
                 header::ACCESS_CONTROL_MAX_AGE,
                 HeaderValue::from_static("86400"),
             );
-            if origin != "*" {
-                headers.insert(header::VARY, HeaderValue::from_static("Origin"));
-            }
         }
         return response;
     }
 
     let mut response = next.run(req).await;
+    // A cache must distinguish allowed, denied and absent Origin requests.
+    if matches!(cors.as_ref(), CorsConfig::Origins(_)) {
+        vary_origin(response.headers_mut());
+    }
 
     // Attach CORS response headers if origin is permitted
     if let Some(ref origin) = matched_origin {
@@ -140,9 +158,6 @@ pub(crate) async fn cors_middleware(
                 "Payment-Required, Payment-Response, X-Payment, Payment-Signature, Retry-After, X-Request-ID",
             ),
         );
-        if origin != "*" {
-            headers.insert(header::VARY, HeaderValue::from_static("Origin"));
-        }
     }
 
     response
@@ -151,6 +166,56 @@ pub(crate) async fn cors_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserve_and_deduplicate_existing_variation() {
+        for existing in ["Accept-Encoding", "Accept-Encoding, oRiGiN", "*"] {
+            let mut headers = HeaderMap::new();
+            headers.append(header::VARY, HeaderValue::from_str(existing).unwrap());
+            vary_origin(&mut headers);
+            vary_origin(&mut headers);
+            let values: Vec<_> = headers.get_all(header::VARY).iter().collect();
+            assert_eq!(values[0], existing);
+            assert_eq!(
+                values.len(),
+                if existing == "Accept-Encoding" { 2 } else { 1 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn variation_is_preserved_for_allowed_denied_and_absent_origins() {
+        for origin in [
+            Some("https://app.example.com"),
+            Some("https://denied.example"),
+            None,
+        ] {
+            let cfg = Arc::new(CorsConfig::Origins(vec!["https://app.example.com".into()]));
+            let app = Router::new()
+                .route(
+                    "/",
+                    get(|| async { ([(header::VARY, "Accept-Encoding")], "ok") }),
+                )
+                .layer(axum_mw::from_fn_with_state(cfg, cors_middleware));
+            let mut req = Request::builder().uri("/");
+            if let Some(origin) = origin {
+                req = req.header(header::ORIGIN, origin);
+            }
+            let res = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+            let values: Vec<_> = res
+                .headers()
+                .get_all(header::VARY)
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect();
+            assert_eq!(values, ["Accept-Encoding", "Origin"]);
+            assert_eq!(
+                res.headers()
+                    .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                origin == Some("https://app.example.com")
+            );
+        }
+    }
 
     #[test]
     fn parse_disabled() {
@@ -298,6 +363,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(res.headers().get(header::VARY).unwrap(), "Origin");
         assert!(res
             .headers()
             .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
