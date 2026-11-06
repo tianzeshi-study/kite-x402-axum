@@ -63,6 +63,9 @@
 //! upstream responds with a status below 400.
 
 pub mod circuit_breaker;
+/// Opt-in atomic in-flight admission permits.
+#[path = "middleware/concurrency_limiter.rs"]
+pub mod concurrency_limiter;
 pub mod expiration;
 pub mod facilitator;
 pub mod firewall;
