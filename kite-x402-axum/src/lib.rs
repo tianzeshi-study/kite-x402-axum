@@ -71,6 +71,7 @@ pub mod kite;
 pub mod metrics;
 pub mod middleware;
 pub mod nonce_guard;
+pub mod payment_options;
 pub mod proxy;
 pub mod security_headers;
 pub mod settlement_ledger;
@@ -90,6 +91,7 @@ pub use kite::{kite_chain_by_name, KiteChain, KiteError, KITE_MAINNET, KITE_TEST
 pub use metrics::{PaymentMetrics, PaymentMetricsSnapshot};
 pub use middleware::{x402_payment, PaymentConfig};
 pub use nonce_guard::{NonceReplayError, PaymentNonceReplayGuard, PaymentNonceReservation};
+pub use payment_options::{find_matching_requirements, requirements_all, PaymentOption};
 pub use proxy::{proxy, UpstreamConfig};
 pub use security_headers::SecurityHeadersConfig;
 pub use settlement_ledger::{LedgerSummary, SettlementLedger, SettlementRecord};
