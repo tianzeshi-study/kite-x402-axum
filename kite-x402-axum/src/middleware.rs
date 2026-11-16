@@ -112,7 +112,7 @@ impl PaymentConfig {
 }
 
 fn payment_required_response(
-    requirements: PaymentRequirements,
+    requirements: &[PaymentRequirements],
     resource_url: String,
     description: String,
     error: Option<String>,
@@ -125,7 +125,7 @@ fn payment_required_response(
             description: Some(description),
             mime_type: Some("application/json".to_owned()),
         },
-        accepts: vec![requirements],
+        accepts: requirements.to_vec(),
     };
 
     let mut response = (StatusCode::PAYMENT_REQUIRED, Json(json!({}))).into_response();
@@ -151,33 +151,14 @@ fn settlement_failure_response(settle: &crate::types::SettleResponse) -> Respons
     response
 }
 
-/// The x402 payment middleware. Apply with
-/// [`axum::middleware::from_fn_with_state`] to the `/v1/*` route group:
+/// Shared gate engine.
 ///
-/// ```ignore
-/// let cfg = Arc::new(PaymentConfig { .. });
-/// let paid = Router::new()
-///     .route("/{*path}", any(proxy))
-///     .with_state(upstream_cfg)
-///     .layer(middleware::from_fn_with_state(cfg, x402_payment));
-/// ```
-///
-/// Behavior:
-/// 1. No `PAYMENT-SIGNATURE` (or legacy `X-PAYMENT`) header → `402` with a
-///    `PAYMENT-REQUIRED` header describing how to pay.
-/// 2. Header present but doesn't decode, or doesn't match this route's
-///    price/network/asset/payTo → `402` with `error` explaining why.
-/// 3. Facilitator `/verify` says invalid, or the facilitator could not be
-///    reached at all → `402` with `error` set to the reason (see the
-///    crate-level docs for why facilitator-unreachable is also a `402`).
-/// 4. Verified → the inner handler runs. If it answers `>= 400`, that
-///    response is returned unchanged and **no settlement is attempted**.
-/// 5. If it answers `< 400`, `/settle` is called. On success, a
-///    `PAYMENT-RESPONSE` header is attached and `Cache-Control` gets
-///    `private` merged in. On failure, a `402` with `PAYMENT-RESPONSE`
-///    (`success: false`) is returned instead of the handler's response.
-pub async fn x402_payment(
-    State(cfg): State<Arc<PaymentConfig>>,
+/// `options` are the wire-level requirements this route accepts; the client's
+/// `accepted` must match one of them. Both the single-option and multi-option
+/// entry points funnel through here, so verify/settle logic is written once.
+async fn payment_gate_inner(
+    cfg: &PaymentConfig,
+    options: &[PaymentRequirements],
     req: Request,
     next: Next,
 ) -> Response {
@@ -201,21 +182,6 @@ pub async fn x402_payment(
         "Processing request through x402 payment gate"
     );
 
-    let requirements = match cfg.requirements() {
-        Ok(r) => r,
-        Err(msg) => {
-            tracing::error!(
-                error = %msg,
-                "Failed to compute payment requirements (invalid server configuration)"
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": msg })),
-            )
-                .into_response();
-        }
-    };
-
     let header_value = req
         .headers()
         .get("PAYMENT-SIGNATURE")
@@ -230,18 +196,13 @@ pub async fn x402_payment(
         );
         tracing::debug!(
             uri = %resource_url,
-            requirements = ?requirements,
+            options = ?options,
             "402 challenge requirements details"
         );
         if let Some(metrics) = &cfg.metrics {
             metrics.record_challenge();
         }
-        return payment_required_response(
-            requirements,
-            resource_url,
-            cfg.description.clone(),
-            None,
-        );
+        return payment_required_response(options, resource_url, cfg.description.clone(), None);
     };
 
     tracing::debug!(
@@ -258,17 +219,21 @@ pub async fn x402_payment(
             metrics.record_challenge();
         }
         return payment_required_response(
-            requirements,
+            options,
             resource_url,
             cfg.description.clone(),
             Some("Invalid payment signature".to_owned()),
         );
     };
 
-    if payload.accepted != requirements {
+    // Find which advertised option the client chose. Single-option callers
+    // pass a one-element slice, making this equivalent to the old `==` check.
+    let Some(requirements) =
+        crate::payment_options::find_matching_requirements(&payload.accepted, options)
+    else {
         tracing::warn!(
             uri = %resource_url,
-            expected = ?requirements,
+            expected = ?options,
             actual = ?payload.accepted,
             "Payment requirements mismatch; returning 402"
         );
@@ -276,12 +241,12 @@ pub async fn x402_payment(
             metrics.record_challenge();
         }
         return payment_required_response(
-            requirements,
+            options,
             resource_url,
             cfg.description.clone(),
             Some("No matching payment requirements".to_owned()),
         );
-    }
+    };
 
     if let Some(guard) = &cfg.expiration_guard {
         if let Some(auth) = payload.payload.get("authorization") {
@@ -304,7 +269,7 @@ pub async fn x402_payment(
                         "Payment authorization rejected by expiration guard; returning 402"
                     );
                     return payment_required_response(
-                        requirements,
+                        options,
                         resource_url,
                         cfg.description.clone(),
                         Some(e.to_string()),
@@ -335,7 +300,7 @@ pub async fn x402_payment(
                     metrics.record_challenge();
                 }
                 return payment_required_response(
-                    requirements,
+                    options,
                     resource_url,
                     cfg.description.clone(),
                     Some(error.to_string()),
@@ -355,7 +320,7 @@ pub async fn x402_payment(
         "Calling facilitator to verify payment signature"
     );
 
-    let verify_outcome = cfg.facilitator.verify(&payload, &requirements).await;
+    let verify_outcome = cfg.facilitator.verify(&payload, requirements).await;
     let verify = match verify_outcome {
         Ok(v) => v,
         Err(e) => {
@@ -371,7 +336,7 @@ pub async fn x402_payment(
                 metrics.record_challenge();
             }
             return payment_required_response(
-                requirements,
+                options,
                 resource_url,
                 cfg.description.clone(),
                 Some(format!("facilitator verify unavailable: {e}")),
@@ -394,7 +359,7 @@ pub async fn x402_payment(
             metrics.record_challenge();
         }
         return payment_required_response(
-            requirements,
+            options,
             resource_url,
             cfg.description.clone(),
             Some(reason),
@@ -448,7 +413,7 @@ pub async fn x402_payment(
     );
 
     let settle_start = std::time::Instant::now();
-    let settle_outcome = cfg.facilitator.settle(&payload, &requirements).await;
+    let settle_outcome = cfg.facilitator.settle(&payload, requirements).await;
     let settle_duration = settle_start.elapsed();
     let settle = match settle_outcome {
         Ok(s) => {
@@ -472,7 +437,7 @@ pub async fn x402_payment(
                 error_message: None,
                 payer: None,
                 transaction: String::new(),
-                network: cfg.chain.network.to_owned(),
+                network: requirements.network.clone(),
                 amount: None,
             };
             return settlement_failure_response(&failure);
@@ -540,6 +505,152 @@ pub async fn x402_payment(
     );
 
     Response::from_parts(parts, body)
+}
+
+/// The x402 payment middleware. Apply with
+/// [`axum::middleware::from_fn_with_state`] to the `/v1/*` route group:
+///
+/// ```ignore
+/// let cfg = Arc::new(PaymentConfig { .. });
+/// let paid = Router::new()
+///     .route("/{*path}", any(proxy))
+///     .with_state(upstream_cfg)
+///     .layer(middleware::from_fn_with_state(cfg, x402_payment));
+/// ```
+///
+/// This is the single-option gate: it builds one `PaymentRequirements` from
+/// the route's static config (one price/network/asset) and delegates to the
+/// shared engine. Existing callers keep working unchanged. Behavior:
+///
+/// 1. No `PAYMENT-SIGNATURE` (or legacy `X-PAYMENT`) header → `402` with a
+///    `PAYMENT-REQUIRED` header describing how to pay.
+/// 2. Header present but doesn't decode, or doesn't match this route's
+///    price/network/asset/payTo → `402` with `error` explaining why.
+/// 3. Facilitator `/verify` says invalid, or the facilitator could not be
+///    reached at all → `402` with `error` set to the reason (see the
+///    crate-level docs for why facilitator-unreachable is also a `402`).
+/// 4. Verified → the inner handler runs. If it answers `>= 400`, that
+///    response is returned unchanged and **no settlement is attempted**.
+/// 5. If it answers `< 400`, `/settle` is called. On success, a
+///    `PAYMENT-RESPONSE` header is attached and `Cache-Control` gets
+///    `private` merged in. On failure, a `402` with `PAYMENT-RESPONSE`
+///    (`success: false`) is returned instead of the handler's response.
+pub async fn x402_payment(
+    State(cfg): State<Arc<PaymentConfig>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let requirements = match cfg.requirements() {
+        Ok(r) => r,
+        Err(msg) => {
+            tracing::error!(
+                error = %msg,
+                "Failed to compute payment requirements (invalid server configuration)"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": msg })),
+            )
+                .into_response();
+        }
+    };
+    payment_gate_inner(&cfg, std::slice::from_ref(&requirements), req, next).await
+}
+
+/// Configuration for the multi-option gate: the shared infrastructure (who
+/// receives payment, the facilitator, guards, metrics, description) plus the
+/// list of payment options to advertise on this route.
+///
+/// `PaymentOption` values are rendered into wire requirements at request time
+/// using the same integer price parser as the single-option gate.
+#[derive(Clone, Debug)]
+pub struct MultiPaymentConfig {
+    /// Address that receives payments (shared by every option).
+    pub pay_to: String,
+    /// The payment options advertised on this route.
+    pub options: Vec<crate::payment_options::PaymentOption>,
+    /// Shown to the buyer in the 402 challenge.
+    pub description: String,
+    /// Client for the Kite facilitator's `/verify` and `/settle`.
+    pub facilitator: FacilitatorClient,
+    /// Optional expiration guard.
+    pub expiration_guard: Option<crate::expiration::ExpirationGuardConfig>,
+    /// Optional metrics collector.
+    pub metrics: Option<Arc<crate::metrics::PaymentMetrics>>,
+    /// Optional nonce replay guard.
+    pub nonce_guard: Option<Arc<crate::nonce_guard::PaymentNonceReplayGuard>>,
+}
+
+impl MultiPaymentConfig {
+    /// Creates a multi-option config with no optional guards or metrics.
+    pub fn new(
+        pay_to: impl Into<String>,
+        options: Vec<crate::payment_options::PaymentOption>,
+        description: impl Into<String>,
+        facilitator: FacilitatorClient,
+    ) -> Self {
+        Self {
+            pay_to: pay_to.into(),
+            options,
+            description: description.into(),
+            facilitator,
+            expiration_guard: None,
+            metrics: None,
+            nonce_guard: None,
+        }
+    }
+
+    /// Builds a `PaymentConfig` view over this config's shared infrastructure.
+    /// The gate engine only reads these fields; options are passed separately.
+    fn as_base(&self) -> PaymentConfig {
+        PaymentConfig {
+            pay_to: self.pay_to.clone(),
+            // `chain`/`price_usd` are unused by the engine on the multi path
+            // (options carry their own chains). Keep them coherent anyway.
+            chain: self
+                .options
+                .first()
+                .map(|o| o.chain)
+                .unwrap_or(crate::kite::KITE_TESTNET),
+            price_usd: String::new(),
+            description: self.description.clone(),
+            facilitator: self.facilitator.clone(),
+            expiration_guard: self.expiration_guard,
+            metrics: self.metrics.clone(),
+            nonce_guard: self.nonce_guard.clone(),
+        }
+    }
+}
+
+/// Multi-option payment gate. Advertises every configured option in the 402
+/// challenge and accepts a client payment matching any one of them. Uses the
+/// exact same verify/settle engine as [`x402_payment`].
+pub async fn x402_payment_multi(
+    State(cfg): State<Arc<MultiPaymentConfig>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let options = match crate::payment_options::requirements_all(&cfg.options, &cfg.pay_to) {
+        Ok(o) if !o.is_empty() => o,
+        Ok(_) => {
+            tracing::error!("MultiPaymentConfig has no payment options configured");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "no payment options configured" })),
+            )
+                .into_response();
+        }
+        Err(msg) => {
+            tracing::error!(error = %msg, "Failed to compute payment requirements");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": msg })),
+            )
+                .into_response();
+        }
+    };
+    let base = cfg.as_base();
+    payment_gate_inner(&base, &options, req, next).await
 }
 
 #[cfg(test)]
@@ -691,7 +802,12 @@ mod tests {
 
     #[tokio::test]
     async fn payment_required_response_has_status_headers_and_empty_body() {
-        let resp = payment_required_response(requirements(), "/v1/x".into(), "desc".into(), None);
+        let resp = payment_required_response(
+            std::slice::from_ref(&requirements()),
+            "/v1/x".into(),
+            "desc".into(),
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
         assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
         assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/json");
@@ -714,7 +830,7 @@ mod tests {
     #[test]
     fn payment_required_response_includes_the_error_when_given() {
         let resp = payment_required_response(
-            requirements(),
+            std::slice::from_ref(&requirements()),
             "/v1/x".into(),
             "d".into(),
             Some("because".into()),
@@ -726,7 +842,7 @@ mod tests {
     fn payment_required_response_survives_unusual_text() {
         // base64 output is always a valid header value, whatever the inputs.
         let resp = payment_required_response(
-            requirements(),
+            std::slice::from_ref(&requirements()),
             "/v1/ünï?q=\n\t\"x\"".into(),
             "line1\nline2 — \u{1F4B8}".into(),
             Some("err\r\nInjected: header".into()),
@@ -1027,5 +1143,87 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("facilitator verify unavailable"));
+    }
+
+    // ---- multi-option gate ------------------------------------------------
+
+    fn multi_gate(options: Vec<crate::payment_options::PaymentOption>) -> Svc {
+        let cfg = Arc::new(MultiPaymentConfig::new(
+            PAY_TO,
+            options,
+            "Multi test service",
+            dead_facilitator(),
+        ));
+        ServiceBuilder::new()
+            .layer(from_fn_with_state(cfg, x402_payment_multi))
+            .service(service_fn(|_req: Request| async {
+                Ok::<_, Infallible>((StatusCode::OK, "inner").into_response())
+            }))
+            .boxed_clone()
+    }
+
+    #[tokio::test]
+    async fn multi_option_challenge_advertises_every_option() {
+        let svc = multi_gate(vec![
+            crate::payment_options::PaymentOption::new(KITE_TESTNET, "0.001"),
+            crate::payment_options::PaymentOption::new(KITE_MAINNET, "$1.50"),
+        ]);
+
+        let resp = svc.oneshot(request("/v1/data", &[])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let challenge = decode_header(&resp, "PAYMENT-REQUIRED");
+        let accepts = challenge["accepts"].as_array().unwrap();
+        assert_eq!(accepts.len(), 2, "challenge must advertise both options");
+        assert_eq!(accepts[0]["network"], KITE_TESTNET.network);
+        assert_eq!(accepts[1]["network"], KITE_MAINNET.network);
+    }
+
+    #[tokio::test]
+    async fn multi_option_accepts_a_client_choice_that_matches_one_option() {
+        // The chosen option is the second one. A dead facilitator means verify
+        // fails, but critically the gate must NOT answer "No matching payment
+        // requirements" — proving the match against option #2 succeeded and
+        // the request reached the facilitator stage.
+        let options = vec![
+            crate::payment_options::PaymentOption::new(KITE_TESTNET, "0.001"),
+            crate::payment_options::PaymentOption::new(KITE_MAINNET, "$1.50"),
+        ];
+        let all = crate::payment_options::requirements_all(&options, PAY_TO).unwrap();
+        let chosen = payload_header(&all[1]);
+
+        let svc = multi_gate(options);
+        let resp = svc
+            .oneshot(request("/v1/data", &[("PAYMENT-SIGNATURE", &chosen)]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let challenge = decode_header(&resp, "PAYMENT-REQUIRED");
+        let error = challenge["error"].as_str().unwrap();
+        assert!(
+            error.contains("facilitator verify unavailable"),
+            "expected verify stage reached, got: {error}"
+        );
+        assert!(!error.contains("No matching payment requirements"));
+    }
+
+    #[tokio::test]
+    async fn multi_option_rejects_a_choice_matching_no_option() {
+        let options = vec![
+            crate::payment_options::PaymentOption::new(KITE_TESTNET, "0.001"),
+            crate::payment_options::PaymentOption::new(KITE_MAINNET, "$1.50"),
+        ];
+        let all = crate::payment_options::requirements_all(&options, PAY_TO).unwrap();
+        let mut foreign = all[0].clone();
+        foreign.network = "eip155:1".to_owned();
+        let chosen = payload_header(&foreign);
+
+        let svc = multi_gate(options);
+        let resp = svc
+            .oneshot(request("/v1/data", &[("PAYMENT-SIGNATURE", &chosen)]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let challenge = decode_header(&resp, "PAYMENT-REQUIRED");
+        assert_eq!(challenge["error"], "No matching payment requirements");
     }
 }

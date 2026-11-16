@@ -89,7 +89,7 @@ pub use firewall::{FirewallRule, IpFilterAction, IpFirewall, IpFirewallConfig};
 pub use idempotency::{AcquireResult, CachedResponse, IdempotencyCache, IdempotencyConfig};
 pub use kite::{kite_chain_by_name, KiteChain, KiteError, KITE_MAINNET, KITE_TESTNET};
 pub use metrics::{PaymentMetrics, PaymentMetricsSnapshot};
-pub use middleware::{x402_payment, PaymentConfig};
+pub use middleware::{x402_payment, x402_payment_multi, MultiPaymentConfig, PaymentConfig};
 pub use nonce_guard::{NonceReplayError, PaymentNonceReplayGuard, PaymentNonceReservation};
 pub use payment_options::{find_matching_requirements, requirements_all, PaymentOption};
 pub use proxy::{proxy, UpstreamConfig};
