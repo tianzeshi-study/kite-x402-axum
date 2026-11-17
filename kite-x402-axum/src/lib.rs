@@ -62,7 +62,9 @@
 //! also guarantees — is untouched: a request is only settled after the
 //! upstream responds with a status below 400.
 
+pub mod cache_store;
 pub mod circuit_breaker;
+pub mod cors_guard;
 pub mod expiration;
 pub mod facilitator;
 pub mod firewall;
@@ -74,14 +76,17 @@ pub mod nonce_guard;
 pub mod proxy;
 pub mod security_headers;
 pub mod settlement_ledger;
+pub mod sliding_limiter;
 pub mod types;
 /// Webhook event types and a retrying dispatcher for payment notifications.
 pub mod webhook;
 pub mod wire;
 
+pub use cache_store::{CachedVerification, VerificationCacheStore};
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError, CircuitBreakerSnapshot, CircuitState,
 };
+pub use cors_guard::{CorsGuardConfig, CorsSecurityGuard};
 pub use expiration::{ExpirationError, ExpirationGuardConfig};
 pub use facilitator::{FacilitatorClient, FacilitatorError, RetryConfig};
 pub use firewall::{FirewallRule, IpFilterAction, IpFirewall, IpFirewallConfig};
@@ -93,16 +98,8 @@ pub use nonce_guard::{NonceReplayError, PaymentNonceReplayGuard, PaymentNonceRes
 pub use proxy::{proxy, UpstreamConfig};
 pub use security_headers::SecurityHeadersConfig;
 pub use settlement_ledger::{LedgerSummary, SettlementLedger, SettlementRecord};
+pub use sliding_limiter::{SlidingWindowConfig, SlidingWindowLimiter};
 pub use webhook::{
     DeliveryStatus, WebhookConfig, WebhookDeliveryRecord, WebhookDispatcher, WebhookEventType,
     WebhookPayload,
 };
-
-pub mod cors_guard;
-pub use cors_guard::*;
-
-pub mod cache_store;
-pub use cache_store::*;
-
-pub mod sliding_limiter;
-pub use sliding_limiter::*;
