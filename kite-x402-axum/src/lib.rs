@@ -74,6 +74,8 @@ pub mod nonce_guard;
 pub mod proxy;
 pub mod security_headers;
 pub mod settlement_ledger;
+/// Opt-in in-memory telemetry primitives.
+pub mod telemetry;
 pub mod types;
 /// Webhook event types and a retrying dispatcher for payment notifications.
 pub mod webhook;

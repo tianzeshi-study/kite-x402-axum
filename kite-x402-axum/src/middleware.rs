@@ -6,6 +6,16 @@
 //! unreachable — as `402 Payment Required`, matching the Go SDK rather than
 //! the TypeScript SDK's `500`/`502` split.
 
+/// Opt-in peer-identity resolution helpers.
+pub mod header_sanitizer;
+/// Backoff calculation only; does not retry payment settlement.
+pub mod retry;
+/// Borrowed payload inspection without copying bytes.
+pub mod zero_copy_decoder;
+
+// Reuse the established implementations rather than publishing duplicate stubs.
+pub use crate::{circuit_breaker, security_headers};
+
 use std::sync::Arc;
 
 use axum::{

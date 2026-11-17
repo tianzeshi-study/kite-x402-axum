@@ -1,25 +1,20 @@
+//! Explicit trusted-peer identity resolution. Configure proxies to overwrite identity headers.
 use std::net::IpAddr;
 
-#[derive(Debug, Clone)]
+/// Explicit peers allowed to supply sanitized forwarding headers.
+#[derive(Debug, Clone, Default)]
 pub struct HeaderSanitizerConfig {
+    /// Proxy socket addresses. Empty means trust no forwarding headers.
     pub trusted_proxies: Vec<IpAddr>,
 }
 
-impl Default for HeaderSanitizerConfig {
-    fn default() -> Self {
-        Self {
-            trusted_proxies: vec![
-                "127.0.0.1".parse().unwrap(),
-                "::1".parse().unwrap(),
-            ],
-        }
-    }
-}
-
+/// Resolves identities only from explicitly trusted peers.
+#[derive(Debug)]
 pub struct HeaderSanitizer;
 
 impl HeaderSanitizer {
     /// Resolves the actual client IP from request headers if the remote peer is trusted
+    #[must_use]
     pub fn resolve_client_ip(
         peer_addr: IpAddr,
         forwarded_for: Option<&str>,

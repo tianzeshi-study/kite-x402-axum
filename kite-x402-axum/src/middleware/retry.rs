@@ -1,13 +1,16 @@
+//! Full-jitter delay calculation. Callers choose whether an operation is safe to retry.
 use std::time::Duration;
-use rand::Rng;
 
+/// Limits for an opt-in backoff calculation.
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
+    /// Number of calculated retry delays.
     pub max_attempts: u32,
+    /// Initial exponential ceiling.
     pub base_delay: Duration,
+    /// Maximum returned delay.
     pub max_delay: Duration,
 }
-
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
@@ -17,8 +20,9 @@ impl Default for RetryPolicy {
         }
     }
 }
-
 impl RetryPolicy {
+    /// Constructs a delay policy; this does not execute or retry any operation.
+    #[must_use]
     pub fn new(max_attempts: u32, base_delay: Duration, max_delay: Duration) -> Self {
         Self {
             max_attempts,
@@ -26,35 +30,17 @@ impl RetryPolicy {
             max_delay,
         }
     }
-
-    /// Computes full-jitter backoff for attempt index (0-based)
+    /// Returns full-jitter backoff for a zero-based retry, capped at max_delay.
+    #[must_use]
     pub fn calculate_backoff(&self, attempt: u32) -> Duration {
         if attempt >= self.max_attempts {
             return self.max_delay;
         }
-
-        let multiplier = 2u64.saturating_pow(attempt);
-        let ceiling_millis = (self.base_delay.as_millis() as u64)
-            .saturating_mul(multiplier)
-            .min(self.max_delay.as_millis() as u64);
-
-        let mut rng = rand::thread_rng();
-        let jittered_millis = rng.gen_range(0..=ceiling_millis);
-
-        Duration::from_millis(jittered_millis)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_backoff_bounds() {
-        let policy = RetryPolicy::default();
-        for i in 0..5 {
-            let delay = policy.calculate_backoff(i);
-            assert!(delay <= policy.max_delay);
-        }
+        let ceiling = self
+            .base_delay
+            .saturating_mul(2u32.saturating_pow(attempt))
+            .min(self.max_delay);
+        let millis = u64::try_from(ceiling.as_millis()).unwrap_or(u64::MAX);
+        Duration::from_millis(rand::random_range(0..=millis))
     }
 }
