@@ -97,13 +97,14 @@ fifth defect found while fixing them — `..` / `%2e%2e` path segments escaping
 the upstream base path — is fixed and covered there too. See the root README's
 "Proxy regression tests" section.
 
-## 6. Payment-requirements matching is single-option only
+## 6. ~~Payment-requirements matching is single-option only~~ — resolved
 
-`x402_payment` compares the client's `accepted` field against exactly one
-`PaymentRequirements` built from this route's static config (one price, one
-network, one asset) — there's no `findMatchingRequirements`-style search
-over multiple accepted options. This matches what both official wrapper
-templates actually do today (one price per route), so it's not a gap
-relative to them, but it means this crate alone isn't a drop-in replacement
-for the full `x402ResourceServer` if a future wrapper template needs
-multiple simultaneous price/network options on one route.
+`PaymentConfig::with_payment_option` now registers additional
+`(chain, price)` options. The 402 challenge advertises every option
+(primary first, then extras in configuration order), and the gate matches
+the client's `accepted` against the advertised options with
+`findMatchingRequirements`-style semantics: scheme, network, asset, `payTo`
+and amount must match, while `maxTimeoutSeconds` and `extra` are advisory.
+Verification and settlement then use the option the client chose. Covered
+by `kite-x402-axum/tests/payment_options.rs` plus unit tests in
+`src/middleware.rs`.

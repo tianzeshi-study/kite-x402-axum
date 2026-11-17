@@ -23,6 +23,18 @@ use crate::{
     wire::{decode_payment_payload, encode_payment_required, encode_settle_response},
 };
 
+/// One additional accepted way to pay, beyond the primary `chain`/`price_usd`
+/// pair configured on [`PaymentConfig`]. Registered with
+/// [`PaymentConfig::with_payment_option`] and advertised in the 402 challenge
+/// after the primary option.
+#[derive(Clone, Debug)]
+pub struct PaymentOption {
+    /// The chain this option settles on (`mainnet` or `testnet`).
+    pub chain: KiteChain,
+    /// A `"0.001"`-or-`"$0.001"`-style USD price per call on `chain`.
+    pub price_usd: String,
+}
+
 /// Shared configuration for the payment gate on a route (or group of
 /// routes). Build one and pass it to [`axum::middleware::from_fn_with_state`]
 /// wrapped in an [`Arc`].
@@ -34,6 +46,9 @@ pub struct PaymentConfig {
     pub chain: KiteChain,
     /// A `"0.001"`-or-`"$0.001"`-style USD price per call.
     pub price_usd: String,
+    /// Additional accepted `(chain, price)` options, advertised after the
+    /// primary one and matched with the same rules. Empty by default.
+    pub extra_payment_options: Vec<PaymentOption>,
     /// Shown to the buyer as the resource description in the 402 challenge.
     pub description: String,
     /// Client for the Kite facilitator's `/verify` and `/settle`.
@@ -59,6 +74,7 @@ impl PaymentConfig {
             pay_to: pay_to.into(),
             chain,
             price_usd: price_usd.into(),
+            extra_payment_options: Vec::new(),
             description: description.into(),
             facilitator,
             expiration_guard: None,
@@ -94,25 +110,79 @@ impl PaymentConfig {
         self
     }
 
-    fn requirements(&self) -> Result<PaymentRequirements, String> {
-        let asset = self
-            .chain
-            .parse_price(&self.price_usd)
+    /// Registers one more accepted `(chain, price)` way to pay, advertised in
+    /// the 402 challenge after the options registered so far. The client may
+    /// then pick any advertised option; verification and settlement use the
+    /// option the client chose.
+    #[must_use]
+    pub fn with_payment_option(mut self, chain: KiteChain, price_usd: impl Into<String>) -> Self {
+        self.extra_payment_options.push(PaymentOption {
+            chain,
+            price_usd: price_usd.into(),
+        });
+        self
+    }
+    fn requirements_for(
+        pay_to: &str,
+        chain: &KiteChain,
+        price_usd: &str,
+    ) -> Result<PaymentRequirements, String> {
+        let asset = chain
+            .parse_price(price_usd)
             .map_err(|e| format!("invalid PRICE_USD configured on the server: {e}"))?;
         Ok(PaymentRequirements {
             scheme: "exact".to_owned(),
-            network: self.chain.network.to_owned(),
+            network: chain.network.to_owned(),
             amount: asset.amount,
             asset: asset.asset,
-            pay_to: self.pay_to.clone(),
+            pay_to: pay_to.to_owned(),
             max_timeout_seconds: 60,
             extra: Some(asset.extra),
         })
     }
+
+    /// The primary payment option, derived from `chain` and `price_usd`.
+    fn requirements(&self) -> Result<PaymentRequirements, String> {
+        Self::requirements_for(&self.pay_to, &self.chain, &self.price_usd)
+    }
+
+    /// Every payment option this route advertises: the primary
+    /// `chain`/`price_usd` pair first, then each entry of
+    /// [`PaymentConfig::extra_payment_options`] in configuration order.
+    fn all_requirements(&self) -> Result<Vec<PaymentRequirements>, String> {
+        let mut all = vec![self.requirements()?];
+        for (index, option) in self.extra_payment_options.iter().enumerate() {
+            let requirements =
+                Self::requirements_for(&self.pay_to, &option.chain, &option.price_usd).map_err(
+                    |e| {
+                        format!(
+                            "invalid PRICE_USD for extra payment option #{index}: {}",
+                            e.trim_start_matches("invalid PRICE_USD configured on the server: ")
+                        )
+                    },
+                )?;
+            all.push(requirements);
+        }
+        Ok(all)
+    }
+}
+
+/// Whether a client's `accepted` requirements satisfy one advertised option,
+/// with `findMatchingRequirements`-style semantics: scheme, network, asset,
+/// `payTo` and amount must match exactly, while `maxTimeoutSeconds` and the
+/// `extra` blob are advisory (a client may cap the timeout below the server's
+/// suggestion) and are therefore ignored — mirroring the TypeScript SDK's
+/// matching rules.
+fn matches_requirements(offered: &PaymentRequirements, accepted: &PaymentRequirements) -> bool {
+    offered.scheme == accepted.scheme
+        && offered.network == accepted.network
+        && offered.amount == accepted.amount
+        && offered.asset == accepted.asset
+        && offered.pay_to == accepted.pay_to
 }
 
 fn payment_required_response(
-    requirements: PaymentRequirements,
+    accepts: Vec<PaymentRequirements>,
     resource_url: String,
     description: String,
     error: Option<String>,
@@ -125,7 +195,7 @@ fn payment_required_response(
             description: Some(description),
             mime_type: Some("application/json".to_owned()),
         },
-        accepts: vec![requirements],
+        accepts,
     };
 
     let mut response = (StatusCode::PAYMENT_REQUIRED, Json(json!({}))).into_response();
@@ -201,7 +271,7 @@ pub async fn x402_payment(
         "Processing request through x402 payment gate"
     );
 
-    let requirements = match cfg.requirements() {
+    let accepts = match cfg.all_requirements() {
         Ok(r) => r,
         Err(msg) => {
             tracing::error!(
@@ -230,14 +300,14 @@ pub async fn x402_payment(
         );
         tracing::debug!(
             uri = %resource_url,
-            requirements = ?requirements,
+            accepts = ?accepts,
             "402 challenge requirements details"
         );
         if let Some(metrics) = &cfg.metrics {
             metrics.record_challenge();
         }
         return payment_required_response(
-            requirements,
+            accepts.clone(),
             resource_url,
             cfg.description.clone(),
             None,
@@ -258,30 +328,36 @@ pub async fn x402_payment(
             metrics.record_challenge();
         }
         return payment_required_response(
-            requirements,
+            accepts.clone(),
             resource_url,
             cfg.description.clone(),
             Some("Invalid payment signature".to_owned()),
         );
     };
 
-    if payload.accepted != requirements {
+    let Some(matched) = accepts
+        .iter()
+        .find(|option| matches_requirements(option, &payload.accepted))
+    else {
         tracing::warn!(
             uri = %resource_url,
-            expected = ?requirements,
+            accepts = ?accepts,
             actual = ?payload.accepted,
-            "Payment requirements mismatch; returning 402"
+            "No advertised payment option matches the client's choice; returning 402"
         );
         if let Some(metrics) = &cfg.metrics {
             metrics.record_challenge();
         }
         return payment_required_response(
-            requirements,
+            accepts.clone(),
             resource_url,
             cfg.description.clone(),
             Some("No matching payment requirements".to_owned()),
         );
-    }
+    };
+    // Verification and settlement must use the option the client chose, not
+    // blindly the primary one.
+    let requirements = matched.clone();
 
     if let Some(guard) = &cfg.expiration_guard {
         if let Some(auth) = payload.payload.get("authorization") {
@@ -304,7 +380,7 @@ pub async fn x402_payment(
                         "Payment authorization rejected by expiration guard; returning 402"
                     );
                     return payment_required_response(
-                        requirements,
+                        accepts.clone(),
                         resource_url,
                         cfg.description.clone(),
                         Some(e.to_string()),
@@ -335,7 +411,7 @@ pub async fn x402_payment(
                     metrics.record_challenge();
                 }
                 return payment_required_response(
-                    requirements,
+                    accepts.clone(),
                     resource_url,
                     cfg.description.clone(),
                     Some(error.to_string()),
@@ -371,7 +447,7 @@ pub async fn x402_payment(
                 metrics.record_challenge();
             }
             return payment_required_response(
-                requirements,
+                accepts.clone(),
                 resource_url,
                 cfg.description.clone(),
                 Some(format!("facilitator verify unavailable: {e}")),
@@ -394,7 +470,7 @@ pub async fn x402_payment(
             metrics.record_challenge();
         }
         return payment_required_response(
-            requirements,
+            accepts.clone(),
             resource_url,
             cfg.description.clone(),
             Some(reason),
@@ -472,7 +548,7 @@ pub async fn x402_payment(
                 error_message: None,
                 payer: None,
                 transaction: String::new(),
-                network: cfg.chain.network.to_owned(),
+                network: requirements.network.clone(),
                 amount: None,
             };
             return settlement_failure_response(&failure);
@@ -579,6 +655,7 @@ mod tests {
             pay_to: PAY_TO.to_owned(),
             chain,
             price_usd: price.to_owned(),
+            extra_payment_options: Vec::new(),
             description: "Unit test service".to_owned(),
             facilitator: dead_facilitator(),
             expiration_guard: None,
@@ -675,6 +752,148 @@ mod tests {
         }
     }
 
+    // ---- multiple payment options -------------------------------------------
+
+    fn config_with_extras() -> Arc<PaymentConfig> {
+        Arc::new(
+            PaymentConfig::new(
+                PAY_TO,
+                KITE_TESTNET,
+                "0.001",
+                "Unit test service",
+                dead_facilitator(),
+            )
+            .with_payment_option(KITE_MAINNET, "$0.05")
+            .with_payment_option(KITE_TESTNET, "0.002"),
+        )
+    }
+
+    #[test]
+    fn all_requirements_lists_the_primary_option_first_in_config_order() {
+        let all = config_with_extras().all_requirements().unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].network, KITE_TESTNET.network);
+        assert_eq!(all[0].amount, "1000000000000000");
+        assert_eq!(all[1].network, KITE_MAINNET.network);
+        assert_eq!(all[1].amount, "50000"); // 0.05 * 10^6
+        assert_eq!(all[2].network, KITE_TESTNET.network);
+        assert_eq!(all[2].amount, "2000000000000000"); // 0.002 * 10^18
+        for r in &all {
+            assert_eq!(r.pay_to, PAY_TO);
+        }
+    }
+
+    #[test]
+    fn all_requirements_reports_bad_extra_prices_with_the_option_index() {
+        let cfg = Arc::new(
+            PaymentConfig::new(
+                PAY_TO,
+                KITE_TESTNET,
+                "0.001",
+                "Unit test service",
+                dead_facilitator(),
+            )
+            .with_payment_option(KITE_MAINNET, "not-a-price"),
+        );
+        let err = cfg.all_requirements().unwrap_err();
+        assert!(
+            err.starts_with("invalid PRICE_USD for extra payment option #0:"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn matching_ignores_timeout_seconds_and_extra_data() {
+        let offered = config(KITE_TESTNET, "0.001").requirements().unwrap();
+        let mut accepted = offered.clone();
+        accepted.max_timeout_seconds = 1;
+        accepted.extra = None;
+        assert!(matches_requirements(&offered, &accepted));
+    }
+
+    #[test]
+    fn matching_fails_on_any_semantic_field_difference() {
+        let offered = config(KITE_TESTNET, "0.001").requirements().unwrap();
+        let mutations: Vec<Box<dyn Fn(&mut PaymentRequirements)>> = vec![
+            Box::new(|r: &mut PaymentRequirements| r.scheme = "upi".into()),
+            Box::new(|r: &mut PaymentRequirements| r.network = "eip155:1".into()),
+            Box::new(|r: &mut PaymentRequirements| r.amount = "1".into()),
+            Box::new(|r: &mut PaymentRequirements| r.asset = "0xother".into()),
+            Box::new(|r: &mut PaymentRequirements| r.pay_to = "0xother".into()),
+        ];
+        for mutate in mutations {
+            let mut accepted = offered.clone();
+            mutate(&mut accepted);
+            assert!(
+                !matches_requirements(&offered, &accepted),
+                "accepted = {accepted:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn challenge_advertises_every_configured_option_in_order() {
+        let (svc, _) = gate(config_with_extras());
+        let resp = svc.oneshot(request("/x", &[])).await.unwrap();
+        let challenge = decode_header(&resp, "PAYMENT-REQUIRED");
+        let accepts = challenge["accepts"].as_array().unwrap();
+        assert_eq!(accepts.len(), 3);
+        assert_eq!(accepts[0]["network"], json!(KITE_TESTNET.network));
+        assert_eq!(accepts[1]["network"], json!(KITE_MAINNET.network));
+        assert_eq!(accepts[2]["amount"], json!("2000000000000000"));
+    }
+
+    #[tokio::test]
+    async fn paying_any_advertised_option_is_accepted_for_verification() {
+        // The facilitator is dead: acceptance of each option is proven by the
+        // error becoming "verify unavailable" instead of "no matching".
+        let cfg = config_with_extras();
+        let all = cfg.all_requirements().unwrap();
+        let (svc, reached) = gate(cfg);
+        for option in &all {
+            let resp = svc
+                .clone()
+                .oneshot(request(
+                    "/x",
+                    &[("PAYMENT-SIGNATURE", &payload_header(option))],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+            let err = decode_header(&resp, "PAYMENT-REQUIRED")["error"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                err.starts_with("facilitator verify unavailable: "),
+                "{option:?}: {err}"
+            );
+            assert_eq!(reached.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn paying_an_unadvertised_amount_is_rejected_and_all_options_readvertised() {
+        let cfg = config_with_extras();
+        let mut bogus = cfg.all_requirements().unwrap().pop().unwrap();
+        bogus.amount = "123".into();
+        let (svc, reached) = gate(cfg);
+        let resp = svc
+            .oneshot(request(
+                "/x",
+                &[("PAYMENT-SIGNATURE", &payload_header(&bogus))],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_header(&resp, "PAYMENT-REQUIRED")["error"],
+            "No matching payment requirements"
+        );
+        let challenge = decode_header(&resp, "PAYMENT-REQUIRED");
+        assert_eq!(challenge["accepts"].as_array().unwrap().len(), 3);
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn config_is_clone_and_debug() {
         let c = config(KITE_TESTNET, "0.001");
@@ -691,7 +910,8 @@ mod tests {
 
     #[tokio::test]
     async fn payment_required_response_has_status_headers_and_empty_body() {
-        let resp = payment_required_response(requirements(), "/v1/x".into(), "desc".into(), None);
+        let resp =
+            payment_required_response(vec![requirements()], "/v1/x".into(), "desc".into(), None);
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
         assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
         assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/json");
@@ -714,7 +934,7 @@ mod tests {
     #[test]
     fn payment_required_response_includes_the_error_when_given() {
         let resp = payment_required_response(
-            requirements(),
+            vec![requirements()],
             "/v1/x".into(),
             "d".into(),
             Some("because".into()),
@@ -726,7 +946,7 @@ mod tests {
     fn payment_required_response_survives_unusual_text() {
         // base64 output is always a valid header value, whatever the inputs.
         let resp = payment_required_response(
-            requirements(),
+            vec![requirements()],
             "/v1/ünï?q=\n\t\"x\"".into(),
             "line1\nline2 — \u{1F4B8}".into(),
             Some("err\r\nInjected: header".into()),

@@ -217,6 +217,7 @@ async fn main() {
         pay_to,
         chain,
         price_usd,
+        extra_payment_options: Vec::new(),
         description,
         facilitator: FacilitatorClient::with_timeout(
             facilitator_url,

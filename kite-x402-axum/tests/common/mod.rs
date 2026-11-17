@@ -366,6 +366,8 @@ impl Mocks {
 pub(crate) struct AppOptions {
     pub chain: KiteChain,
     pub price_usd: String,
+    /// Extra `(chain, price)` options registered after the primary one.
+    pub extra_payment_options: Vec<(KiteChain, String)>,
     pub auth_header: String,
     pub auth_value: String,
     pub facilitator_timeout: Option<Duration>,
@@ -377,6 +379,7 @@ impl Default for AppOptions {
         Self {
             chain: KITE_TESTNET,
             price_usd: "0.001".into(),
+            extra_payment_options: Vec::new(),
             auth_header: "Authorization".into(),
             auth_value: String::new(),
             facilitator_timeout: None,
@@ -392,7 +395,7 @@ pub(crate) fn build_app(facilitator_url: &str, upstream_url: &str, o: &AppOption
         Some(t) => FacilitatorClient::with_timeout(facilitator_url, t),
         None => FacilitatorClient::new(facilitator_url),
     };
-    let payment_cfg = Arc::new(PaymentConfig {
+    let mut payment = PaymentConfig {
         pay_to: PAY_TO.to_owned(),
         chain: o.chain,
         price_usd: o.price_usd.clone(),
@@ -401,7 +404,12 @@ pub(crate) fn build_app(facilitator_url: &str, upstream_url: &str, o: &AppOption
         expiration_guard: None,
         metrics: None,
         nonce_guard: None,
-    });
+        extra_payment_options: Vec::new(),
+    };
+    for (chain, price_usd) in &o.extra_payment_options {
+        payment = payment.with_payment_option(*chain, price_usd.clone());
+    }
+    let payment_cfg = Arc::new(payment);
     let upstream_cfg = Arc::new(UpstreamConfig {
         http: o.upstream_client.clone().unwrap_or_else(upstream_client),
         base_url: upstream_url.trim_end_matches('/').to_owned(),

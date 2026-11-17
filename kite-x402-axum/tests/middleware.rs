@@ -126,6 +126,7 @@ fn build_app(facilitator_base: &str, upstream_base: &str) -> Router {
         pay_to: "0xC0FFEE0000000000000000000000000000C0FFEE".to_owned(),
         chain: KITE_TESTNET,
         price_usd: "0.001".to_owned(),
+        extra_payment_options: Vec::new(),
         description: "Test wrapper".to_owned(),
         facilitator: FacilitatorClient::new(facilitator_base),
         expiration_guard: None,
