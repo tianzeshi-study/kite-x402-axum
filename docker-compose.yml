@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  kite-x402-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kite-x402-axum-service
+    environment:
+      - PORT=8402
+      - PAY_TO=0xYourKiteWalletAddress
+      - UPSTREAM_URL=https://api.open-meteo.com
+      - PRICE_USD=0.001
+      - KITE_NETWORK=testnet
+      - FACILITATOR_URL=https://facilitator.pieverse.io/v2
+      - RUST_LOG=info
+    ports:
+      - "8402:8402"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8402/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3

@@ -434,7 +434,7 @@ async fn verify_http_error_includes_status_and_body_in_the_message() {
     let err = header_json(resp.headers(), "PAYMENT-REQUIRED")["error"]
         .as_str()
         .unwrap()
-        .to_string();
+        .to_owned();
     assert!(err.contains("503"), "{err}");
     assert!(err.contains("maintenance window"), "{err}");
 }
@@ -452,7 +452,7 @@ async fn verify_unreachable_facilitator_is_402() {
     let err = header_json(resp.headers(), "PAYMENT-REQUIRED")["error"]
         .as_str()
         .unwrap()
-        .to_string();
+        .to_owned();
     assert!(err.starts_with("facilitator verify unavailable"), "{err}");
     assert_eq!(mocks.upstream.count(), 0);
 }

@@ -23,13 +23,21 @@ pub enum KiteError {
     /// The price had more fractional digits than the asset supports.
     #[error("price {price} has more than {decimals} decimals ({symbol})")]
     TooManyDecimals {
+        /// The offending price string.
         price: String,
+        /// Maximum number of fractional digits the asset supports.
         decimals: u32,
+        /// Symbol of the asset.
         symbol: &'static str,
     },
     /// The price rounded down to zero smallest units of the asset.
     #[error("price {price} is below one unit of {symbol}")]
-    BelowOneUnit { price: String, symbol: &'static str },
+    BelowOneUnit {
+        /// The offending price string.
+        price: String,
+        /// Symbol of the asset.
+        symbol: &'static str,
+    },
 }
 
 /// One Kite network the wrapper can charge on.
@@ -37,12 +45,17 @@ pub enum KiteError {
 pub struct KiteChain {
     /// CAIP-2 network identifier, e.g. `eip155:2366`.
     pub network: &'static str,
+    /// JSON-RPC endpoint of the chain.
     pub rpc_url: &'static str,
     /// Stablecoin contract address.
     pub asset_address: &'static str,
+    /// Ticker symbol of the stablecoin.
     pub asset_symbol: &'static str,
+    /// Number of decimals the stablecoin uses.
     pub asset_decimals: u32,
+    /// EIP-712 domain `name` of the asset contract.
     pub eip712_name: &'static str,
+    /// EIP-712 domain `version` of the asset contract.
     pub eip712_version: &'static str,
 }
 
@@ -80,7 +93,7 @@ pub fn kite_chain_by_name(name: &str) -> Result<KiteChain, KiteError> {
     match name.trim() {
         "" | "mainnet" => Ok(KITE_MAINNET),
         "testnet" => Ok(KITE_TESTNET),
-        other => Err(KiteError::UnknownNetwork(other.to_string())),
+        other => Err(KiteError::UnknownNetwork(other.to_owned())),
     }
 }
 
@@ -89,8 +102,11 @@ pub fn kite_chain_by_name(name: &str) -> Result<KiteChain, KiteError> {
 /// needs to validate the signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssetAmount {
+    /// Asset contract address.
     pub asset: String,
+    /// Amount in the asset's smallest unit, as an integer string.
     pub amount: String,
+    /// Extra metadata (EIP-712 name/version) for the facilitator.
     pub extra: Value,
 }
 
@@ -109,7 +125,7 @@ impl KiteChain {
         let text = trimmed.strip_prefix('$').unwrap_or(trimmed);
 
         if !is_plain_positive_decimal(text) {
-            return Err(KiteError::InvalidPrice(price_usd.to_string()));
+            return Err(KiteError::InvalidPrice(price_usd.to_owned()));
         }
 
         let (whole, frac) = match text.split_once('.') {
@@ -119,7 +135,7 @@ impl KiteChain {
 
         if frac.len() as u32 > self.asset_decimals {
             return Err(KiteError::TooManyDecimals {
-                price: text.to_string(),
+                price: text.to_owned(),
                 decimals: self.asset_decimals,
                 symbol: self.asset_symbol,
             });
@@ -136,14 +152,14 @@ impl KiteChain {
 
         if units == "0" {
             return Err(KiteError::BelowOneUnit {
-                price: price_usd.to_string(),
+                price: price_usd.to_owned(),
                 symbol: self.asset_symbol,
             });
         }
 
         Ok(AssetAmount {
-            asset: self.asset_address.to_string(),
-            amount: units.to_string(),
+            asset: self.asset_address.to_owned(),
+            amount: units.to_owned(),
             extra: json!({ "name": self.eip712_name, "version": self.eip712_version }),
         })
     }
@@ -186,7 +202,7 @@ mod tests {
     #[test]
     fn rejects_unknown_network() {
         let err = kite_chain_by_name("devnet").unwrap_err();
-        assert_eq!(err, KiteError::UnknownNetwork("devnet".to_string()));
+        assert_eq!(err, KiteError::UnknownNetwork("devnet".to_owned()));
     }
 
     #[test]
@@ -259,7 +275,7 @@ mod tests {
         for bad in ["Mainnet", "TESTNET", "main", "test-net", "eip155:2366"] {
             assert_eq!(
                 kite_chain_by_name(bad).unwrap_err(),
-                KiteError::UnknownNetwork(bad.to_string()),
+                KiteError::UnknownNetwork(bad.to_owned()),
                 "{bad}"
             );
         }
@@ -432,12 +448,12 @@ mod tests {
     fn errors_carry_the_original_input() {
         assert_eq!(
             KITE_MAINNET.parse_price("$abc").unwrap_err(),
-            KiteError::InvalidPrice("$abc".to_string())
+            KiteError::InvalidPrice("$abc".to_owned())
         );
         assert_eq!(
             KITE_MAINNET.parse_price("$0").unwrap_err(),
             KiteError::BelowOneUnit {
-                price: "$0".to_string(),
+                price: "$0".to_owned(),
                 symbol: "USDC.e"
             }
         );
@@ -445,7 +461,7 @@ mod tests {
         assert_eq!(
             KITE_MAINNET.parse_price("$0.0000001").unwrap_err(),
             KiteError::TooManyDecimals {
-                price: "0.0000001".to_string(),
+                price: "0.0000001".to_owned(),
                 decimals: 6,
                 symbol: "USDC.e"
             }

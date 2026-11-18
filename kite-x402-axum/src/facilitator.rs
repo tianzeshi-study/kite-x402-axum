@@ -6,13 +6,55 @@
 
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::types::{PaymentPayload, PaymentRequirements, SettleResponse, VerifyResponse};
 
 /// Default per-request timeout for facilitator HTTP calls.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Retry policy for verification only. Settlement outcomes may be unknown after
+/// a transport or server error, so settlement is never automatically repeated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryConfig {
+    /// Maximum retries for transient verification failures. 0 disables retries.
+    pub max_retries: u32,
+    /// Initial backoff delay for the first retry.
+    pub initial_backoff: Duration,
+    /// Upper bound for exponential backoff delay.
+    pub max_backoff: Duration,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 0,
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(2),
+        }
+    }
+}
+
+impl RetryConfig {
+    /// Creates a new retry configuration.
+    #[must_use]
+    pub fn new(max_retries: u32, initial_backoff: Duration, max_backoff: Duration) -> Self {
+        Self {
+            max_retries,
+            initial_backoff,
+            max_backoff,
+        }
+    }
+
+    /// Calculates backoff duration for the given 0-indexed attempt using exponential backoff.
+    #[must_use]
+    pub fn calculate_backoff(&self, attempt: u32) -> Duration {
+        let factor = 2u32.saturating_pow(attempt);
+        let backoff = self.initial_backoff.saturating_mul(factor);
+        std::cmp::min(backoff, self.max_backoff)
+    }
+}
 
 /// A facilitator call failed at the transport or protocol level (the
 /// facilitator was unreachable, timed out, or returned something that
@@ -22,12 +64,17 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// values, not errors.
 #[derive(Debug, Error)]
 pub enum FacilitatorError {
+    /// The HTTP request to the facilitator failed (network, TLS, timeout, or decoding error).
     #[error("facilitator request failed: {0}")]
     Request(#[from] reqwest::Error),
+    /// The facilitator answered with a non-success status or an unparseable body.
     #[error("facilitator {op} returned {status}: {body}")]
     BadResponse {
+        /// The operation being performed (e.g. `verify` or `settle`).
         op: &'static str,
+        /// HTTP status code returned by the facilitator.
         status: u16,
+        /// Response body returned by the facilitator.
         body: String,
     },
 }
@@ -39,6 +86,7 @@ pub enum FacilitatorError {
 pub struct FacilitatorClient {
     http: reqwest::Client,
     base_url: String,
+    retry_config: RetryConfig,
 }
 
 #[derive(Serialize)]
@@ -53,8 +101,27 @@ struct FacilitatorRequest<'a> {
 
 impl FacilitatorClient {
     /// Returns the facilitator base URL.
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Returns the active retry configuration.
+    #[must_use]
+    pub fn retry_config(&self) -> RetryConfig {
+        self.retry_config
+    }
+
+    /// Sets retry configuration using a builder pattern.
+    #[must_use]
+    pub fn with_retry_config(mut self, config: RetryConfig) -> Self {
+        self.retry_config = config;
+        self
+    }
+
+    /// Sets retry configuration in-place.
+    pub fn set_retry_config(&mut self, config: RetryConfig) {
+        self.retry_config = config;
     }
 
     /// Builds a client for `base_url` with [`DEFAULT_TIMEOUT`].
@@ -70,8 +137,18 @@ impl FacilitatorClient {
             .expect("reqwest client with default TLS backend");
         Self {
             http,
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+            base_url: base_url.into().trim_end_matches('/').to_owned(),
+            retry_config: RetryConfig::default(),
         }
+    }
+
+    /// Builds a client for `base_url` with custom timeout and retry configuration.
+    pub fn with_retry(
+        base_url: impl Into<String>,
+        timeout: Duration,
+        retry_config: RetryConfig,
+    ) -> Self {
+        Self::with_timeout(base_url, timeout).with_retry_config(retry_config)
     }
 
     /// Calls `POST {base_url}/verify`.
@@ -92,7 +169,102 @@ impl FacilitatorClient {
         self.call("settle", payload, requirements).await
     }
 
+    /// Checks that the facilitator advertises a valid x402 v2 exact capability.
+    pub async fn probe(&self) -> Result<(), FacilitatorError> {
+        self.probe_capability(None).await
+    }
+
+    /// Checks x402 v2 exact support for the configured CAIP-2 network.
+    /// This is a readiness check, not proof of successful settlement.
+    pub async fn probe_network(&self, network: &str) -> Result<(), FacilitatorError> {
+        self.probe_capability(Some(network)).await
+    }
+
+    async fn probe_capability(&self, network: Option<&str>) -> Result<(), FacilitatorError> {
+        #[derive(Deserialize)]
+        struct Supported {
+            kinds: Vec<Kind>,
+        }
+        #[derive(Deserialize)]
+        struct Kind {
+            #[serde(rename = "x402Version")]
+            version: u32,
+            scheme: String,
+            network: String,
+        }
+        let url = format!("{}/supported", self.base_url);
+        let response = self.http.get(&url).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(FacilitatorError::BadResponse {
+                op: "probe",
+                status: status.as_u16(),
+                body: "supported endpoint rejected readiness check".into(),
+            });
+        }
+        let supported = response.json::<Supported>().await?;
+        if supported.kinds.iter().any(|kind| {
+            kind.version == 2
+                && kind.scheme == "exact"
+                && !kind.network.is_empty()
+                && network.is_none_or(|expected| expected == kind.network)
+        }) {
+            return Ok(());
+        }
+        Err(FacilitatorError::BadResponse {
+            op: "probe",
+            status: status.as_u16(),
+            body: "configured x402 v2 exact capability is not offered".into(),
+        })
+    }
+
     async fn call<T: serde::de::DeserializeOwned>(
+        &self,
+        op: &'static str,
+        payload: &PaymentPayload,
+        requirements: &PaymentRequirements,
+    ) -> Result<T, FacilitatorError> {
+        let max_retries = if op == "verify" {
+            self.retry_config.max_retries
+        } else {
+            0
+        };
+
+        let mut attempt = 0;
+        loop {
+            match self.send_single(op, payload, requirements).await {
+                Ok(resp) => return Ok(resp),
+                Err(err) => {
+                    let is_transient = match &err {
+                        FacilitatorError::Request(error) => {
+                            error.is_connect() || error.is_timeout()
+                        }
+                        FacilitatorError::BadResponse { status, .. } => {
+                            *status >= 500 && *status < 600
+                        }
+                    };
+
+                    if attempt < max_retries && is_transient {
+                        let backoff = self.retry_config.calculate_backoff(attempt);
+                        tracing::warn!(
+                            op = %op,
+                            attempt = attempt + 1,
+                            max_retries = max_retries,
+                            backoff_ms = backoff.as_millis(),
+                            error = %err,
+                            "Transient facilitator failure, retrying with backoff"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn send_single<T: serde::de::DeserializeOwned>(
         &self,
         op: &'static str,
         payload: &PaymentPayload,
@@ -186,6 +358,7 @@ mod tests {
     struct Fake {
         verify: Mutex<(u16, String)>,
         settle: Mutex<(u16, String)>,
+        settle_sequence: Mutex<Vec<(u16, String)>>,
         delay: Mutex<Option<Duration>>,
         seen: Mutex<Vec<Seen>>,
     }
@@ -199,15 +372,19 @@ mod tests {
                     json!({ "success": true, "transaction": "0xtx", "network": "eip155:2368" })
                         .to_string(),
                 )),
+                settle_sequence: Mutex::new(vec![]),
                 delay: Mutex::new(None),
                 seen: Mutex::new(vec![]),
             })
         }
         fn set_verify(&self, status: u16, body: &str) {
-            *self.verify.lock().unwrap() = (status, body.to_string());
+            *self.verify.lock().unwrap() = (status, body.to_owned());
         }
         fn set_settle(&self, status: u16, body: &str) {
-            *self.settle.lock().unwrap() = (status, body.to_string());
+            *self.settle.lock().unwrap() = (status, body.to_owned());
+        }
+        fn set_settle_sequence(&self, responses: Vec<(u16, String)>) {
+            *self.settle_sequence.lock().unwrap() = responses;
         }
         fn seen(&self) -> Vec<Seen> {
             self.seen.lock().unwrap().clone()
@@ -217,23 +394,34 @@ mod tests {
     async fn handler(State(fake): State<Arc<Fake>>, req: Request) -> Response {
         let (parts, body) = req.into_parts();
         let bytes = to_bytes(body, usize::MAX).await.unwrap();
-        let path = parts.uri.path().to_string();
+        let path = parts.uri.path().to_owned();
         fake.seen.lock().unwrap().push(Seen {
             path: path.clone(),
             content_type: parts
                 .headers
                 .get(header::CONTENT_TYPE)
-                .map(|v| v.to_str().unwrap().to_string()),
+                .map(|v| v.to_str().unwrap().to_owned()),
             body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         });
         let delay = *fake.delay.lock().unwrap();
         if let Some(d) = delay {
             tokio::time::sleep(d).await;
         }
-        let (status, body) = if path.ends_with("/verify") {
+        let (status, body) = if path.ends_with("/supported") {
+            (
+                200,
+                json!({"kinds":[{"x402Version":2,"scheme":"exact","network":"eip155:2368"}]})
+                    .to_string(),
+            )
+        } else if path.ends_with("/verify") {
             fake.verify.lock().unwrap().clone()
         } else {
-            fake.settle.lock().unwrap().clone()
+            let mut seq = fake.settle_sequence.lock().unwrap();
+            if !seq.is_empty() {
+                seq.remove(0)
+            } else {
+                fake.settle.lock().unwrap().clone()
+            }
         };
         (StatusCode::from_u16(status).unwrap(), body).into_response()
     }
@@ -482,7 +670,9 @@ mod tests {
                         ("verify", status, "upstream said no")
                     );
                 }
-                other => panic!("expected BadResponse, got {other:?}"),
+                other @ FacilitatorError::Request(_) => {
+                    panic!("expected BadResponse, got {other:?}")
+                }
             }
             match client
                 .settle(&payload(), &requirements())
@@ -496,7 +686,9 @@ mod tests {
                 } => {
                     assert_eq!((op, s, body.as_str()), ("settle", status, "settle said no"));
                 }
-                other => panic!("expected BadResponse, got {other:?}"),
+                other @ FacilitatorError::Request(_) => {
+                    panic!("expected BadResponse, got {other:?}")
+                }
             }
         }
     }
@@ -563,7 +755,9 @@ mod tests {
             .unwrap_err();
         match err {
             FacilitatorError::Request(e) => assert!(e.is_connect(), "{e}"),
-            other => panic!("expected Request, got {other:?}"),
+            other @ FacilitatorError::BadResponse { .. } => {
+                panic!("expected Request, got {other:?}")
+            }
         }
     }
 
@@ -582,7 +776,9 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(500));
         match err {
             FacilitatorError::Request(e) => assert!(e.is_timeout(), "{e}"),
-            other => panic!("expected Request, got {other:?}"),
+            other @ FacilitatorError::BadResponse { .. } => {
+                panic!("expected Request, got {other:?}")
+            }
         }
     }
 
@@ -638,5 +834,148 @@ mod tests {
             assert!(t.await.unwrap());
         }
         assert_eq!(fake.seen().len(), 20);
+    }
+
+    #[tokio::test]
+    async fn probe_returns_ok_when_facilitator_is_reachable() {
+        let (url, _) = start().await;
+        let client = FacilitatorClient::new(&url);
+        assert!(client.probe().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn probe_fails_when_facilitator_is_unreachable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = FacilitatorClient::new(format!("http://{addr}"));
+        assert!(client.probe().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_successful_supported_json_and_matching_capability() {
+        for (status, body, expected) in [
+            (404, "{}", false),
+            (401, "{}", false),
+            (200, "<html>ok</html>", false),
+            (200, "{}", false),
+            (200, r#"{"kinds":[]}"#, false),
+            (
+                200,
+                r#"{"kinds":[{"x402Version":1,"scheme":"exact","network":"eip155:2368"}]}"#,
+                false,
+            ),
+            (
+                200,
+                r#"{"kinds":[{"x402Version":2,"scheme":"upto","network":"eip155:2368"}]}"#,
+                false,
+            ),
+            (
+                200,
+                r#"{"kinds":[{"x402Version":2,"scheme":"exact","network":"eip155:2366"}]}"#,
+                false,
+            ),
+            (
+                200,
+                r#"{"kinds":[{"x402Version":2,"scheme":"exact","network":"eip155:2368"}]}"#,
+                true,
+            ),
+        ] {
+            let app = Router::new()
+                .fallback(move || async move { (StatusCode::from_u16(status).unwrap(), body) });
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let result = FacilitatorClient::new(format!("http://{addr}"))
+                .probe_network("eip155:2368")
+                .await;
+            assert_eq!(result.is_ok(), expected, "{status}: {body}");
+            task.abort();
+        }
+    }
+
+    #[test]
+    fn retry_config_calculates_exponential_backoff_and_caps_at_maximum() {
+        let config = RetryConfig::new(3, Duration::from_millis(50), Duration::from_millis(300));
+        assert_eq!(config.calculate_backoff(0), Duration::from_millis(50));
+        assert_eq!(config.calculate_backoff(1), Duration::from_millis(100));
+        assert_eq!(config.calculate_backoff(2), Duration::from_millis(200));
+        assert_eq!(config.calculate_backoff(3), Duration::from_millis(300));
+        assert_eq!(config.calculate_backoff(4), Duration::from_millis(300));
+    }
+
+    #[tokio::test]
+    async fn settle_does_not_repeat_an_indeterminate_503() {
+        let (url, fake) = start().await;
+        fake.set_settle_sequence(vec![
+            (503, "Service Unavailable".into()),
+            (
+                200,
+                json!({ "success": true, "transaction": "0xretry_tx", "network": "eip155:2368" })
+                    .to_string(),
+            ),
+        ]);
+
+        let retry = RetryConfig::new(2, Duration::from_millis(10), Duration::from_millis(50));
+        let client = FacilitatorClient::new(&url).with_retry_config(retry);
+
+        assert!(client.settle(&payload(), &requirements()).await.is_err());
+        assert_eq!(fake.seen().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn settle_does_not_retry_non_transient_400() {
+        let (url, fake) = start().await;
+        fake.set_settle(400, "Bad Request");
+
+        let retry = RetryConfig::new(3, Duration::from_millis(10), Duration::from_millis(50));
+        let client = FacilitatorClient::new(&url).with_retry_config(retry);
+
+        let err = client
+            .settle(&payload(), &requirements())
+            .await
+            .unwrap_err();
+        match err {
+            FacilitatorError::BadResponse { status, .. } => assert_eq!(status, 400),
+            other @ FacilitatorError::Request(_) => {
+                panic!("expected BadResponse 400, got: {other:?}")
+            }
+        }
+        assert_eq!(fake.seen().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn verification_retries_are_bounded_and_explicit() {
+        let (url, fake) = start().await;
+        fake.set_verify(503, "Facilitator Unavailable");
+
+        let retry = RetryConfig::new(3, Duration::from_millis(10), Duration::from_millis(50));
+        let client = FacilitatorClient::new(&url).with_retry_config(retry);
+
+        let err = client
+            .verify(&payload(), &requirements())
+            .await
+            .unwrap_err();
+        match err {
+            FacilitatorError::BadResponse { status, .. } => assert_eq!(status, 503),
+            other @ FacilitatorError::Request(_) => {
+                panic!("expected BadResponse 503, got: {other:?}")
+            }
+        }
+        assert_eq!(fake.seen().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn settlement_timeout_is_not_retried_even_with_a_retry_policy() {
+        let (url, fake) = start().await;
+        *fake.delay.lock().unwrap() = Some(Duration::from_millis(100));
+        let client =
+            FacilitatorClient::with_timeout(url, Duration::from_millis(20)).with_retry_config(
+                RetryConfig::new(3, Duration::from_millis(1), Duration::from_millis(2)),
+            );
+        assert!(client.settle(&payload(), &requirements()).await.is_err());
+        assert_eq!(fake.seen().len(), 1);
     }
 }

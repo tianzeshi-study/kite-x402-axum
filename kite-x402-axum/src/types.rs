@@ -11,9 +11,12 @@ use serde_json::Value;
 /// Describes the protected resource in a `PaymentRequired` (402) response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceInfo {
+    /// URL of the protected resource.
     pub url: String,
+    /// Human-readable description of the resource.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// MIME type of the resource.
     #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
 }
@@ -22,14 +25,21 @@ pub struct ResourceInfo {
 /// `accepted` in the client's payment payload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PaymentRequirements {
+    /// Payment scheme (e.g. `exact`).
     pub scheme: String,
+    /// Network identifier (CAIP-2).
     pub network: String,
+    /// Required amount in atomic token units.
     pub amount: String,
+    /// Asset contract address.
     pub asset: String,
+    /// Address that receives the payment.
     #[serde(rename = "payTo")]
     pub pay_to: String,
+    /// Maximum time in seconds the payment authorization may remain valid.
     #[serde(rename = "maxTimeoutSeconds")]
     pub max_timeout_seconds: u64,
+    /// Scheme-specific extra data (e.g. EIP-712 domain parameters).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra: Option<Value>,
 }
@@ -38,11 +48,15 @@ pub struct PaymentRequirements {
 /// `PAYMENT-REQUIRED` response header.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaymentRequired {
+    /// x402 protocol version.
     #[serde(rename = "x402Version")]
     pub x402_version: u32,
+    /// Optional error message explaining why payment is required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The resource being protected.
     pub resource: ResourceInfo,
+    /// Payment options the server accepts.
     pub accepts: Vec<PaymentRequirements>,
 }
 
@@ -50,12 +64,17 @@ pub struct PaymentRequired {
 /// `PAYMENT-SIGNATURE` (or legacy `X-PAYMENT`) request header.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaymentPayload {
+    /// x402 protocol version.
     #[serde(rename = "x402Version")]
     pub x402_version: u32,
+    /// The resource the payment is for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<ResourceInfo>,
+    /// The payment requirements the payer chose to satisfy.
     pub accepted: PaymentRequirements,
+    /// Scheme-specific signed payload (e.g. an authorization and signature).
     pub payload: Value,
+    /// Optional protocol extensions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<Value>,
 }
@@ -63,12 +82,16 @@ pub struct PaymentPayload {
 /// The Kite facilitator's `POST /verify` response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VerifyResponse {
+    /// Whether the payment is valid.
     #[serde(rename = "isValid")]
     pub is_valid: bool,
+    /// Machine-readable reason the payment is invalid.
     #[serde(rename = "invalidReason", default)]
     pub invalid_reason: Option<String>,
+    /// Human-readable explanation of the invalidity.
     #[serde(rename = "invalidMessage", default)]
     pub invalid_message: Option<String>,
+    /// Address of the payer.
     #[serde(default)]
     pub payer: Option<String>,
 }
@@ -77,23 +100,30 @@ pub struct VerifyResponse {
 /// the `PAYMENT-RESPONSE` header on both success and failure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettleResponse {
+    /// Whether settlement succeeded.
     pub success: bool,
+    /// Machine-readable reason settlement failed.
     #[serde(
         rename = "errorReason",
         default,
         skip_serializing_if = "Option::is_none"
     )]
     pub error_reason: Option<String>,
+    /// Human-readable explanation of the failure.
     #[serde(
         rename = "errorMessage",
         default,
         skip_serializing_if = "Option::is_none"
     )]
     pub error_message: Option<String>,
+    /// Address of the payer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payer: Option<String>,
+    /// Transaction hash of the settlement.
     pub transaction: String,
+    /// Network identifier (CAIP-2).
     pub network: String,
+    /// Amount settled in atomic token units.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amount: Option<String>,
 }

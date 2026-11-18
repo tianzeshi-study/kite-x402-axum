@@ -14,9 +14,11 @@ use axum::{
 use serde_json::json;
 
 /// Request headers that must never be blindly forwarded between hops.
-/// Matches the Express template's `HOP_BY_HOP` set.
+/// Connection-specific fields are removed in addition to this fixed set.
 const HOP_BY_HOP: &[&str] = &[
     "connection",
+    "proxy-authenticate",
+    "proxy-authorization",
     "keep-alive",
     "transfer-encoding",
     "te",
@@ -31,6 +33,16 @@ const HOP_BY_HOP: &[&str] = &[
 /// must drop both: the upstream API has no business seeing a payment payload.
 const PAYMENT_HEADERS: &[&str] = &["payment-signature", "x-payment"];
 
+/// Collect all connection options before removing the Connection header.
+/// Repeated fields and comma-separated options both name hop-local headers.
+fn connection_options<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
+    values
+        .flat_map(|value| value.split(','))
+        .map(|option| option.trim().to_ascii_lowercase())
+        .filter(|option| !option.is_empty())
+        .collect()
+}
+
 /// Maximum number of same-origin redirects [`same_origin_redirect_policy`]
 /// will follow.
 const MAX_REDIRECTS: usize = 10;
@@ -40,6 +52,9 @@ const MAX_REDIRECTS: usize = 10;
 /// metered API wrapper; this bound exists so a misbehaving client can't
 /// exhaust memory.
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Finite paid responses are buffered before the gate can begin settlement.
+const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Configuration for forwarding a paid request to the wrapped API.
 #[derive(Clone)]
@@ -84,6 +99,7 @@ impl std::fmt::Debug for UpstreamConfig {
 /// and stops at any other. When it stops, the upstream's `3xx` response is
 /// handed back to the buyer unchanged, so the credential never leaves the
 /// host it was configured for.
+#[must_use]
 pub fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
         if attempt.previous().len() >= MAX_REDIRECTS {
@@ -163,7 +179,7 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/")
-        .to_string();
+        .to_owned();
 
     if has_dot_segment(&path_and_query) {
         tracing::warn!(path = %path_and_query, "Rejected request with dot segments in the path");
@@ -183,7 +199,7 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
         strip_v1_prefix(&path_and_query)
     };
     let forwarded = if forwarded.starts_with('/') {
-        forwarded.to_string()
+        forwarded.to_owned()
     } else {
         format!("/{forwarded}")
     };
@@ -220,9 +236,19 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
         .unwrap_or(reqwest::Method::GET);
 
     let mut out_headers = reqwest::header::HeaderMap::new();
+    let request_options = connection_options(
+        parts
+            .headers
+            .get_all("connection")
+            .iter()
+            .filter_map(|v| v.to_str().ok()),
+    );
     for (name, value) in parts.headers.iter() {
         let lower = name.as_str().to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&lower.as_str()) || PAYMENT_HEADERS.contains(&lower.as_str()) {
+        if HOP_BY_HOP.contains(&lower.as_str())
+            || PAYMENT_HEADERS.contains(&lower.as_str())
+            || request_options.contains(&lower)
+        {
             continue;
         }
         if let (Ok(hn), Ok(hv)) = (
@@ -257,7 +283,7 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
         .send()
         .await;
 
-    let upstream_response = match upstream_response {
+    let mut upstream_response = match upstream_response {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(
@@ -287,9 +313,16 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
     // streamed exactly as received (the client is not expected to decompress),
     // so the header is the only thing telling the buyer how to decode it.
     let mut builder = Response::builder().status(status);
+    let response_options = connection_options(
+        upstream_response
+            .headers()
+            .get_all("connection")
+            .iter()
+            .filter_map(|v| v.to_str().ok()),
+    );
     for (name, value) in upstream_response.headers().iter() {
         let lower = name.as_str().to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&lower.as_str()) {
+        if HOP_BY_HOP.contains(&lower.as_str()) || response_options.contains(&lower) {
             continue;
         }
         if let (Ok(hn), Ok(hv)) = (
@@ -300,9 +333,33 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
         }
     }
 
-    let stream = upstream_response.bytes_stream();
+    let mut bytes = Vec::new();
+    loop {
+        match upstream_response.chunk().await {
+            Ok(Some(chunk))
+                if chunk.len() <= MAX_RESPONSE_BODY_BYTES.saturating_sub(bytes.len()) =>
+            {
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(Some(_)) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    axum::Json(json!({"error": "upstream response too large"})),
+                )
+                    .into_response()
+            }
+            Ok(None) => break,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    axum::Json(json!({"error": "upstream response incomplete"})),
+                )
+                    .into_response()
+            }
+        }
+    }
     builder
-        .body(Body::from_stream(stream))
+        .body(Body::from(bytes))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
@@ -321,9 +378,9 @@ mod tests {
     fn cfg(auth_value: &str) -> UpstreamConfig {
         UpstreamConfig {
             http: reqwest::Client::new(),
-            base_url: "http://127.0.0.1:1".to_string(), // nothing listens here
-            auth_header: "X-Api-Key".to_string(),
-            auth_value: auth_value.to_string(),
+            base_url: "http://127.0.0.1:1".to_owned(), // nothing listens here
+            auth_header: "X-Api-Key".to_owned(),
+            auth_value: auth_value.to_owned(),
         }
     }
 

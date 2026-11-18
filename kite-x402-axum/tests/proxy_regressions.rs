@@ -206,6 +206,57 @@ async fn encoded_upstream_bodies_keep_their_content_encoding_header() {
 // request headers
 // ---------------------------------------------------------------------------
 
+#[tokio::test]
+async fn connection_options_are_removed_from_requests() {
+    let mocks = Mocks::start().await;
+    let app = build_proxy_only(upstream_cfg(&mocks.upstream_url));
+    let resp = send(
+        &app,
+        req_with(
+            "GET",
+            "/v1/x",
+            &[
+                ("connection", " X-Internal, keep-alive"),
+                ("connection", "x-other"),
+                ("x-internal", "hop-secret"),
+                ("x-other", "another-secret"),
+                ("x-end-to-end", "preserved"),
+                ("proxy-authorization", "Basic secret"),
+            ],
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let received = mocks.upstream.last();
+    assert_eq!(received.header("x-internal"), None);
+    assert_eq!(received.header("x-other"), None);
+    assert_eq!(received.header("proxy-authorization"), None);
+    assert_eq!(received.header("x-end-to-end"), Some("preserved"));
+}
+
+#[tokio::test]
+async fn connection_options_are_removed_from_responses() {
+    let mocks = Mocks::start().await;
+    let mut reply = UpstreamReply::json(200);
+    reply.headers.extend([
+        ("connection".into(), " X-Internal, keep-alive".into()),
+        ("connection".into(), "x-other".into()),
+        ("x-internal".into(), "hop-secret".into()),
+        ("x-other".into(), "another-secret".into()),
+        ("x-end-to-end".into(), "preserved".into()),
+        ("proxy-authenticate".into(), "Basic".into()),
+    ]);
+    mocks.upstream.set_reply(reply);
+    let app = build_proxy_only(upstream_cfg(&mocks.upstream_url));
+    let resp = send(&app, get_req("/v1/x")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    for name in ["connection", "x-internal", "x-other", "proxy-authenticate"] {
+        assert!(resp.headers().get(name).is_none(), "{name}");
+    }
+    assert_eq!(resp.headers()["x-end-to-end"], "preserved");
+}
+
 /// The gate accepts the legacy `X-PAYMENT` header, but the proxy used to drop
 /// only `PAYMENT-SIGNATURE`, forwarding the buyer's signed payment
 /// authorization to the upstream API.
@@ -275,7 +326,7 @@ async fn same_origin_redirects_are_followed() {
                     .get("x-api-key")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("-")
-                    .to_string();
+                    .to_owned();
                 (StatusCode::OK, format!("done:{key}")).into_response()
             }),
         );

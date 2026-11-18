@@ -27,6 +27,7 @@ jobs:
     permissions:
       contents: read
       checks: write # lets the action publish its result as a check run
+      issues: write # lets the action create an issue when vulnerabilities are found
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2

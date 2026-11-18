@@ -57,19 +57,51 @@
 //! facilitator is unreachable — is reported as `402 Payment Required` with
 //! the reason in `error` (verify) or `PAYMENT-RESPONSE`'s `errorReason`
 //! (settle), never a `500`/`502`. This keeps the contract simple and
-//! predictable for callers: any `402` is retryable, nothing else needs
-//! special-casing. What both official SDKs agree on — and what this crate
+//! predictable for callers. A settlement transport failure can have an unknown
+//! outcome: reconcile it before retrying or issuing a new payment. What both official SDKs agree on — and what this crate
 //! also guarantees — is untouched: a request is only settled after the
 //! upstream responds with a status below 400.
 
+pub mod cache_store;
+pub mod circuit_breaker;
+pub mod cors_guard;
+pub mod expiration;
 pub mod facilitator;
+pub mod firewall;
+pub mod idempotency;
 pub mod kite;
+pub mod metrics;
 pub mod middleware;
+pub mod nonce_guard;
+pub mod payment_options;
 pub mod proxy;
+pub mod security_headers;
+pub mod settlement_ledger;
+pub mod sliding_limiter;
 pub mod types;
+/// Webhook event types and a retrying dispatcher for payment notifications.
+pub mod webhook;
 pub mod wire;
 
-pub use facilitator::{FacilitatorClient, FacilitatorError};
+pub use cache_store::{CachedVerification, VerificationCacheStore};
+pub use circuit_breaker::{
+    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError, CircuitBreakerSnapshot, CircuitState,
+};
+pub use cors_guard::{CorsGuardConfig, CorsSecurityGuard};
+pub use expiration::{ExpirationError, ExpirationGuardConfig};
+pub use facilitator::{FacilitatorClient, FacilitatorError, RetryConfig};
+pub use firewall::{FirewallRule, IpFilterAction, IpFirewall, IpFirewallConfig};
+pub use idempotency::{AcquireResult, CachedResponse, IdempotencyCache, IdempotencyConfig};
 pub use kite::{kite_chain_by_name, KiteChain, KiteError, KITE_MAINNET, KITE_TESTNET};
-pub use middleware::{x402_payment, PaymentConfig};
+pub use metrics::{PaymentMetrics, PaymentMetricsSnapshot};
+pub use middleware::{x402_payment, x402_payment_multi, MultiPaymentConfig, PaymentConfig};
+pub use nonce_guard::{NonceReplayError, PaymentNonceReplayGuard, PaymentNonceReservation};
+pub use payment_options::{find_matching_requirements, requirements_all, PaymentOption};
 pub use proxy::{proxy, UpstreamConfig};
+pub use security_headers::SecurityHeadersConfig;
+pub use settlement_ledger::{LedgerSummary, SettlementLedger, SettlementRecord};
+pub use sliding_limiter::{SlidingWindowConfig, SlidingWindowLimiter};
+pub use webhook::{
+    DeliveryStatus, WebhookConfig, WebhookDeliveryRecord, WebhookDispatcher, WebhookEventType,
+    WebhookPayload,
+};

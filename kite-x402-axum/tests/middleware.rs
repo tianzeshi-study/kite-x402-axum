@@ -123,16 +123,19 @@ async fn spawn_upstream(status: StatusCode) -> String {
 /// `facilitator_base`. Mirrors how `service/src/main.rs` wires things.
 fn build_app(facilitator_base: &str, upstream_base: &str) -> Router {
     let payment_cfg = Arc::new(PaymentConfig {
-        pay_to: "0xC0FFEE0000000000000000000000000000C0FFEE".to_string(),
+        pay_to: "0xC0FFEE0000000000000000000000000000C0FFEE".to_owned(),
         chain: KITE_TESTNET,
-        price_usd: "0.001".to_string(),
-        description: "Test wrapper".to_string(),
+        price_usd: "0.001".to_owned(),
+        description: "Test wrapper".to_owned(),
         facilitator: FacilitatorClient::new(facilitator_base),
+        expiration_guard: None,
+        metrics: None,
+        nonce_guard: None,
     });
     let upstream_cfg = Arc::new(UpstreamConfig {
         http: reqwest::Client::new(),
-        base_url: upstream_base.trim_end_matches('/').to_string(),
-        auth_header: "Authorization".to_string(),
+        base_url: upstream_base.trim_end_matches('/').to_owned(),
+        auth_header: "Authorization".to_owned(),
         auth_value: String::new(),
     });
 
@@ -261,7 +264,7 @@ async fn paid_request_is_verified_settled_and_proxied() {
     let cache_control = response
         .headers()
         .get("cache-control")
-        .map(|v| v.to_str().unwrap().to_string());
+        .map(|v| v.to_str().unwrap().to_owned());
     assert!(cache_control.unwrap_or_default().contains("private"));
     assert_eq!(facilitator_state.settle_calls.load(Ordering::SeqCst), 1);
 
@@ -313,7 +316,7 @@ async fn verify_invalid_returns_402_without_calling_upstream_or_settling() {
     facilitator_state
         .verify_valid
         .store(false, Ordering::SeqCst);
-    *facilitator_state.verify_reason.lock().unwrap() = Some("insufficient_funds".to_string());
+    *facilitator_state.verify_reason.lock().unwrap() = Some("insufficient_funds".to_owned());
     let upstream_base = spawn_upstream(StatusCode::OK).await;
     let app = build_app(&facilitator_base, &upstream_base);
 
@@ -403,11 +406,11 @@ async fn facilitator_unreachable_during_verify_returns_402_not_5xx() {
     // facilitator), so build requirements straight from the same
     // config this app uses.
     let requirements = PaymentRequirements {
-        scheme: "exact".to_string(),
-        network: KITE_TESTNET.network.to_string(),
-        amount: "1000000000000000".to_string(),
-        asset: KITE_TESTNET.asset_address.to_string(),
-        pay_to: "0xC0FFEE0000000000000000000000000000C0FFEE".to_string(),
+        scheme: "exact".to_owned(),
+        network: KITE_TESTNET.network.to_owned(),
+        amount: "1000000000000000".to_owned(),
+        asset: KITE_TESTNET.asset_address.to_owned(),
+        pay_to: "0xC0FFEE0000000000000000000000000000C0FFEE".to_owned(),
         max_timeout_seconds: 60,
         extra: Some(
             json!({ "name": KITE_TESTNET.eip712_name, "version": KITE_TESTNET.eip712_version }),
@@ -492,11 +495,11 @@ async fn v1_prefix_is_stripped_before_reaching_upstream() {
 #[test]
 fn wire_decode_is_reexported_and_usable() {
     let requirements = PaymentRequirements {
-        scheme: "exact".to_string(),
-        network: "eip155:2368".to_string(),
-        amount: "1".to_string(),
-        asset: "0xabc".to_string(),
-        pay_to: "0xdef".to_string(),
+        scheme: "exact".to_owned(),
+        network: "eip155:2368".to_owned(),
+        amount: "1".to_owned(),
+        asset: "0xabc".to_owned(),
+        pay_to: "0xdef".to_owned(),
         max_timeout_seconds: 60,
         extra: None,
     };
@@ -504,7 +507,7 @@ fn wire_decode_is_reexported_and_usable() {
         x402_version: 2,
         error: None,
         resource: kite_x402_axum::types::ResourceInfo {
-            url: "https://example.com".to_string(),
+            url: "https://example.com".to_owned(),
             description: None,
             mime_type: None,
         },
@@ -531,9 +534,9 @@ fn wire_decode_is_reexported_and_usable() {
 fn upstream_config_debug_redacts_auth_value() {
     let cfg = UpstreamConfig {
         http: reqwest::Client::new(),
-        base_url: "https://api.example.com".to_string(),
-        auth_header: "Authorization".to_string(),
-        auth_value: "super-secret-bearer-token".to_string(),
+        base_url: "https://api.example.com".to_owned(),
+        auth_header: "Authorization".to_owned(),
+        auth_value: "super-secret-bearer-token".to_owned(),
     };
     let formatted = format!("{cfg:?}");
     assert!(!formatted.contains("super-secret-bearer-token"));
@@ -543,9 +546,9 @@ fn upstream_config_debug_redacts_auth_value() {
 
     let empty_cfg = UpstreamConfig {
         http: reqwest::Client::new(),
-        base_url: "https://api.example.com".to_string(),
-        auth_header: "Authorization".to_string(),
-        auth_value: "".to_string(),
+        base_url: "https://api.example.com".to_owned(),
+        auth_header: "Authorization".to_owned(),
+        auth_value: "".to_owned(),
     };
     let formatted_empty = format!("{empty_cfg:?}");
     assert!(formatted_empty.contains("[empty]"));

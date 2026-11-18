@@ -154,7 +154,7 @@ async fn forwards_ordinary_headers_including_multi_valued_ones() {
 #[tokio::test]
 async fn strips_hop_by_hop_headers_and_rewrites_host() {
     let (mocks, app) = proxied(|_| {}).await;
-    let upstream_authority = mocks.upstream_url.trim_start_matches("http://").to_string();
+    let upstream_authority = mocks.upstream_url.trim_start_matches("http://").to_owned();
     send(
         &app,
         req_with(

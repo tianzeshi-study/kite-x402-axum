@@ -38,17 +38,70 @@ pub struct PaymentConfig {
     pub description: String,
     /// Client for the Kite facilitator's `/verify` and `/settle`.
     pub facilitator: FacilitatorClient,
+    /// Optional expiration guard to reject expired or premature authorizations early.
+    pub expiration_guard: Option<crate::expiration::ExpirationGuardConfig>,
+    /// Optional metrics collector to track payment telemetry.
+    pub metrics: Option<Arc<crate::metrics::PaymentMetrics>>,
+    /// Optional nonce replay guard to reject duplicate payment signatures before calling facilitator.
+    pub nonce_guard: Option<Arc<crate::nonce_guard::PaymentNonceReplayGuard>>,
 }
 
 impl PaymentConfig {
+    /// Creates a payment config with no optional guards or metrics enabled.
+    pub fn new(
+        pay_to: impl Into<String>,
+        chain: KiteChain,
+        price_usd: impl Into<String>,
+        description: impl Into<String>,
+        facilitator: FacilitatorClient,
+    ) -> Self {
+        Self {
+            pay_to: pay_to.into(),
+            chain,
+            price_usd: price_usd.into(),
+            description: description.into(),
+            facilitator,
+            expiration_guard: None,
+            metrics: None,
+            nonce_guard: None,
+        }
+    }
+
+    /// Enables validation of the authorization's validity window.
+    #[must_use]
+    pub fn with_expiration_guard(
+        mut self,
+        guard: crate::expiration::ExpirationGuardConfig,
+    ) -> Self {
+        self.expiration_guard = Some(guard);
+        self
+    }
+
+    /// Records payment events into the given metrics collector.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<crate::metrics::PaymentMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Enables replay protection using the given nonce guard.
+    #[must_use]
+    pub fn with_nonce_guard(
+        mut self,
+        guard: Arc<crate::nonce_guard::PaymentNonceReplayGuard>,
+    ) -> Self {
+        self.nonce_guard = Some(guard);
+        self
+    }
+
     fn requirements(&self) -> Result<PaymentRequirements, String> {
         let asset = self
             .chain
             .parse_price(&self.price_usd)
             .map_err(|e| format!("invalid PRICE_USD configured on the server: {e}"))?;
         Ok(PaymentRequirements {
-            scheme: "exact".to_string(),
-            network: self.chain.network.to_string(),
+            scheme: "exact".to_owned(),
+            network: self.chain.network.to_owned(),
             amount: asset.amount,
             asset: asset.asset,
             pay_to: self.pay_to.clone(),
@@ -59,7 +112,7 @@ impl PaymentConfig {
 }
 
 fn payment_required_response(
-    requirements: PaymentRequirements,
+    requirements: &[PaymentRequirements],
     resource_url: String,
     description: String,
     error: Option<String>,
@@ -70,9 +123,9 @@ fn payment_required_response(
         resource: ResourceInfo {
             url: resource_url,
             description: Some(description),
-            mime_type: Some("application/json".to_string()),
+            mime_type: Some("application/json".to_owned()),
         },
-        accepts: vec![requirements],
+        accepts: requirements.to_vec(),
     };
 
     let mut response = (StatusCode::PAYMENT_REQUIRED, Json(json!({}))).into_response();
@@ -98,33 +151,14 @@ fn settlement_failure_response(settle: &crate::types::SettleResponse) -> Respons
     response
 }
 
-/// The x402 payment middleware. Apply with
-/// [`axum::middleware::from_fn_with_state`] to the `/v1/*` route group:
+/// Shared gate engine.
 ///
-/// ```ignore
-/// let cfg = Arc::new(PaymentConfig { .. });
-/// let paid = Router::new()
-///     .route("/{*path}", any(proxy))
-///     .with_state(upstream_cfg)
-///     .layer(middleware::from_fn_with_state(cfg, x402_payment));
-/// ```
-///
-/// Behavior:
-/// 1. No `PAYMENT-SIGNATURE` (or legacy `X-PAYMENT`) header → `402` with a
-///    `PAYMENT-REQUIRED` header describing how to pay.
-/// 2. Header present but doesn't decode, or doesn't match this route's
-///    price/network/asset/payTo → `402` with `error` explaining why.
-/// 3. Facilitator `/verify` says invalid, or the facilitator could not be
-///    reached at all → `402` with `error` set to the reason (see the
-///    crate-level docs for why facilitator-unreachable is also a `402`).
-/// 4. Verified → the inner handler runs. If it answers `>= 400`, that
-///    response is returned unchanged and **no settlement is attempted**.
-/// 5. If it answers `< 400`, `/settle` is called. On success, a
-///    `PAYMENT-RESPONSE` header is attached and `Cache-Control` gets
-///    `private` merged in. On failure, a `402` with `PAYMENT-RESPONSE`
-///    (`success: false`) is returned instead of the handler's response.
-pub async fn x402_payment(
-    State(cfg): State<Arc<PaymentConfig>>,
+/// `options` are the wire-level requirements this route accepts; the client's
+/// `accepted` must match one of them. Both the single-option and multi-option
+/// entry points funnel through here, so verify/settle logic is written once.
+async fn payment_gate_inner(
+    cfg: &PaymentConfig,
+    options: &[PaymentRequirements],
     req: Request,
     next: Next,
 ) -> Response {
@@ -138,33 +172,22 @@ pub async fn x402_payment(
         .unwrap_or_else(|| req.uri().to_string());
     let method = req.method().clone();
 
+    if let Some(metrics) = &cfg.metrics {
+        metrics.record_request();
+    }
+
     tracing::debug!(
         method = %method,
         uri = %resource_url,
         "Processing request through x402 payment gate"
     );
 
-    let requirements = match cfg.requirements() {
-        Ok(r) => r,
-        Err(msg) => {
-            tracing::error!(
-                error = %msg,
-                "Failed to compute payment requirements (invalid server configuration)"
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": msg })),
-            )
-                .into_response();
-        }
-    };
-
     let header_value = req
         .headers()
         .get("PAYMENT-SIGNATURE")
         .or_else(|| req.headers().get("X-PAYMENT"))
         .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+        .map(str::to_owned);
 
     let Some(header_value) = header_value else {
         tracing::info!(
@@ -173,15 +196,13 @@ pub async fn x402_payment(
         );
         tracing::debug!(
             uri = %resource_url,
-            requirements = ?requirements,
+            options = ?options,
             "402 challenge requirements details"
         );
-        return payment_required_response(
-            requirements,
-            resource_url,
-            cfg.description.clone(),
-            None,
-        );
+        if let Some(metrics) = &cfg.metrics {
+            metrics.record_challenge();
+        }
+        return payment_required_response(options, resource_url, cfg.description.clone(), None);
     };
 
     tracing::debug!(
@@ -189,36 +210,106 @@ pub async fn x402_payment(
         "Payment signature header present; decoding payload"
     );
 
-    let payload = match decode_payment_payload(&header_value) {
-        Ok(p) => p,
-        Err(_) => {
-            tracing::warn!(
-                uri = %resource_url,
-                "Failed to decode payment signature header; returning 402"
-            );
-            return payment_required_response(
-                requirements,
-                resource_url,
-                cfg.description.clone(),
-                Some("Invalid payment signature".to_string()),
-            );
-        }
-    };
-
-    if payload.accepted != requirements {
+    let Ok(payload) = decode_payment_payload(&header_value) else {
         tracing::warn!(
             uri = %resource_url,
-            expected = ?requirements,
+            "Failed to decode payment signature header; returning 402"
+        );
+        if let Some(metrics) = &cfg.metrics {
+            metrics.record_challenge();
+        }
+        return payment_required_response(
+            options,
+            resource_url,
+            cfg.description.clone(),
+            Some("Invalid payment signature".to_owned()),
+        );
+    };
+
+    // Find which advertised option the client chose. Single-option callers
+    // pass a one-element slice, making this equivalent to the old `==` check.
+    let Some(requirements) =
+        crate::payment_options::find_matching_requirements(&payload.accepted, options)
+    else {
+        tracing::warn!(
+            uri = %resource_url,
+            expected = ?options,
             actual = ?payload.accepted,
             "Payment requirements mismatch; returning 402"
         );
+        if let Some(metrics) = &cfg.metrics {
+            metrics.record_challenge();
+        }
         return payment_required_response(
-            requirements,
+            options,
             resource_url,
             cfg.description.clone(),
-            Some("No matching payment requirements".to_string()),
+            Some("No matching payment requirements".to_owned()),
         );
+    };
+
+    if let Some(guard) = &cfg.expiration_guard {
+        if let Some(auth) = payload.payload.get("authorization") {
+            let valid_after = auth.get("validAfter").and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .or_else(|| v.as_u64())
+            });
+            let valid_before = auth.get("validBefore").and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .or_else(|| v.as_u64())
+            });
+
+            if let (Some(va), Some(vb)) = (valid_after, valid_before) {
+                if let Err(e) = guard.validate_now(va, vb) {
+                    tracing::warn!(
+                        uri = %resource_url,
+                        error = %e,
+                        "Payment authorization rejected by expiration guard; returning 402"
+                    );
+                    return payment_required_response(
+                        options,
+                        resource_url,
+                        cfg.description.clone(),
+                        Some(e.to_string()),
+                    );
+                }
+            }
+        }
     }
+
+    let mut reservation = if let Some(guard) = &cfg.nonce_guard {
+        match guard.reserve(&payload) {
+            Ok(reservation) => Some(reservation),
+            Err(crate::nonce_guard::NonceReplayError::CapacityExceeded) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [("cache-control", "no-store"), ("retry-after", "1")],
+                    Json(json!({ "error": "payment_replay_capacity_exceeded" })),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                tracing::warn!(
+                    uri = %resource_url,
+                    error = %error,
+                    "Payment authorization rejected by nonce replay guard; returning 402"
+                );
+                if let Some(metrics) = &cfg.metrics {
+                    metrics.record_challenge();
+                }
+                return payment_required_response(
+                    options,
+                    resource_url,
+                    cfg.description.clone(),
+                    Some(error.to_string()),
+                );
+            }
+        }
+    } else {
+        None
+    };
 
     tracing::debug!(
         uri = %resource_url,
@@ -229,7 +320,7 @@ pub async fn x402_payment(
         "Calling facilitator to verify payment signature"
     );
 
-    let verify_outcome = cfg.facilitator.verify(&payload, &requirements).await;
+    let verify_outcome = cfg.facilitator.verify(&payload, requirements).await;
     let verify = match verify_outcome {
         Ok(v) => v,
         Err(e) => {
@@ -240,8 +331,12 @@ pub async fn x402_payment(
                 error = %e,
                 "Facilitator verify unavailable; returning 402"
             );
+            if let Some(metrics) = &cfg.metrics {
+                metrics.record_verification(false);
+                metrics.record_challenge();
+            }
             return payment_required_response(
-                requirements,
+                options,
                 resource_url,
                 cfg.description.clone(),
                 Some(format!("facilitator verify unavailable: {e}")),
@@ -252,19 +347,27 @@ pub async fn x402_payment(
     if !verify.is_valid {
         let reason = verify
             .invalid_reason
-            .unwrap_or_else(|| "Payment invalid".to_string());
+            .unwrap_or_else(|| "Payment invalid".to_owned());
         tracing::warn!(
             uri = %resource_url,
             reason = %reason,
             payer = ?verify.payer,
             "Payment rejected by facilitator; returning 402"
         );
+        if let Some(metrics) = &cfg.metrics {
+            metrics.record_verification(false);
+            metrics.record_challenge();
+        }
         return payment_required_response(
-            requirements,
+            options,
             resource_url,
             cfg.description.clone(),
             Some(reason),
         );
+    }
+
+    if let Some(metrics) = &cfg.metrics {
+        metrics.record_verification(true);
     }
 
     tracing::info!(
@@ -281,10 +384,19 @@ pub async fn x402_payment(
         uri = %resource_url,
         "Running inner handler (forwarding to upstream)"
     );
+    // Cancellation after entering the handler has an uncertain execution outcome.
+    // Keep the reservation pending until completion, then retain it conservatively.
+    if let Some(reservation) = reservation.as_mut() {
+        reservation.retain_on_drop();
+    }
     let response = next.run(req).await;
 
     let status = response.status();
     if status.as_u16() >= 400 {
+        // This branch never calls settle, so the authorization is safe to retry.
+        if let Some(reservation) = reservation.take() {
+            reservation.release();
+        }
         tracing::warn!(
             uri = %resource_url,
             status = status.as_u16(),
@@ -300,10 +412,20 @@ pub async fn x402_payment(
         "Upstream succeeded; settling payment with facilitator"
     );
 
-    let settle_outcome = cfg.facilitator.settle(&payload, &requirements).await;
+    let settle_start = std::time::Instant::now();
+    let settle_outcome = cfg.facilitator.settle(&payload, requirements).await;
+    let settle_duration = settle_start.elapsed();
     let settle = match settle_outcome {
-        Ok(s) => s,
+        Ok(s) => {
+            if let Some(metrics) = &cfg.metrics {
+                metrics.record_settlement(s.success, settle_duration);
+            }
+            s
+        }
         Err(e) => {
+            if let Some(metrics) = &cfg.metrics {
+                metrics.record_settlement(false, settle_duration);
+            }
             tracing::error!(
                 uri = %resource_url,
                 error = %e,
@@ -315,7 +437,7 @@ pub async fn x402_payment(
                 error_message: None,
                 payer: None,
                 transaction: String::new(),
-                network: cfg.chain.network.to_string(),
+                network: requirements.network.clone(),
                 amount: None,
             };
             return settlement_failure_response(&failure);
@@ -329,6 +451,13 @@ pub async fn x402_payment(
             error_message = ?settle.error_message,
             "Facilitator settlement failed"
         );
+        tracing::warn!(
+            target: "kite_x402::audit",
+            event = "settlement_failure",
+            uri = %resource_url,
+            error_reason = ?settle.error_reason,
+            "Payment settlement audit: failed"
+        );
         return settlement_failure_response(&settle);
     }
 
@@ -339,6 +468,16 @@ pub async fn x402_payment(
         payer = ?settle.payer,
         amount = ?settle.amount,
         "Payment settled successfully on-chain"
+    );
+    tracing::info!(
+        target: "kite_x402::audit",
+        event = "settlement_success",
+        uri = %resource_url,
+        tx = %settle.transaction,
+        network = %settle.network,
+        payer = ?settle.payer,
+        amount = ?settle.amount,
+        "Payment settlement audit: confirmed"
     );
     tracing::debug!(
         settle = ?settle,
@@ -357,7 +496,7 @@ pub async fn x402_payment(
         .and_then(|v| v.to_str().ok())
     {
         Some(existing) if !existing.is_empty() => format!("{existing}, private"),
-        _ => "private".to_string(),
+        _ => "private".to_owned(),
     };
     parts.headers.insert(
         header::CACHE_CONTROL,
@@ -366,6 +505,152 @@ pub async fn x402_payment(
     );
 
     Response::from_parts(parts, body)
+}
+
+/// The x402 payment middleware. Apply with
+/// [`axum::middleware::from_fn_with_state`] to the `/v1/*` route group:
+///
+/// ```ignore
+/// let cfg = Arc::new(PaymentConfig { .. });
+/// let paid = Router::new()
+///     .route("/{*path}", any(proxy))
+///     .with_state(upstream_cfg)
+///     .layer(middleware::from_fn_with_state(cfg, x402_payment));
+/// ```
+///
+/// This is the single-option gate: it builds one `PaymentRequirements` from
+/// the route's static config (one price/network/asset) and delegates to the
+/// shared engine. Existing callers keep working unchanged. Behavior:
+///
+/// 1. No `PAYMENT-SIGNATURE` (or legacy `X-PAYMENT`) header → `402` with a
+///    `PAYMENT-REQUIRED` header describing how to pay.
+/// 2. Header present but doesn't decode, or doesn't match this route's
+///    price/network/asset/payTo → `402` with `error` explaining why.
+/// 3. Facilitator `/verify` says invalid, or the facilitator could not be
+///    reached at all → `402` with `error` set to the reason (see the
+///    crate-level docs for why facilitator-unreachable is also a `402`).
+/// 4. Verified → the inner handler runs. If it answers `>= 400`, that
+///    response is returned unchanged and **no settlement is attempted**.
+/// 5. If it answers `< 400`, `/settle` is called. On success, a
+///    `PAYMENT-RESPONSE` header is attached and `Cache-Control` gets
+///    `private` merged in. On failure, a `402` with `PAYMENT-RESPONSE`
+///    (`success: false`) is returned instead of the handler's response.
+pub async fn x402_payment(
+    State(cfg): State<Arc<PaymentConfig>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let requirements = match cfg.requirements() {
+        Ok(r) => r,
+        Err(msg) => {
+            tracing::error!(
+                error = %msg,
+                "Failed to compute payment requirements (invalid server configuration)"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": msg })),
+            )
+                .into_response();
+        }
+    };
+    payment_gate_inner(&cfg, std::slice::from_ref(&requirements), req, next).await
+}
+
+/// Configuration for the multi-option gate: the shared infrastructure (who
+/// receives payment, the facilitator, guards, metrics, description) plus the
+/// list of payment options to advertise on this route.
+///
+/// `PaymentOption` values are rendered into wire requirements at request time
+/// using the same integer price parser as the single-option gate.
+#[derive(Clone, Debug)]
+pub struct MultiPaymentConfig {
+    /// Address that receives payments (shared by every option).
+    pub pay_to: String,
+    /// The payment options advertised on this route.
+    pub options: Vec<crate::payment_options::PaymentOption>,
+    /// Shown to the buyer in the 402 challenge.
+    pub description: String,
+    /// Client for the Kite facilitator's `/verify` and `/settle`.
+    pub facilitator: FacilitatorClient,
+    /// Optional expiration guard.
+    pub expiration_guard: Option<crate::expiration::ExpirationGuardConfig>,
+    /// Optional metrics collector.
+    pub metrics: Option<Arc<crate::metrics::PaymentMetrics>>,
+    /// Optional nonce replay guard.
+    pub nonce_guard: Option<Arc<crate::nonce_guard::PaymentNonceReplayGuard>>,
+}
+
+impl MultiPaymentConfig {
+    /// Creates a multi-option config with no optional guards or metrics.
+    pub fn new(
+        pay_to: impl Into<String>,
+        options: Vec<crate::payment_options::PaymentOption>,
+        description: impl Into<String>,
+        facilitator: FacilitatorClient,
+    ) -> Self {
+        Self {
+            pay_to: pay_to.into(),
+            options,
+            description: description.into(),
+            facilitator,
+            expiration_guard: None,
+            metrics: None,
+            nonce_guard: None,
+        }
+    }
+
+    /// Builds a `PaymentConfig` view over this config's shared infrastructure.
+    /// The gate engine only reads these fields; options are passed separately.
+    fn as_base(&self) -> PaymentConfig {
+        PaymentConfig {
+            pay_to: self.pay_to.clone(),
+            // `chain`/`price_usd` are unused by the engine on the multi path
+            // (options carry their own chains). Keep them coherent anyway.
+            chain: self
+                .options
+                .first()
+                .map(|o| o.chain)
+                .unwrap_or(crate::kite::KITE_TESTNET),
+            price_usd: String::new(),
+            description: self.description.clone(),
+            facilitator: self.facilitator.clone(),
+            expiration_guard: self.expiration_guard,
+            metrics: self.metrics.clone(),
+            nonce_guard: self.nonce_guard.clone(),
+        }
+    }
+}
+
+/// Multi-option payment gate. Advertises every configured option in the 402
+/// challenge and accepts a client payment matching any one of them. Uses the
+/// exact same verify/settle engine as [`x402_payment`].
+pub async fn x402_payment_multi(
+    State(cfg): State<Arc<MultiPaymentConfig>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let options = match crate::payment_options::requirements_all(&cfg.options, &cfg.pay_to) {
+        Ok(o) if !o.is_empty() => o,
+        Ok(_) => {
+            tracing::error!("MultiPaymentConfig has no payment options configured");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "no payment options configured" })),
+            )
+                .into_response();
+        }
+        Err(msg) => {
+            tracing::error!(error = %msg, "Failed to compute payment requirements");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": msg })),
+            )
+                .into_response();
+        }
+    };
+    let base = cfg.as_base();
+    payment_gate_inner(&base, &options, req, next).await
 }
 
 #[cfg(test)]
@@ -402,11 +687,14 @@ mod tests {
 
     fn config(chain: KiteChain, price: &str) -> Arc<PaymentConfig> {
         Arc::new(PaymentConfig {
-            pay_to: PAY_TO.to_string(),
+            pay_to: PAY_TO.to_owned(),
             chain,
-            price_usd: price.to_string(),
-            description: "Unit test service".to_string(),
+            price_usd: price.to_owned(),
+            description: "Unit test service".to_owned(),
             facilitator: dead_facilitator(),
+            expiration_guard: None,
+            metrics: None,
+            nonce_guard: None,
         })
     }
 
@@ -514,7 +802,12 @@ mod tests {
 
     #[tokio::test]
     async fn payment_required_response_has_status_headers_and_empty_body() {
-        let resp = payment_required_response(requirements(), "/v1/x".into(), "desc".into(), None);
+        let resp = payment_required_response(
+            std::slice::from_ref(&requirements()),
+            "/v1/x".into(),
+            "desc".into(),
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
         assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
         assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/json");
@@ -537,7 +830,7 @@ mod tests {
     #[test]
     fn payment_required_response_includes_the_error_when_given() {
         let resp = payment_required_response(
-            requirements(),
+            std::slice::from_ref(&requirements()),
             "/v1/x".into(),
             "d".into(),
             Some("because".into()),
@@ -549,7 +842,7 @@ mod tests {
     fn payment_required_response_survives_unusual_text() {
         // base64 output is always a valid header value, whatever the inputs.
         let resp = payment_required_response(
-            requirements(),
+            std::slice::from_ref(&requirements()),
             "/v1/ünï?q=\n\t\"x\"".into(),
             "line1\nline2 — \u{1F4B8}".into(),
             Some("err\r\nInjected: header".into()),
@@ -687,7 +980,7 @@ mod tests {
         let err = decode_header(&resp, "PAYMENT-REQUIRED")["error"]
             .as_str()
             .unwrap()
-            .to_string();
+            .to_owned();
         assert!(err.starts_with("facilitator verify unavailable: "), "{err}");
         assert_eq!(reached.load(Ordering::SeqCst), 0);
     }
@@ -729,5 +1022,208 @@ mod tests {
             decode_header(&resp, "PAYMENT-REQUIRED")["error"],
             "No matching payment requirements"
         );
+    }
+
+    #[tokio::test]
+    async fn expired_authorization_is_rejected_before_facilitator_call() {
+        let guard = crate::expiration::ExpirationGuardConfig::new(5, 5);
+        let cfg = Arc::new(
+            PaymentConfig::new(
+                PAY_TO,
+                KITE_TESTNET,
+                "0.001",
+                "Unit test service",
+                dead_facilitator(),
+            )
+            .with_expiration_guard(guard),
+        );
+        let reqs = cfg.requirements().unwrap();
+        let payload = PaymentPayload {
+            x402_version: 2,
+            resource: None,
+            accepted: reqs,
+            payload: json!({
+                "authorization": {
+                    "validAfter": "0",
+                    "validBefore": "1000",
+                }
+            }),
+            extensions: None,
+        };
+        let encoded = STANDARD.encode(serde_json::to_vec(&payload).unwrap());
+
+        let (svc, reached) = gate(cfg);
+        let resp = svc
+            .oneshot(request("/v1/data", &[("PAYMENT-SIGNATURE", &encoded)]))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+        let header = decode_header(&resp, "PAYMENT-REQUIRED");
+        assert!(header["error"].as_str().unwrap().contains("expired"));
+    }
+
+    #[tokio::test]
+    async fn middleware_records_metrics_on_unauthenticated_request() {
+        let metrics = Arc::new(crate::metrics::PaymentMetrics::new());
+        let cfg = Arc::new(
+            PaymentConfig::new(
+                PAY_TO,
+                KITE_TESTNET,
+                "0.001",
+                "Unit test service",
+                dead_facilitator(),
+            )
+            .with_metrics(metrics.clone()),
+        );
+
+        let (svc, _) = gate(cfg);
+        let resp = svc.oneshot(request("/v1/data", &[])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.requests_total, 1);
+        assert_eq!(snap.challenges_total, 1);
+        assert_eq!(snap.verifications_success, 0);
+        assert_eq!(snap.settlements_success, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_verification_does_not_poison_the_authorization() {
+        let guard = Arc::new(crate::nonce_guard::PaymentNonceReplayGuard::new(100, 60));
+        let cfg = Arc::new(
+            PaymentConfig::new(
+                PAY_TO,
+                KITE_TESTNET,
+                "0.001",
+                "Unit test service",
+                dead_facilitator(),
+            )
+            .with_nonce_guard(guard),
+        );
+        let reqs = cfg.requirements().unwrap();
+        let payload = PaymentPayload {
+            x402_version: 2,
+            resource: None,
+            accepted: reqs,
+            payload: json!({
+                "authorization": {
+                    "nonce": "0xreplayed_nonce_123"
+                }
+            }),
+            extensions: None,
+        };
+        let encoded = STANDARD.encode(serde_json::to_vec(&payload).unwrap());
+
+        let (svc, reached) = gate(cfg);
+
+        // A verification failure must not consume the authorization.
+        let resp1 = svc
+            .clone()
+            .oneshot(request("/v1/data", &[("PAYMENT-SIGNATURE", &encoded)]))
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::PAYMENT_REQUIRED);
+        let header1 = decode_header(&resp1, "PAYMENT-REQUIRED");
+        assert!(!header1["error"]
+            .as_str()
+            .unwrap()
+            .contains("already been used"));
+
+        // The same authorization reaches verification again.
+        let resp2 = svc
+            .oneshot(request("/v1/data", &[("PAYMENT-SIGNATURE", &encoded)]))
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+        let header2 = decode_header(&resp2, "PAYMENT-REQUIRED");
+        assert!(header2["error"]
+            .as_str()
+            .unwrap()
+            .contains("facilitator verify unavailable"));
+    }
+
+    // ---- multi-option gate ------------------------------------------------
+
+    fn multi_gate(options: Vec<crate::payment_options::PaymentOption>) -> Svc {
+        let cfg = Arc::new(MultiPaymentConfig::new(
+            PAY_TO,
+            options,
+            "Multi test service",
+            dead_facilitator(),
+        ));
+        ServiceBuilder::new()
+            .layer(from_fn_with_state(cfg, x402_payment_multi))
+            .service(service_fn(|_req: Request| async {
+                Ok::<_, Infallible>((StatusCode::OK, "inner").into_response())
+            }))
+            .boxed_clone()
+    }
+
+    #[tokio::test]
+    async fn multi_option_challenge_advertises_every_option() {
+        let svc = multi_gate(vec![
+            crate::payment_options::PaymentOption::new(KITE_TESTNET, "0.001"),
+            crate::payment_options::PaymentOption::new(KITE_MAINNET, "$1.50"),
+        ]);
+
+        let resp = svc.oneshot(request("/v1/data", &[])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let challenge = decode_header(&resp, "PAYMENT-REQUIRED");
+        let accepts = challenge["accepts"].as_array().unwrap();
+        assert_eq!(accepts.len(), 2, "challenge must advertise both options");
+        assert_eq!(accepts[0]["network"], KITE_TESTNET.network);
+        assert_eq!(accepts[1]["network"], KITE_MAINNET.network);
+    }
+
+    #[tokio::test]
+    async fn multi_option_accepts_a_client_choice_that_matches_one_option() {
+        // The chosen option is the second one. A dead facilitator means verify
+        // fails, but critically the gate must NOT answer "No matching payment
+        // requirements" — proving the match against option #2 succeeded and
+        // the request reached the facilitator stage.
+        let options = vec![
+            crate::payment_options::PaymentOption::new(KITE_TESTNET, "0.001"),
+            crate::payment_options::PaymentOption::new(KITE_MAINNET, "$1.50"),
+        ];
+        let all = crate::payment_options::requirements_all(&options, PAY_TO).unwrap();
+        let chosen = payload_header(&all[1]);
+
+        let svc = multi_gate(options);
+        let resp = svc
+            .oneshot(request("/v1/data", &[("PAYMENT-SIGNATURE", &chosen)]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let challenge = decode_header(&resp, "PAYMENT-REQUIRED");
+        let error = challenge["error"].as_str().unwrap();
+        assert!(
+            error.contains("facilitator verify unavailable"),
+            "expected verify stage reached, got: {error}"
+        );
+        assert!(!error.contains("No matching payment requirements"));
+    }
+
+    #[tokio::test]
+    async fn multi_option_rejects_a_choice_matching_no_option() {
+        let options = vec![
+            crate::payment_options::PaymentOption::new(KITE_TESTNET, "0.001"),
+            crate::payment_options::PaymentOption::new(KITE_MAINNET, "$1.50"),
+        ];
+        let all = crate::payment_options::requirements_all(&options, PAY_TO).unwrap();
+        let mut foreign = all[0].clone();
+        foreign.network = "eip155:1".to_owned();
+        let chosen = payload_header(&foreign);
+
+        let svc = multi_gate(options);
+        let resp = svc
+            .oneshot(request("/v1/data", &[("PAYMENT-SIGNATURE", &chosen)]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let challenge = decode_header(&resp, "PAYMENT-REQUIRED");
+        assert_eq!(challenge["error"], "No matching payment requirements");
     }
 }

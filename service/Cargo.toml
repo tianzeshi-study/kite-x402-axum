@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
+
 [dependencies]
 kite-x402-axum = { path = "../kite-x402-axum" }
 axum = { version = "0.8", features = ["http1", "tokio"] }
@@ -17,6 +21,6 @@ dotenvy = "0.15"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-base64 = "0.22"
+base64 = "0.23"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal"] }
