@@ -238,6 +238,19 @@ The service provides built-in concurrency admission control for metered `/v1/*` 
 - If inbound concurrency exceeds the limit, incoming metered requests are immediately rejected with `503 Service Unavailable`, `Retry-After: 1`, `Cache-Control: no-store`, and JSON `{"error": "service_busy"}` before any facilitator verification or upstream proxying takes place.
 - Requests outside `/v1/*` (such as `/healthz`) do not consume concurrency slots and remain accessible during load spikes.
 
+## Bounded graceful shutdown
+
+`SHUTDOWN_TIMEOUT_SECONDS` bounds draining after `SIGTERM` or Ctrl+C (default
+`30`, valid range `1..=86400` seconds). It does not limit normal server uptime.
+The server stops accepting connections and lets in-flight requests finish their
+upstream processing and settlement. If the deadline expires, the process exits
+without waiting indefinitely. A completed response is still required before
+settlement; a timeout does not authorize a charge. Termination during a settlement
+can leave its outcome unknown: reconcile it instead of automatically retrying.
+
+Security headers continue to use the existing configurable middleware described
+above; no duplicate response-header layer is installed.
+
 ## Running the tests
 
 ```bash

@@ -2072,6 +2072,83 @@ fn refuses_invalid_max_concurrent_requests() {
     }
 }
 
+#[test]
+fn refuses_an_invalid_shutdown_timeout() {
+    for bad in ["abc", "-1", "0", "86401", "18446744073709551615"] {
+        let (status, stderr) = run_expecting_failure(vec![
+            ("PAY_TO", PAY_TO),
+            ("UPSTREAM_URL", "http://localhost:1"),
+            ("SHUTDOWN_TIMEOUT_SECONDS", bad),
+            ("RUST_LOG", "off"),
+        ]);
+        assert!(!status.success(), "SHUTDOWN_TIMEOUT_SECONDS={bad:?}");
+        assert!(
+            stderr.contains("SHUTDOWN_TIMEOUT_SECONDS must be an integer between 1 and 86400"),
+            "SHUTDOWN_TIMEOUT_SECONDS={bad:?}: {stderr}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_timeout_forces_exit_when_exceeded() {
+    let mocks = Mocks::start().await;
+    let mut reply = UpstreamReply::json(200);
+    // Upstream delay is 5s, but shutdown timeout is 1s
+    reply.delay = Some(Duration::from_millis(5000));
+    mocks.upstream.set_reply(reply);
+
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push(("SHUTDOWN_TIMEOUT_SECONDS".into(), "1".into()));
+    let mut svc = Service::start(env).await;
+
+    let reqs = svc.requirements("/v1/stuck").await;
+    let client = svc.http.clone();
+    let url = svc.url("/v1/stuck");
+    tokio::spawn(async move {
+        let _ = client
+            .get(url)
+            .header("PAYMENT-SIGNATURE", payment_header(&reqs))
+            .send()
+            .await;
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while mocks.upstream.count() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "request never reached the upstream"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let start = Instant::now();
+    let status = svc.terminate();
+    let elapsed = start.elapsed();
+
+    // The shutdown timeout was 1s, so the process must exit well before the 5s upstream delay
+    assert!(
+        elapsed < Duration::from_millis(3500),
+        "shutdown should have timed out and terminated within ~1-2s, took {elapsed:?}"
+    );
+    assert!(status.success());
+    assert_eq!(
+        mocks.facilitator.settle_count(),
+        0,
+        "unfinished responses must not settle"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_timeout_does_not_limit_server_uptime() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push(("SHUTDOWN_TIMEOUT_SECONDS".into(), "1".into()));
+    let svc = Service::start(env).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(svc.get("/healthz").await.status(), 200);
+}
+
 // Keep the import used on non-unix targets too.
 #[allow(dead_code)]
 fn _unused(_: Reply) {}

@@ -71,6 +71,13 @@ async fn main() {
     let description = env_or("SERVICE_DESCRIPTION", "Paid API access via Kite x402");
     let upstream_auth_header = env_or("UPSTREAM_AUTH_HEADER", "Authorization");
     let upstream_auth_value = env_or("UPSTREAM_AUTH_VALUE", "");
+    let shutdown_timeout_secs: u64 = env_or("SHUTDOWN_TIMEOUT_SECONDS", "30")
+        .parse()
+        .expect("SHUTDOWN_TIMEOUT_SECONDS must be an integer between 1 and 86400");
+    assert!(
+        (1..=86_400).contains(&shutdown_timeout_secs),
+        "SHUTDOWN_TIMEOUT_SECONDS must be an integer between 1 and 86400"
+    );
     let rate_limit_rps: f64 = env_or("RATE_LIMIT_RPS", "0")
         .parse()
         .expect("RATE_LIMIT_RPS must be a number");
@@ -175,6 +182,7 @@ async fn main() {
         cors_origin = %cors_origin,
         cors_enabled = cors_cfg.is_enabled(),
         auth_injected = !upstream_auth_value.is_empty(),
+        shutdown_timeout_secs,
         "Configured kite-x402 wrapper"
     );
 
@@ -316,15 +324,34 @@ async fn main() {
         "kite-x402 wrapper listening on 0.0.0.0:{port} (network={network_name})"
     );
 
-    axum::serve(
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .expect("server error");
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(());
+    });
 
-    tracing::info!("Server shut down gracefully");
+    tokio::select! {
+        res = server => {
+            res.expect("server error");
+            tracing::info!("Server shut down gracefully");
+        }
+        _ = async {
+            if shutdown_rx.await.is_ok() {
+                tokio::time::sleep(Duration::from_secs(shutdown_timeout_secs)).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            tracing::warn!(
+                timeout_secs = shutdown_timeout_secs,
+                "Graceful shutdown timeout exceeded; forcing exit"
+            );
+        }
+    }
 }
 
 static REQUEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
