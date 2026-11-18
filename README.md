@@ -218,7 +218,7 @@ completion; it cannot guarantee that a disconnected buyer receives every byte.
 The service exposes lightweight Kubernetes-compatible health endpoints outside the metered `/v1/*` namespace:
 
 - **`GET /healthz`** (Liveness probe): Returns `200 OK` (`"ok"`) immediately without contacting backends. Free and unmetered.
-- **`GET /readyz`** (Readiness probe): Probes downstream dependencies by pinging the configured Kite facilitator `/verify` endpoint with a zero-budget probe.
+- **`GET /readyz`** (Readiness probe): Checks that the configured facilitator advertises x402 v2 `exact` support for this service's network (it calls the facilitator's `/supported` endpoint). It returns `200` when ready and `503` otherwise. By default every request triggers a live check; set `FACILITATOR_HEALTH_INTERVAL_SECS` (1 to 86400) to probe in the background instead, so `/readyz` answers from the latest result (and reports its `checked_at` Unix time) without adding load on the facilitator.
   - Returns `200 OK` with JSON `{"status":"ready","facilitator":"ok","network":"…"}` only when `/supported` returns valid JSON advertising x402 v2, `exact`, and the configured network. A reachable 404, malformed body, or incompatible capability returns 503. This does not prove that a funded payment will settle.
   - Returns `503 Service Unavailable` with JSON `{"status":"unavailable","facilitator":"error","error":"..."}` if the facilitator cannot be reached. Useful for load balancers and orchestrators to avoid routing traffic before the settlement gateway is operational.
 ## Browser CORS support
