@@ -385,11 +385,26 @@ docker run -d --name kite-service \
   kite-x402-axum-service
 ```
 
-Or deploy via Docker Compose:
+For Docker Compose, create a `.env` file in the repository root. Replace the
+example values with your receiving wallet address and the base URL of your API.
+
+```dotenv
+PAY_TO=0xYourWalletAddress
+UPSTREAM_URL=https://api.example.com
+```
+
+You can also export these variables in your shell. Exported values take
+precedence over `.env`. Compose requires both values to be nonempty. The
+Compose service uses Kite testnet by default.
 
 ```bash
-docker compose up -d
+docker compose up --build -d
+curl -fsS http://localhost:8402/healthz
+curl -i http://localhost:8402/v1/example
 ```
+
+`/healthz` returns HTTP 200 once the service is up. The unsigned `/v1/example`
+request returns HTTP 402 with the `PAYMENT-REQUIRED` header.
 
 
 ## Contributing
