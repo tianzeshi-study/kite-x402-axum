@@ -78,11 +78,14 @@ pub fn requirements_all(
 
 /// Finds the advertised option the client chose in its `accepted` field.
 ///
-/// Uses the same full-struct equality the current middleware uses
-/// (`payload.accepted != requirements`), just applied across a set: a client
-/// payment is accepted only if it matches one advertised option exactly. This
-/// keeps the single-option behavior identical (a one-element slice is exactly
-/// the old `==` check) while enabling a choice when several are advertised.
+/// Compares the semantic fields only — `scheme`, `network`, `amount`,
+/// `asset` and `pay_to` — and treats `max_timeout_seconds` and `extra` as
+/// advisory, mirroring the TypeScript SDK's `findMatchingRequirements`: a
+/// client may cap its validity window below the server's advertised
+/// suggestion (the signed authorization carries the real window, and the
+/// facilitator validates that), and `extra` is server-derived metadata the
+/// resource server echoes authoritatively when calling `/verify` and
+/// `/settle`, so a differing echo must not block verification.
 ///
 /// Returns `None` when the slice is empty or no option matches; callers should
 /// answer `402` with `"No matching payment requirements"` in that case.
@@ -91,7 +94,13 @@ pub fn find_matching_requirements<'a>(
     accepted: &PaymentRequirements,
     options: &'a [PaymentRequirements],
 ) -> Option<&'a PaymentRequirements> {
-    options.iter().find(|candidate| *candidate == accepted)
+    options.iter().find(|candidate| {
+        candidate.scheme == accepted.scheme
+            && candidate.network == accepted.network
+            && candidate.amount == accepted.amount
+            && candidate.asset == accepted.asset
+            && candidate.pay_to == accepted.pay_to
+    })
 }
 
 #[cfg(test)]
@@ -221,11 +230,18 @@ mod tests {
     }
 
     #[test]
-    fn extra_field_is_part_of_the_match() {
-        // Full-struct equality means extra (EIP-712 domain metadata) must agree.
+    fn advisory_fields_do_not_block_matching() {
+        // TS-SDK semantics: max_timeout_seconds is a server suggestion the
+        // client may cap, and extra is server-derived metadata echoed back —
+        // neither participates in the match.
         let all = requirements_all(&[PaymentOption::new(KITE_TESTNET, "0.001")], PAY_TO).unwrap();
         let mut chosen = all[0].clone();
+        chosen.max_timeout_seconds = 5;
         chosen.extra = Some(json!({ "name": "something-else" }));
-        assert_eq!(find_matching_requirements(&chosen, &all), None);
+        assert_eq!(find_matching_requirements(&chosen, &all), Some(&all[0]));
+
+        let mut dropped = all[0].clone();
+        dropped.extra = None;
+        assert_eq!(find_matching_requirements(&dropped, &all), Some(&all[0]));
     }
 }
