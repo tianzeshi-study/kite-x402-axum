@@ -50,6 +50,26 @@ enum Entry {
     },
 }
 
+impl Entry {
+    /// When this entry was recorded; used to pick the oldest one for eviction.
+    fn timestamp(&self) -> Instant {
+        match self {
+            Self::InProgress { started_at } => *started_at,
+            Self::Completed { cached_at, .. } => *cached_at,
+        }
+    }
+
+    /// Whether the entry is still within its TTL / in-progress window.
+    fn is_live(&self, now: Instant, config: &IdempotencyConfig) -> bool {
+        match self {
+            Self::InProgress { started_at } => {
+                now.duration_since(*started_at) < config.in_progress_timeout
+            }
+            Self::Completed { cached_at, .. } => now.duration_since(*cached_at) < config.ttl,
+        }
+    }
+}
+
 /// Outcome of attempting to acquire an idempotency key slot.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AcquireResult {
@@ -78,6 +98,12 @@ impl IdempotencyCache {
     /// Creates a cache with custom configuration.
     #[must_use]
     pub fn with_config(config: IdempotencyConfig) -> Self {
+        // A zero bound would evict every key immediately; clamp like the sibling
+        // `NonceGuard` does so a misconfigured cache still holds one entry.
+        let config = IdempotencyConfig {
+            max_entries: config.max_entries.max(1),
+            ..config
+        };
         Self {
             config,
             entries: Arc::new(Mutex::new(HashMap::new())),
@@ -112,14 +138,21 @@ impl IdempotencyCache {
 
         // Clean up expired entries if reaching capacity limit
         if entries.len() >= self.config.max_entries {
-            entries.retain(|_, entry| match entry {
-                Entry::InProgress { started_at } => {
-                    now.duration_since(*started_at) < self.config.in_progress_timeout
-                }
-                Entry::Completed { cached_at, .. } => {
-                    now.duration_since(*cached_at) < self.config.ttl
-                }
-            });
+            entries.retain(|_, entry| entry.is_live(now, &self.config));
+        }
+
+        // Pruning alone is not enough: when every entry is still fresh, `retain`
+        // removes nothing and the map would grow past `max_entries` for every
+        // distinct key. Evict the oldest entries to keep the bound hard. Entries
+        // expire after `ttl` anyway, so this is early expiry under memory
+        // pressure rather than a new loss of the idempotency guarantee.
+        while entries.len() >= self.config.max_entries {
+            let oldest = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.timestamp())
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else { break };
+            entries.remove(&oldest);
         }
 
         entries.insert(key.to_owned(), Entry::InProgress { started_at: now });
@@ -169,5 +202,59 @@ impl IdempotencyCache {
 impl Default for IdempotencyCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_entries_is_a_hard_bound() {
+        let cache = IdempotencyCache::with_config(IdempotencyConfig {
+            max_entries: 3,
+            ttl: Duration::from_secs(300),
+            in_progress_timeout: Duration::from_secs(60),
+        });
+
+        // Every entry is still fresh, so nothing is eligible for TTL pruning.
+        for i in 0..10 {
+            assert_eq!(cache.acquire(&format!("key-{i}")), AcquireResult::Acquired);
+        }
+
+        assert!(
+            cache.len() <= 3,
+            "cache grew past max_entries: {}",
+            cache.len()
+        );
+    }
+
+    #[test]
+    fn completed_response_is_still_returned_under_capacity() {
+        let cache = IdempotencyCache::new();
+        assert_eq!(cache.acquire("k"), AcquireResult::Acquired);
+        cache.complete("k", 200, Vec::new(), b"ok".to_vec());
+
+        match cache.acquire("k") {
+            AcquireResult::Cached(response) => {
+                assert_eq!(response.status, 200);
+                assert_eq!(response.body, b"ok");
+            }
+            other => panic!("expected a cached response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn newest_key_survives_eviction() {
+        let cache = IdempotencyCache::with_config(IdempotencyConfig {
+            max_entries: 2,
+            ..IdempotencyConfig::default()
+        });
+        for key in ["a", "b", "c"] {
+            assert_eq!(cache.acquire(key), AcquireResult::Acquired);
+        }
+        assert!(cache.len() <= 2);
+        // The key just admitted must not be the one evicted.
+        assert_eq!(cache.acquire("c"), AcquireResult::InProgress);
     }
 }
