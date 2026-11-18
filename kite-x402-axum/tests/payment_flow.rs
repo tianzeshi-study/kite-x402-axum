@@ -208,15 +208,6 @@ async fn validation_any_mismatch_with_server_requirements_is_rejected() {
             "payTo",
             Box::new(|r| r.pay_to = "0xAttacker000000000000000000000000000000".into()),
         ),
-        (
-            "maxTimeoutSeconds",
-            Box::new(|r| r.max_timeout_seconds = 3600),
-        ),
-        ("extra dropped", Box::new(|r| r.extra = None)),
-        (
-            "extra domain",
-            Box::new(|r| r.extra = Some(json!({ "name": "evil", "version": "1" }))),
-        ),
     ];
 
     for (what, mutate) in mutations {
@@ -243,6 +234,60 @@ async fn validation_any_mismatch_with_server_requirements_is_rejected() {
         assert_eq!(challenge["accepts"][0]["amount"], good.amount, "{what}");
     }
     assert!(mocks.timeline().is_empty());
+}
+
+#[tokio::test]
+async fn advisory_field_differences_do_not_block_matching() {
+    // findMatchingRequirements semantics (TypeScript SDK): a client may cap
+    // maxTimeoutSeconds below the server's suggestion, and `extra` is
+    // server-derived metadata echoed back — neither is part of the match.
+    // The server's own requirements, not the client's echo, are what the
+    // facilitator validates against, so such payments must verify.
+    type Mutation = (
+        &'static str,
+        Box<dyn Fn(&mut kite_x402_axum::types::PaymentRequirements)>,
+    );
+
+    let mocks = Mocks::start().await;
+    let app = mocks.app();
+    let good = probe_requirements(&app, "/v1/forecast").await;
+
+    let mutations: Vec<Mutation> = vec![
+        (
+            "maxTimeoutSeconds",
+            Box::new(|r| r.max_timeout_seconds = 3600),
+        ),
+        ("extra dropped", Box::new(|r| r.extra = None)),
+        (
+            "extra domain",
+            Box::new(|r| r.extra = Some(json!({ "name": "evil", "version": "1" }))),
+        ),
+    ];
+
+    for (what, mutate) in &mutations {
+        let mut tampered = good.clone();
+        mutate(&mut tampered);
+        let header = payment_header(&tampered);
+        let resp = send(
+            &app,
+            req_with(
+                "GET",
+                "/v1/forecast",
+                &[("PAYMENT-SIGNATURE", &header)],
+                vec![],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{what}");
+    }
+
+    // Every mutation paid in full: one verify -> upstream -> settle per
+    // mutation, none rejected at the matching stage.
+    let expected: Vec<&str> = mutations
+        .iter()
+        .flat_map(|_| ["verify", "upstream", "settle"])
+        .collect();
+    assert_eq!(mocks.timeline(), expected);
 }
 
 #[tokio::test]
