@@ -2152,3 +2152,121 @@ async fn shutdown_timeout_does_not_limit_server_uptime() {
 // Keep the import used on non-unix targets too.
 #[allow(dead_code)]
 fn _unused(_: Reply) {}
+
+// ---------------------------------------------------------------------------
+// background facilitator health probe (FACILITATOR_HEALTH_INTERVAL_SECS)
+// ---------------------------------------------------------------------------
+
+/// A facilitator whose `/supported` endpoint counts how often it is hit.
+async fn counting_facilitator() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::{atomic::Ordering, Arc};
+
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    let app = axum::Router::new().route(
+        "/supported",
+        axum::routing::get(move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({"kinds": [
+                    {"x402Version": 2, "scheme": "exact", "network": "eip155:2368"}
+                ]}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), hits)
+}
+
+fn env_with(mut env: Vec<(String, String)>, key: &str, value: &str) -> Vec<(String, String)> {
+    env.retain(|(k, _)| k != key);
+    env.push((key.into(), value.into()));
+    env
+}
+
+#[tokio::test]
+async fn background_probe_serves_readyz_from_cache_instead_of_probing_per_request() {
+    use std::sync::atomic::Ordering;
+
+    let mocks = Mocks::start().await;
+    let (facilitator_url, hits) = counting_facilitator().await;
+    let env = env_with(
+        Service::base_env(&mocks, free_port()),
+        "FACILITATOR_URL",
+        &facilitator_url,
+    );
+    let env = env_with(env, "FACILITATOR_HEALTH_INTERVAL_SECS", "30");
+    let svc = Service::start(env).await;
+
+    // The first probe runs right at startup; wait until it has landed.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while hits.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "no background probe within 10s");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let before = hits.load(Ordering::SeqCst);
+
+    for _ in 0..10 {
+        let resp = svc.get("/readyz").await;
+        assert_eq!(resp.status(), 200);
+        let body = resp.json::<Value>().await.unwrap();
+        assert_eq!(body["status"], "ready");
+        assert!(body["checked_at"].as_u64().unwrap() > 0);
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        before,
+        "/readyz must not contact the facilitator when the background probe is on"
+    );
+}
+
+#[tokio::test]
+async fn background_probe_reports_an_unreachable_facilitator_as_503_with_check_time() {
+    let mocks = Mocks::start().await;
+    let env = env_with(
+        Service::base_env(&mocks, free_port()),
+        "FACILITATOR_URL",
+        "http://127.0.0.1:1",
+    );
+    let env = env_with(env, "FACILITATOR_HEALTH_INTERVAL_SECS", "30");
+    let svc = Service::start(env).await;
+
+    // Until the first background result lands, /readyz falls back to a live
+    // probe, so the answer is a 503 either way; the cached one has `checked_at`.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let resp = svc.get("/readyz").await;
+        assert_eq!(resp.status(), 503);
+        let body = resp.json::<Value>().await.unwrap();
+        assert_eq!(body["status"], "not_ready");
+        if body.get("checked_at").is_some() {
+            assert_eq!(body["facilitator"], "unreachable");
+            return;
+        }
+        assert!(Instant::now() < deadline, "no cached result within 10s");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[test]
+fn refuses_invalid_facilitator_health_interval() {
+    for value in ["abc", "-1", "1.5", "86401"] {
+        let (status, stderr) = run_expecting_failure(vec![
+            ("PAY_TO", PAY_TO),
+            ("UPSTREAM_URL", "http://localhost:1"),
+            ("FACILITATOR_HEALTH_INTERVAL_SECS", value),
+            ("RUST_LOG", "off"),
+        ]);
+        assert!(!status.success(), "{value} must fail startup");
+        assert!(
+            stderr.contains("FACILITATOR_HEALTH_INTERVAL_SECS"),
+            "{value}: {stderr}"
+        );
+    }
+}

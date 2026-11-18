@@ -34,8 +34,10 @@ use kite_x402_axum::{
 use serde_json::json;
 
 mod cors;
+mod health;
 mod rate_limit;
 use cors::{cors_middleware, CorsConfig};
+use health::ReadinessState;
 use rate_limit::{
     rate_limit_middleware, RateLimiterConfig, TokenBucketRateLimiter, TrustedProxies,
 };
@@ -221,6 +223,11 @@ async fn main() {
     let nonce_guard = replay_cache_size
         .map(|cap| Arc::new(kite_x402_axum::PaymentNonceReplayGuard::new(cap, 3600)));
 
+    let health_interval =
+        health::parse_interval(env::var("FACILITATOR_HEALTH_INTERVAL_SECS").ok().as_deref())
+            .unwrap_or_else(|message| panic!("{message}"));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
     let payment_cfg = Arc::new(PaymentConfig {
         pay_to,
         chain,
@@ -260,6 +267,34 @@ async fn main() {
             concurrency_limiter,
         ));
 
+    let readiness = health_interval.map(|interval| {
+        let state = ReadinessState::new();
+        let cfg = Arc::clone(&payment_cfg);
+        tokio::spawn(health::run_probe_loop(
+            state.clone(),
+            interval,
+            shutdown_rx.clone(),
+            move || {
+                let cfg = Arc::clone(&cfg);
+                async move {
+                    cfg.facilitator
+                        .probe_network(cfg.chain.network)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            },
+        ));
+        tracing::info!(
+            interval_secs = interval.as_secs(),
+            "Background facilitator health probe enabled"
+        );
+        state
+    });
+    let readyz_state = Arc::new(ReadyzState {
+        payment_cfg: Arc::clone(&payment_cfg),
+        cached: readiness,
+    });
+
     let service_metrics = Arc::new(ServiceMetrics::new());
 
     let metrics_router = Router::new()
@@ -296,7 +331,7 @@ async fn main() {
         .route("/healthz", axum::routing::get(healthz))
         .route(
             "/readyz",
-            axum::routing::get(readyz).with_state(payment_cfg),
+            axum::routing::get(readyz).with_state(readyz_state),
         )
         .merge(metrics_router)
         .merge(diag_router)
@@ -324,14 +359,14 @@ async fn main() {
         "kite-x402 wrapper listening on 0.0.0.0:{port} (network={network_name})"
     );
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
     let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
         shutdown_signal().await;
-        let _ = shutdown_tx.send(());
+        let _ = signal_tx.send(());
     });
 
     tokio::select! {
@@ -340,7 +375,7 @@ async fn main() {
             tracing::info!("Server shut down gracefully");
         }
         _ = async {
-            if shutdown_rx.await.is_ok() {
+            if signal_rx.await.is_ok() {
                 tokio::time::sleep(Duration::from_secs(shutdown_timeout_secs)).await;
             } else {
                 std::future::pending::<()>().await;
@@ -352,6 +387,9 @@ async fn main() {
             );
         }
     }
+    // Stop background tasks (they also stop if the sender is dropped).
+    let _ = shutdown_tx.send(true);
+    tracing::info!("Server shut down gracefully");
 }
 
 static REQUEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -647,19 +685,48 @@ async fn healthz() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
 }
 
+/// State behind `/readyz`: the payment config for a live probe, plus the
+/// cached result of the background probe when one is enabled.
+struct ReadyzState {
+    payment_cfg: Arc<PaymentConfig>,
+    cached: Option<ReadinessState>,
+}
+
 async fn readyz(
-    State(payment_cfg): State<Arc<PaymentConfig>>,
+    State(state): State<Arc<ReadyzState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     tracing::debug!("Handling /readyz request");
-    match payment_cfg
-        .facilitator
-        .probe_network(payment_cfg.chain.network)
-        .await
-    {
+    let network = state.payment_cfg.chain.network;
+
+    // With the background probe enabled, answer from its latest result so
+    // readiness polling never adds load on the facilitator. Before the first
+    // probe has finished, fall through to a live probe.
+    if let Some(latest) = state.cached.as_ref().and_then(ReadinessState::latest) {
+        return if latest.healthy {
+            Ok(Json(json!({
+                "status": "ready",
+                "facilitator": "ok",
+                "network": network,
+                "checked_at": latest.checked_at,
+            })))
+        } else {
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "not_ready",
+                    "facilitator": "unreachable",
+                    "error": latest.error,
+                    "checked_at": latest.checked_at,
+                })),
+            ))
+        };
+    }
+
+    match state.payment_cfg.facilitator.probe_network(network).await {
         Ok(()) => Ok(Json(json!({
             "status": "ready",
             "facilitator": "ok",
-            "network": payment_cfg.chain.network,
+            "network": network,
         }))),
         Err(err) => {
             tracing::warn!(error = %err, "Readiness probe failed: facilitator unreachable");
