@@ -359,16 +359,15 @@ async fn main() {
         "kite-x402 wrapper listening on 0.0.0.0:{port} (network={network_name})"
     );
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
     let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
         shutdown_signal().await;
-        let _ = shutdown_tx.send(());
+        let _ = signal_tx.send(());
     });
-
 
     tokio::select! {
         res = server => {
@@ -376,7 +375,7 @@ async fn main() {
             tracing::info!("Server shut down gracefully");
         }
         _ = async {
-            if shutdown_rx.await.is_ok() {
+            if signal_rx.await.is_ok() {
                 tokio::time::sleep(Duration::from_secs(shutdown_timeout_secs)).await;
             } else {
                 std::future::pending::<()>().await;
