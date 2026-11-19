@@ -361,6 +361,8 @@ request; the same commands work locally:
 | rustdoc | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked` |
 | package | `cargo package -p kite-x402-axum --locked` |
 | scripts | Compile the Python client and run its settlement regression tests with `python -m unittest discover -s service/scripts`. Install `eth-account` and `requests` first. |
+| scripts | `python -m py_compile service/scripts/kite_x402_client.py` |
+| Docker Compose smoke test | Checks required settings, builds and starts the image, then verifies `/healthz` and the unsigned payment challenge. |
 
 Mark **CI success** as the required check in branch protection; it passes only
 if all of the jobs above pass. `.github/workflows/audit.yml` checks

@@ -106,12 +106,78 @@ jobs:
       - run: python -m py_compile service/scripts/kite_x402_client.py
       - run: python -m unittest discover -s service/scripts -p 'test_kite_x402_client.py'
 
+  compose:
+    name: Docker Compose smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      COMPOSE_PROJECT_NAME: kite-compose-smoke
+      PAY_TO: '0x1111111111111111111111111111111111111111'
+      UPSTREAM_URL: http://127.0.0.1:9
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject missing or empty deployment settings
+        shell: bash
+        run: |
+          for variable in PAY_TO UPSTREAM_URL; do
+            for mode in unset empty; do
+              if [[ "$mode" == unset ]]; then
+                override=(-u "$variable")
+              else
+                override=("$variable=")
+              fi
+              if output=$(env "${override[@]}" docker compose --env-file /dev/null config --quiet 2>&1); then
+                echo "Compose accepted $variable when $mode"
+                exit 1
+              fi
+              if [[ "$output" != *"required variable $variable"* ]]; then
+                printf 'Unexpected Compose error for %s (%s): %s\n' "$variable" "$mode" "$output"
+                exit 1
+              fi
+            done
+          done
+      - name: Build and start the service
+        run: docker compose --env-file /dev/null up --build --wait --wait-timeout 60
+      - name: Check health and payment challenge
+        run: |
+          python3 - <<'PYTHON'
+          import base64
+          import http.client
+          import json
+          import os
+          from contextlib import closing
+
+          with closing(http.client.HTTPConnection("127.0.0.1", 8402, timeout=5)) as client:
+              client.request("GET", "/healthz")
+              with client.getresponse() as response:
+                  if response.status != 200:
+                      raise SystemExit(f"Expected HTTP 200 from /healthz, got {response.status}")
+                  response.read()
+
+              client.request("GET", "/v1/example")
+              with client.getresponse() as response:
+                  if response.status != 402:
+                      raise SystemExit(f"Expected HTTP 402 from /v1/example, got {response.status}")
+                  header = response.getheader("PAYMENT-REQUIRED")
+                  if not header:
+                      raise SystemExit("Missing PAYMENT-REQUIRED header")
+                  challenge = json.loads(base64.b64decode(header, validate=True))
+                  if challenge["accepts"][0]["payTo"] != os.environ["PAY_TO"]:
+                      raise SystemExit("Payment challenge does not use the configured PAY_TO")
+          PYTHON
+      - name: Show container logs on failure
+        if: failure()
+        run: docker compose --env-file /dev/null logs --no-color
+      - name: Stop the service
+        if: always()
+        run: docker compose --env-file /dev/null down
+
   # One stable name to mark as the required check in branch protection, so the
   # list of required jobs does not need editing whenever a job is added.
   ci-success:
     name: CI success
     if: always()
-    needs: [fmt, clippy, test, msrv, docs, package, scripts]
+    needs: [fmt, clippy, test, msrv, docs, package, scripts, compose]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any required job failed or was cancelled
