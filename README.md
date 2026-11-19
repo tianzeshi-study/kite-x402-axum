@@ -186,6 +186,14 @@ The service exposes endpoints outside `/v1/*` that are unmetered (free) and neve
 | `UPSTREAM_AUTH_HEADER` | `Authorization` | Credential header injected into upstream calls. |
 | `UPSTREAM_AUTH_VALUE` | Empty | Upstream secret credential (redacted from logs). |
 
+Facilitator response bodies from verification, settlement, and readiness checks
+are limited to 64 KiB, including HTTP error responses. The limit is enforced
+while reading, even without a Content-Length header. Oversized responses are not
+automatically retried; body transport errors are preserved. An unreadable settlement
+response may conceal a successful charge: reconcile the original payment before
+issuing another authorization. The library exposes this new failure as
+`FacilitatorError::ResponseTooLarge`; exhaustive error matches must handle it.
+
 ## Logging
 
 The service and library use [`tracing`](https://crates.io/crates/tracing) for structured diagnostic and protocol logging.

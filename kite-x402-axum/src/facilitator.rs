@@ -14,6 +14,9 @@ use crate::types::{PaymentPayload, PaymentRequirements, SettleResponse, VerifyRe
 /// Default per-request timeout for facilitator HTTP calls.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum body size for all facilitator responses, including HTTP errors (64 KiB).
+pub const MAX_FACILITATOR_RESPONSE_BYTES: usize = 64 * 1024;
+
 /// Retry policy for verification only. Settlement outcomes may be unknown after
 /// a transport or server error, so settlement is never automatically repeated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +67,16 @@ impl RetryConfig {
 /// values, not errors.
 #[derive(Debug, Error)]
 pub enum FacilitatorError {
+    /// Response exceeded the bounded buffer; this failure is never retried.
+    #[error("facilitator {op} response exceeds {limit} bytes (HTTP {status})")]
+    ResponseTooLarge {
+        /// Operation being performed.
+        op: &'static str,
+        /// HTTP response status.
+        status: u16,
+        /// Maximum accepted body size in bytes.
+        limit: usize,
+    },
     /// The HTTP request to the facilitator failed (network, TLS, timeout, or decoding error).
     #[error("facilitator request failed: {0}")]
     Request(#[from] reqwest::Error),
@@ -77,6 +90,26 @@ pub enum FacilitatorError {
         /// Response body returned by the facilitator.
         body: String,
     },
+}
+
+/// Check actual bytes without relying on response length metadata.
+async fn read_bounded_body(
+    mut response: reqwest::Response,
+    op: &'static str,
+) -> Result<Vec<u8>, FacilitatorError> {
+    let status = response.status().as_u16();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > MAX_FACILITATOR_RESPONSE_BYTES - bytes.len() {
+            return Err(FacilitatorError::ResponseTooLarge {
+                op,
+                status,
+                limit: MAX_FACILITATOR_RESPONSE_BYTES,
+            });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// HTTP client for one facilitator base URL (e.g.
@@ -195,6 +228,7 @@ impl FacilitatorClient {
         let url = format!("{}/supported", self.base_url);
         let response = self.http.get(&url).send().await?;
         let status = response.status();
+        let bytes = read_bounded_body(response, "probe").await?;
         if !status.is_success() {
             return Err(FacilitatorError::BadResponse {
                 op: "probe",
@@ -202,7 +236,13 @@ impl FacilitatorClient {
                 body: "supported endpoint rejected readiness check".into(),
             });
         }
-        let supported = response.json::<Supported>().await?;
+        let supported = serde_json::from_slice::<Supported>(&bytes).map_err(|error| {
+            FacilitatorError::BadResponse {
+                op: "probe",
+                status: status.as_u16(),
+                body: format!("could not parse facilitator supported response: {error}"),
+            }
+        })?;
         if supported.kinds.iter().any(|kind| {
             kind.version == 2
                 && kind.scheme == "exact"
@@ -236,6 +276,7 @@ impl FacilitatorClient {
                 Ok(resp) => return Ok(resp),
                 Err(err) => {
                     let is_transient = match &err {
+                        FacilitatorError::ResponseTooLarge { .. } => false,
                         FacilitatorError::Request(error) => {
                             error.is_connect() || error.is_timeout()
                         }
@@ -288,7 +329,8 @@ impl FacilitatorClient {
         };
 
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let bytes = read_bounded_body(response, op).await?;
+        let text = String::from_utf8_lossy(&bytes);
 
         if !status.is_success() {
             tracing::warn!(
@@ -301,7 +343,7 @@ impl FacilitatorClient {
             return Err(FacilitatorError::BadResponse {
                 op,
                 status: status.as_u16(),
-                body: text,
+                body: text.into_owned(),
             });
         }
 
@@ -312,7 +354,7 @@ impl FacilitatorClient {
             "Facilitator returned success HTTP status"
         );
 
-        serde_json::from_str(&text).map_err(|e| {
+        serde_json::from_slice(&bytes).map_err(|e| {
             tracing::error!(
                 op = %op,
                 url = %url,
@@ -670,7 +712,7 @@ mod tests {
                         ("verify", status, "upstream said no")
                     );
                 }
-                other @ FacilitatorError::Request(_) => {
+                other => {
                     panic!("expected BadResponse, got {other:?}")
                 }
             }
@@ -686,7 +728,7 @@ mod tests {
                 } => {
                     assert_eq!((op, s, body.as_str()), ("settle", status, "settle said no"));
                 }
-                other @ FacilitatorError::Request(_) => {
+                other => {
                     panic!("expected BadResponse, got {other:?}")
                 }
             }
@@ -755,7 +797,7 @@ mod tests {
             .unwrap_err();
         match err {
             FacilitatorError::Request(e) => assert!(e.is_connect(), "{e}"),
-            other @ FacilitatorError::BadResponse { .. } => {
+            other => {
                 panic!("expected Request, got {other:?}")
             }
         }
@@ -776,7 +818,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(500));
         match err {
             FacilitatorError::Request(e) => assert!(e.is_timeout(), "{e}"),
-            other @ FacilitatorError::BadResponse { .. } => {
+            other => {
                 panic!("expected Request, got {other:?}")
             }
         }
@@ -896,6 +938,80 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn body_limits_cover_verify_settle_and_supported() {
+        for op in ["verify", "settle", "probe"] {
+            for extra in [0, 1] {
+                for status in [200, 503] {
+                    let json = match op {
+                        "verify" => r#"{"isValid":true}"#,
+                        "settle" => {
+                            r#"{"success":true,"transaction":"tx","network":"eip155:2368"}"#
+                        }
+                        _ => {
+                            r#"{"kinds":[{"x402Version":2,"scheme":"exact","network":"eip155:2368"}]}"#
+                        }
+                    };
+                    let body = format!(
+                        "{json}{}",
+                        " ".repeat(MAX_FACILITATOR_RESPONSE_BYTES + extra - json.len())
+                    );
+                    let app = Router::new().fallback(move || {
+                        let body = body.clone();
+                        async move { (StatusCode::from_u16(status).unwrap(), body) }
+                    });
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let addr = listener.local_addr().unwrap();
+                    let task = tokio::spawn(async move {
+                        axum::serve(listener, app).await.unwrap();
+                    });
+                    let client = FacilitatorClient::new(format!("http://{addr}"));
+                    let result = match op {
+                        "verify" => client.verify(&payload(), &requirements()).await.map(|_| ()),
+                        "settle" => client.settle(&payload(), &requirements()).await.map(|_| ()),
+                        _ => client.probe().await,
+                    };
+                    task.abort();
+                    if extra == 1 {
+                        assert!(
+                            matches!(result, Err(FacilitatorError::ResponseTooLarge { op: actual, status: actual_status, limit: MAX_FACILITATOR_RESPONSE_BYTES }) if actual == op && actual_status == status),
+                            "{result:?}"
+                        );
+                    } else if status == 200 {
+                        assert!(result.is_ok(), "{result:?}");
+                    } else {
+                        assert!(matches!(
+                            result,
+                            Err(FacilitatorError::BadResponse { status: 503, .. })
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_responses_are_not_retried() {
+        let (url, fake) = start().await;
+        let body = "x".repeat(MAX_FACILITATOR_RESPONSE_BYTES + 1);
+        fake.set_verify(503, &body);
+        fake.set_settle(503, &body);
+        let client = FacilitatorClient::new(url).with_retry_config(RetryConfig::new(
+            3,
+            Duration::ZERO,
+            Duration::ZERO,
+        ));
+        assert!(matches!(
+            client.verify(&payload(), &requirements()).await,
+            Err(FacilitatorError::ResponseTooLarge { .. })
+        ));
+        assert!(matches!(
+            client.settle(&payload(), &requirements()).await,
+            Err(FacilitatorError::ResponseTooLarge { .. })
+        ));
+        assert_eq!(fake.seen().len(), 2);
+    }
+
     #[test]
     fn retry_config_calculates_exponential_backoff_and_caps_at_maximum() {
         let config = RetryConfig::new(3, Duration::from_millis(50), Duration::from_millis(300));
@@ -939,7 +1055,7 @@ mod tests {
             .unwrap_err();
         match err {
             FacilitatorError::BadResponse { status, .. } => assert_eq!(status, 400),
-            other @ FacilitatorError::Request(_) => {
+            other => {
                 panic!("expected BadResponse 400, got: {other:?}")
             }
         }
@@ -960,7 +1076,7 @@ mod tests {
             .unwrap_err();
         match err {
             FacilitatorError::BadResponse { status, .. } => assert_eq!(status, 503),
-            other @ FacilitatorError::Request(_) => {
+            other => {
                 panic!("expected BadResponse 503, got: {other:?}")
             }
         }
@@ -977,5 +1093,58 @@ mod tests {
             );
         assert!(client.settle(&payload(), &requirements()).await.is_err());
         assert_eq!(fake.seen().len(), 1);
+    }
+    #[tokio::test]
+    async fn streamed_bodies_enforce_limit_and_preserve_read_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for mode in ["chunked", "close-delimited", "truncated", "timeout"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0; 1];
+                while !request.ends_with(&[13, 10, 13, 10]) {
+                    socket.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                }
+                let headers = String::from_utf8(request).unwrap();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                socket.read_exact(&mut vec![0; length]).await.unwrap();
+                let body = "x".repeat(MAX_FACILITATOR_RESPONSE_BYTES / 2);
+                let wire = match mode {
+                    "chunked" => format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n{:x}\r\n{body}\r\n1\r\nx\r\n", body.len(), body.len()),
+                    "close-delimited" => format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{body}{body}x"),
+                    _ => "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n{".to_owned(),
+                };
+                let _ = socket.write_all(wire.as_bytes()).await;
+                if mode != "truncated" {
+                    std::future::pending::<()>().await;
+                }
+            });
+            let result =
+                FacilitatorClient::with_timeout(format!("http://{addr}"), Duration::from_secs(2))
+                    .settle(&payload(), &requirements())
+                    .await;
+            task.abort();
+            match (mode, result) {
+                ("chunked" | "close-delimited", Err(FacilitatorError::ResponseTooLarge { .. })) => {
+                }
+                ("truncated", Err(FacilitatorError::Request(error))) => {
+                    assert!(error.is_body() || error.is_decode(), "{error}")
+                }
+                ("timeout", Err(FacilitatorError::Request(error))) => {
+                    assert!(error.is_timeout(), "{error}")
+                }
+                (_, other) => panic!("{mode}: unexpected result {other:?}"),
+            }
+        }
     }
 }
