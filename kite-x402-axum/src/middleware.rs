@@ -261,20 +261,42 @@ async fn payment_gate_inner(
                     .or_else(|| v.as_u64())
             });
 
-            if let (Some(va), Some(vb)) = (valid_after, valid_before) {
-                if let Err(e) = guard.validate_now(va, vb) {
-                    tracing::warn!(
-                        uri = %resource_url,
-                        error = %e,
-                        "Payment authorization rejected by expiration guard; returning 402"
-                    );
-                    return payment_required_response(
-                        options,
-                        resource_url,
-                        cfg.description.clone(),
-                        Some(e.to_string()),
-                    );
+            // An authorization object that carries no usable validity window
+            // cannot be checked, so it must not be let through: skipping the
+            // guard here would turn a configured expiration check into a no-op
+            // for any client that simply omits `validAfter`/`validBefore`
+            // (or sends them as non-integers). EIP-3009 requires both fields,
+            // so rejecting is the only interpretation that keeps the guard's
+            // promise. Payloads without an `authorization` object at all are a
+            // different scheme and still skip the guard on purpose.
+            let (Some(valid_after), Some(valid_before)) = (valid_after, valid_before) else {
+                tracing::warn!(
+                    uri = %resource_url,
+                    "Payment authorization has a missing or malformed validity window; returning 402"
+                );
+                if let Some(metrics) = &cfg.metrics {
+                    metrics.record_challenge();
                 }
+                return payment_required_response(
+                    options,
+                    resource_url,
+                    cfg.description.clone(),
+                    Some("Payment authorization is missing a valid time window".to_owned()),
+                );
+            };
+
+            if let Err(e) = guard.validate_now(valid_after, valid_before) {
+                tracing::warn!(
+                    uri = %resource_url,
+                    error = %e,
+                    "Payment authorization rejected by expiration guard; returning 402"
+                );
+                return payment_required_response(
+                    options,
+                    resource_url,
+                    cfg.description.clone(),
+                    Some(e.to_string()),
+                );
             }
         }
     }
@@ -1062,6 +1084,122 @@ mod tests {
         assert_eq!(reached.load(Ordering::SeqCst), 0);
         let header = decode_header(&resp, "PAYMENT-REQUIRED");
         assert!(header["error"].as_str().unwrap().contains("expired"));
+    }
+
+    /// Builds a gate whose payload carries `authorization` but an unusable
+    /// validity window, and returns the status, the challenge body and how
+    /// often the inner service was reached.
+    async fn gate_response_for_authorization(authorization: Value) -> (StatusCode, Value, usize) {
+        let guard = crate::expiration::ExpirationGuardConfig::new(5, 5);
+        let cfg = Arc::new(
+            PaymentConfig::new(
+                PAY_TO,
+                KITE_TESTNET,
+                "0.001",
+                "Unit test service",
+                dead_facilitator(),
+            )
+            .with_expiration_guard(guard),
+        );
+        let reqs = cfg.requirements().unwrap();
+        let payload = PaymentPayload {
+            x402_version: 2,
+            resource: None,
+            accepted: reqs,
+            payload: json!({ "authorization": authorization }),
+            extensions: None,
+        };
+        let encoded = STANDARD.encode(serde_json::to_vec(&payload).unwrap());
+
+        let (svc, reached) = gate(cfg);
+        let resp = svc
+            .oneshot(request("/v1/data", &[("PAYMENT-SIGNATURE", &encoded)]))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let header = decode_header(&resp, "PAYMENT-REQUIRED");
+        (status, header, reached.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn authorization_without_validity_window_is_rejected() {
+        let (status, header, reached) = gate_response_for_authorization(json!({})).await;
+
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(reached, 0, "the guard must reject before the inner service");
+        assert!(
+            header["error"]
+                .as_str()
+                .unwrap()
+                .contains("missing a valid time window"),
+            "expected an explicit time-window rejection, got {header}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_with_malformed_validity_window_is_rejected() {
+        let (status, header, reached) =
+            gate_response_for_authorization(json!({ "validAfter": "soon", "validBefore": -1 }))
+                .await;
+
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(reached, 0);
+        assert!(header["error"]
+            .as_str()
+            .unwrap()
+            .contains("missing a valid time window"));
+    }
+
+    /// Positive control: the fail-closed branch must not reject payloads that
+    /// do carry a checkable window. With a dead facilitator the next failure
+    /// is the verify call, not the guard.
+    #[tokio::test]
+    async fn authorization_with_a_usable_window_still_reaches_verification() {
+        let guard = crate::expiration::ExpirationGuardConfig::new(5, 5);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let cfg = Arc::new(
+            PaymentConfig::new(
+                PAY_TO,
+                KITE_TESTNET,
+                "0.001",
+                "Unit test service",
+                dead_facilitator(),
+            )
+            .with_expiration_guard(guard),
+        );
+        let reqs = cfg.requirements().unwrap();
+        let payload = PaymentPayload {
+            x402_version: 2,
+            resource: None,
+            accepted: reqs,
+            payload: json!({
+                "authorization": {
+                    "validAfter": (now - 10).to_string(),
+                    "validBefore": (now + 600).to_string(),
+                }
+            }),
+            extensions: None,
+        };
+        let encoded = STANDARD.encode(serde_json::to_vec(&payload).unwrap());
+
+        let (svc, reached) = gate(cfg);
+        let resp = svc
+            .oneshot(request("/v1/data", &[("PAYMENT-SIGNATURE", &encoded)]))
+            .await
+            .unwrap();
+
+        let header = decode_header(&resp, "PAYMENT-REQUIRED");
+        assert!(
+            header["error"]
+                .as_str()
+                .unwrap()
+                .contains("facilitator verify unavailable"),
+            "a usable window must pass the guard, got {header}"
+        );
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
