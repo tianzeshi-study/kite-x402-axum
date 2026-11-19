@@ -27,7 +27,7 @@ use axum::{
 use kite_x402_axum::{
     facilitator::{FacilitatorClient, RetryConfig},
     kite::{kite_chain_by_name, FACILITATOR_URL},
-    middleware::{x402_payment, PaymentConfig},
+    middleware::PaymentConfig,
     proxy::{proxy, same_origin_redirect_policy, UpstreamConfig},
     PaymentMetrics, PaymentMetricsSnapshot,
 };
@@ -36,11 +36,13 @@ use serde_json::json;
 mod cors;
 mod health;
 mod rate_limit;
+mod route_prices;
 use cors::{cors_middleware, CorsConfig};
 use health::ReadinessState;
 use rate_limit::{
     rate_limit_middleware, RateLimiterConfig, TokenBucketRateLimiter, TrustedProxies,
 };
+use route_prices::{route_payment, RoutePrices};
 
 #[tokio::main]
 async fn main() {
@@ -188,14 +190,6 @@ async fn main() {
         "Configured kite-x402 wrapper"
     );
 
-    // Never follow a redirect to another host: the injected upstream
-    // credential would go with it. See `same_origin_redirect_policy`.
-    let http_client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(upstream_timeout_ms))
-        .redirect(same_origin_redirect_policy())
-        .build()
-        .expect("reqwest client");
-
     let clock_drift_secs = env::var("PAYMENT_CLOCK_DRIFT_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok());
@@ -242,6 +236,30 @@ async fn main() {
         metrics: Some(Arc::clone(&metrics)),
         nonce_guard,
     });
+    let route_prices_env = env::var_os("ROUTE_PRICES_USD")
+        .map(|value| {
+            value
+                .into_string()
+                .expect("ROUTE_PRICES_USD must be valid UTF-8")
+        })
+        .unwrap_or_default();
+    let route_prices = RoutePrices::parse(&route_prices_env, Arc::clone(&payment_cfg))
+        .unwrap_or_else(|err| panic!("invalid ROUTE_PRICES_USD: {err}"));
+
+    // Redirects can move a verified request to a differently priced route.
+    let redirect_policy = if route_prices.has_overrides() {
+        reqwest::redirect::Policy::custom(|attempt| {
+            attempt.error("upstream redirects are disabled with ROUTE_PRICES_USD")
+        })
+    } else {
+        same_origin_redirect_policy()
+    };
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(upstream_timeout_ms))
+        .redirect(redirect_policy)
+        .build()
+        .expect("reqwest client");
+
     let upstream_cfg = Arc::new(UpstreamConfig {
         http: http_client,
         base_url: upstream_url,
@@ -255,8 +273,8 @@ async fn main() {
         .route("/{*path}", any(proxy))
         .with_state(upstream_cfg)
         .layer(middleware::from_fn_with_state(
-            payment_cfg.clone(),
-            x402_payment,
+            Arc::new(route_prices),
+            route_payment,
         ))
         .layer(middleware::from_fn_with_state(
             rate_limiter.clone(),

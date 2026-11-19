@@ -33,6 +33,27 @@ failed upstream call never charges the buyer. See
 this template's behavior is a deliberate choice rather than a direct port:
 what happens when the facilitator itself can't be reached.
 
+## Pricing by route
+
+Set `ROUTE_PRICES_USD` in the service environment to charge different prices
+from the same proxy. The value is a JSON array of rules.
+
+```dotenv
+PRICE_USD=0.01
+ROUTE_PRICES_USD='[{"method":"GET","path":"/v1/forecast","price":"0.001"},{"method":"POST","path":"/v1/report","price":"0.05"}]'
+```
+
+Each rule matches the exact HTTP method and full, case-sensitive request path
+under `/v1/`. Use URL-encoded paths for rules and requests. The query string does
+not affect pricing. Unmatched metered requests use `PRICE_USD`. When the array is
+empty or unset, all metered requests use that default. Invalid or duplicate
+rules fail at startup.
+
+Configure the same price for each public path or method your upstream treats as
+an alias of the same operation. With at least one pricing rule, the proxy rejects
+upstream redirects it would otherwise follow with HTTP `502` and skips settlement.
+Use the upstream's final URL so each payment applies to the requested route.
+
 ## Rate Limiting
 
 The service includes an in-memory token-bucket rate limiter that guards `/v1/*`
@@ -149,7 +170,8 @@ The service exposes endpoints outside `/v1/*` that are unmetered (free) and neve
 | `PAY_TO` | Required | Receiving wallet address on Kite. |
 | `UPSTREAM_URL` | Required | Protected upstream origin URL. |
 | `KITE_NETWORK` | `mainnet` | `mainnet` or `testnet`. |
-| `PRICE_USD` | `0.001` | Price per call in USD. |
+| `PRICE_USD` | `0.001` | Default price per call in USD. |
+| `ROUTE_PRICES_USD` | Empty | Optional JSON array of [route price overrides](#pricing-by-route). |
 | `PORT` | `8402` | Port for the reverse proxy service. |
 | `FACILITATOR_URL` | `https://facilitator.pieverse.io/v2` | Kite facilitator URL (retaining `/v2`). |
 | `UPSTREAM_TIMEOUT_MS` | `10000` | Upstream request timeout in milliseconds (100..=300000). |
@@ -395,7 +417,8 @@ UPSTREAM_URL=https://api.example.com
 
 You can also export these variables in your shell. Exported values take
 precedence over `.env`. Compose requires both values to be nonempty. The
-Compose service uses Kite testnet by default.
+Compose service uses Kite testnet by default. To set [route prices](#pricing-by-route),
+add `ROUTE_PRICES_USD` to the same `.env` file or export it in your shell.
 
 ```bash
 docker compose up --build -d

@@ -13,8 +13,8 @@
 mod common;
 
 use std::{
-    io::Read,
-    net::TcpListener as StdListener,
+    io::{Read, Write},
+    net::{TcpListener as StdListener, TcpStream},
     process::{Child, Command, ExitStatus, Stdio},
     time::{Duration, Instant},
 };
@@ -1008,6 +1008,179 @@ async fn an_invalid_price_starts_fine_but_fails_every_metered_request_with_500()
         .as_str()
         .unwrap()
         .contains("invalid PRICE_USD"));
+}
+
+#[tokio::test]
+async fn route_prices_control_challenges_and_settlement() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.extend([
+        ("PRICE_USD".into(), "0.01".into()),
+        (
+            "ROUTE_PRICES_USD".into(),
+            json!([
+                {"method": "GET", "path": "/v1/forecast", "price": "0.001"},
+                {"method": "POST", "path": "/v1/report", "price": "0.05"},
+            ])
+            .to_string(),
+        ),
+    ]);
+    let svc = Service::start(env).await;
+
+    let forecast = svc.requirements("/v1/forecast?city=Berlin").await;
+    assert_eq!(forecast.amount, "1000000000000000");
+    assert_eq!(
+        svc.requirements("/v1/report").await.amount,
+        "10000000000000000"
+    );
+    assert_eq!(
+        svc.requirements("/v1/forecast/daily").await.amount,
+        "10000000000000000"
+    );
+    let report = svc.http.post(svc.url("/v1/report")).send().await.unwrap();
+    assert_eq!(report.status(), 402);
+    let report: PaymentRequirements =
+        serde_json::from_value(header_json(&report, "payment-required")["accepts"][0].clone())
+            .unwrap();
+    assert_eq!(report.amount, "50000000000000000");
+
+    let rejected = svc
+        .http
+        .post(svc.url("/v1/report"))
+        .header("PAYMENT-SIGNATURE", payment_header(&forecast))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 402);
+    assert_eq!(
+        header_json(&rejected, "payment-required")["accepts"][0]["amount"],
+        report.amount
+    );
+    assert!(mocks.timeline().is_empty());
+
+    for (method, path, requirements) in [
+        (reqwest::Method::GET, "/v1/forecast?city=Berlin", &forecast),
+        (reqwest::Method::POST, "/v1/report", &report),
+    ] {
+        let paid = svc
+            .http
+            .request(method, svc.url(path))
+            .header("PAYMENT-SIGNATURE", payment_header(requirements))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(paid.status(), 200);
+        assert_eq!(header_json(&paid, "payment-response")["success"], true);
+    }
+    assert_eq!(mocks.upstream.count(), 2);
+    let settlements = mocks.facilitator.settle_requests.lock().unwrap();
+    assert_eq!(settlements.len(), 2);
+    assert_eq!(
+        settlements[0]["paymentRequirements"]["amount"],
+        forecast.amount
+    );
+    assert_eq!(
+        settlements[1]["paymentRequirements"]["amount"],
+        report.amount
+    );
+}
+
+#[tokio::test]
+async fn route_prices_reject_upstream_redirects_without_settling() {
+    let mocks = Mocks::start().await;
+    let mut redirect = UpstreamReply::json(307);
+    redirect.headers.push(("location".into(), "/report".into()));
+    mocks.upstream.set_reply(redirect);
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push((
+        "ROUTE_PRICES_USD".into(),
+        r#"[{"method":"GET","path":"/v1/report","price":"0.05"}]"#.into(),
+    ));
+    let svc = Service::start(env).await;
+
+    let paid = svc.pay_get("/v1/forecast").await;
+    assert_eq!(paid.status(), 502);
+    assert!(!paid.headers().contains_key("payment-response"));
+    assert_eq!(mocks.upstream.count(), 1);
+    assert_eq!(mocks.facilitator.settle_count(), 0);
+}
+
+#[tokio::test]
+async fn route_prices_require_encoded_paths() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push((
+        "ROUTE_PRICES_USD".into(),
+        r#"[{"method":"GET","path":"/v1/report%7Bdraft%7D","price":"0.05"}]"#.into(),
+    ));
+    let svc = Service::start(env).await;
+    let requirements = svc.requirements("/v1/report%7Bdraft%7D").await;
+    assert_eq!(requirements.amount, "50000000000000000");
+
+    let mut socket = TcpStream::connect(("127.0.0.1", svc.port)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    socket
+        .write_all(
+            b"GET /v1/report{draft} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+    let mut raw_response = String::new();
+    socket.read_to_string(&mut raw_response).unwrap();
+    assert!(raw_response.starts_with("HTTP/1.1 400 "));
+    assert!(raw_response.contains("request path must use URL encoding"));
+    assert!(mocks.timeline().is_empty());
+}
+
+#[test]
+fn route_prices_reject_invalid_configuration_at_startup() {
+    let rule = json!({"method": "GET", "path": "/v1/forecast", "price": "0.001"});
+    for (rules, expected_error) in [
+        ("{".into(), "invalid ROUTE_PRICES_USD"),
+        (
+            json!([&rule, &rule]).to_string(),
+            "duplicates a method and path",
+        ),
+        (
+            json!([{"method":"NOT A METHOD","path":"/v1/forecast","price":"0.001"}]).to_string(),
+            "invalid HTTP method",
+        ),
+        (
+            json!([{"method":"GET","path":"/healthz","price":"0.001"}]).to_string(),
+            "exact HTTP method and path",
+        ),
+        (
+            json!([{"method":"GET","path":"/v1/{*path}","price":"0.001"}]).to_string(),
+            "exact HTTP method and path",
+        ),
+        (
+            json!([{"method":"GET","path":"/v1/forecast?city=Berlin","price":"0.001"}]).to_string(),
+            "exact HTTP method and path",
+        ),
+        (
+            json!([{"method":"GET","path":"/v1/forecast%xyz","price":"0.001"}]).to_string(),
+            "exact HTTP method and path",
+        ),
+        (
+            json!([{"method":"GET","path":"/v1/forecast","price":"cheap"}]).to_string(),
+            "invalid USD price",
+        ),
+    ] {
+        // A reserved port makes the test exit even if validation regresses.
+        let listener = StdListener::bind("0.0.0.0:0").unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        let (status, stderr) = run_expecting_failure(vec![
+            ("PORT", &port),
+            ("PAY_TO", PAY_TO),
+            ("UPSTREAM_URL", "http://localhost:1"),
+            ("RUST_LOG", "off"),
+            ("ROUTE_PRICES_USD", &rules),
+        ]);
+        assert!(!status.success());
+        assert!(stderr.contains("invalid ROUTE_PRICES_USD"), "{stderr}");
+        assert!(stderr.contains(expected_error), "{stderr}");
+    }
 }
 
 // ===========================================================================
