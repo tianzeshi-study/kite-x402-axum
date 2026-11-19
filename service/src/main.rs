@@ -716,10 +716,18 @@ async fn readyz(
     tracing::debug!("Handling /readyz request");
     let network = state.payment_cfg.chain.network;
 
-    // With the background probe enabled, answer from its latest result so
-    // readiness polling never adds load on the facilitator. Before the first
-    // probe has finished, fall through to a live probe.
-    if let Some(latest) = state.cached.as_ref().and_then(ReadinessState::latest) {
+    // Background mode never probes from a request, including while the first
+    // result is pending, so startup polling cannot amplify facilitator load.
+    if let Some(cached) = &state.cached {
+        let Some(latest) = cached.latest() else {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "not_ready",
+                    "facilitator": "pending",
+                })),
+            ));
+        };
         return if latest.healthy {
             Ok(Json(json!({
                 "status": "ready",
