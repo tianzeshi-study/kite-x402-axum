@@ -6,7 +6,10 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use kite_x402_axum::middleware::{x402_payment, PaymentConfig};
+use kite_x402_axum::middleware::{
+    x402_payment, x402_payment_multi, MultiPaymentConfig, PaymentConfig,
+};
+use kite_x402_axum::payment_options::PaymentOption;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -21,10 +24,18 @@ struct Rule {
 pub(super) struct RoutePrices {
     default: Arc<PaymentConfig>,
     overrides: HashMap<String, HashMap<Method, Arc<PaymentConfig>>>,
+    /// Additional `(network, price)` options advertised after each route's
+    /// own option (from `EXTRA_PAYMENT_OPTIONS`); empty keeps the
+    /// single-option gate.
+    extras: Vec<PaymentOption>,
 }
 
 impl RoutePrices {
-    pub(super) fn parse(value: &str, default: Arc<PaymentConfig>) -> Result<Self, String> {
+    pub(super) fn parse(
+        value: &str,
+        default: Arc<PaymentConfig>,
+        extras: Vec<PaymentOption>,
+    ) -> Result<Self, String> {
         let mut overrides: HashMap<String, HashMap<Method, Arc<PaymentConfig>>> = HashMap::new();
         if !value.trim().is_empty() {
             let rules: Vec<Rule> = serde_json::from_str(value).map_err(|err| err.to_string())?;
@@ -56,7 +67,11 @@ impl RoutePrices {
                 }
             }
         }
-        Ok(Self { default, overrides })
+        Ok(Self {
+            default,
+            overrides,
+            extras,
+        })
     }
 
     pub(super) fn has_overrides(&self) -> bool {
@@ -111,5 +126,21 @@ pub(super) async fn route_payment(
         .get(uri.path())
         .and_then(|methods| methods.get(req.method()))
         .unwrap_or(&prices.default);
-    x402_payment(State(Arc::clone(config)), req, next).await
+    if prices.extras.is_empty() {
+        return x402_payment(State(Arc::clone(config)), req, next).await;
+    }
+    // Advertise the route's own option first, then every configured extra;
+    // the client picks one and verification settles against its choice.
+    let mut options = vec![PaymentOption::new(config.chain, config.price_usd.clone())];
+    options.extend(prices.extras.iter().cloned());
+    let multi = Arc::new(MultiPaymentConfig {
+        pay_to: config.pay_to.clone(),
+        options,
+        description: config.description.clone(),
+        facilitator: config.facilitator.clone(),
+        expiration_guard: config.expiration_guard,
+        metrics: config.metrics.clone(),
+        nonce_guard: config.nonce_guard.clone(),
+    });
+    x402_payment_multi(State(multi), req, next).await
 }
