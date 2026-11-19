@@ -18,8 +18,8 @@ What it does, step by step:
      format exactly — see the comment above `AUTHORIZATION_TYPES` below).
   4. Retry the same request with a `PAYMENT-SIGNATURE` header carrying the
      base64-encoded payment payload.
-  5. Print the final response, and decode the `PAYMENT-RESPONSE` header if
-     present.
+  5. Print the final response. Exit successfully only when the HTTP request
+     succeeds and `PAYMENT-RESPONSE` confirms settlement on the requested network.
 
 Install:
     pip install eth-account requests
@@ -72,7 +72,10 @@ def b64_encode_json(obj: dict) -> str:
 
 
 def b64_decode_json(value: str) -> dict:
-    return json.loads(base64.b64decode(value))
+    decoded = json.loads(base64.b64decode(value, validate=True))
+    if not isinstance(decoded, dict):
+        raise ValueError("payment header must contain a JSON object")
+    return decoded
 
 
 def evm_chain_id(network: str) -> int:
@@ -169,14 +172,18 @@ def main() -> int:
     if first.status_code != 402:
         print("Expected 402 Payment Required. Response body:")
         print(first.text)
-        return 1 if first.status_code >= 400 else 0
+        return 1
 
     challenge_header = first.headers.get("PAYMENT-REQUIRED")
     if not challenge_header:
         print("error: 402 response has no PAYMENT-REQUIRED header", file=sys.stderr)
         return 1
 
-    challenge = b64_decode_json(challenge_header)
+    try:
+        challenge = b64_decode_json(challenge_header)
+    except ValueError:
+        print("error: invalid PAYMENT-REQUIRED header", file=sys.stderr)
+        return 1
     print("\npayment required:")
     print(pretty(challenge))
 
@@ -190,26 +197,44 @@ def main() -> int:
     payment_header = build_payment_header(args.private_key, account.address, requirements)
 
     print(f"\n--- 3) retrying {args.method} {args.url} with PAYMENT-SIGNATURE")
-    second = requests.request(
-        args.method,
-        args.url,
-        json=body,
-        headers={**headers, "PAYMENT-SIGNATURE": payment_header},
-        timeout=30,
-    )
+    try:
+        second = requests.request(
+            args.method,
+            args.url,
+            json=body,
+            headers={**headers, "PAYMENT-SIGNATURE": payment_header},
+            timeout=30,
+        )
+    except requests.RequestException:
+        print(
+            "error: signed request failed. Reconcile the original payment before retrying",
+            file=sys.stderr,
+        )
+        return 1
     print(f"HTTP {second.status_code}")
 
+    settlement = None
     settle_header = second.headers.get("PAYMENT-RESPONSE")
     if settle_header:
-        print("\nsettlement (PAYMENT-RESPONSE):")
-        print(pretty(b64_decode_json(settle_header)))
+        try:
+            settlement = b64_decode_json(settle_header)
+        except ValueError:
+            print("error: invalid PAYMENT-RESPONSE header", file=sys.stderr)
+        else:
+            print("\nsettlement (PAYMENT-RESPONSE):")
+            print(pretty(settlement))
 
     if second.status_code == 402 and not settle_header:
-        # Verify rejected the payment before ever reaching the handler.
+        # 验签被拒绝时，服务可能返回新的支付挑战。
         retry_challenge = second.headers.get("PAYMENT-REQUIRED")
         if retry_challenge:
-            print("\npayment rejected:")
-            print(pretty(b64_decode_json(retry_challenge)))
+            try:
+                rejection = b64_decode_json(retry_challenge)
+            except ValueError:
+                print("error: invalid PAYMENT-REQUIRED header", file=sys.stderr)
+            else:
+                print("\npayment rejected:")
+                print(pretty(rejection))
 
     print("\nresponse body:")
     try:
@@ -217,7 +242,23 @@ def main() -> int:
     except ValueError:
         print(second.text)
 
-    return 0 if second.status_code < 400 else 1
+    if second.status_code >= 400:
+        return 1
+
+    transaction = settlement.get("transaction") if settlement is not None else None
+    if (
+        settlement is None
+        or settlement.get("success") is not True
+        or settlement.get("network") != requirements["network"]
+        or not isinstance(transaction, str)
+        or not transaction.strip()
+    ):
+        print(
+            "error: settlement could not be confirmed. Reconcile the original payment before retrying",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
