@@ -172,12 +172,24 @@ jobs:
         if: always()
         run: docker compose --env-file /dev/null down
 
+  deny:
+    name: cargo-deny (licenses, bans, sources)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # Policy lives in deny.toml. Advisories are checked by audit.yml, which
+      # also runs on a schedule, so a new advisory never blocks unrelated PRs.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources
+
   # One stable name to mark as the required check in branch protection, so the
   # list of required jobs does not need editing whenever a job is added.
   ci-success:
     name: CI success
     if: always()
-    needs: [fmt, clippy, test, msrv, docs, package, scripts, compose]
+    needs: [fmt, clippy, test, msrv, docs, package, scripts, compose, deny]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any required job failed or was cancelled
