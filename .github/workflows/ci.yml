@@ -231,7 +231,6 @@ jobs:
     name: CI success
     if: always()
     needs: [fmt, clippy, test, msrv, docs, package, scripts, compose, deny, docker]
-    needs: [fmt, clippy, test, msrv, docs, package, scripts, deny, docker]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any required job failed or was cancelled
