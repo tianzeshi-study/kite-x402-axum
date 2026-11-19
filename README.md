@@ -128,6 +128,12 @@ nonzero legacy settings fail startup. `FACILITATOR_VERIFY_RETRIES` optionally
 enables 0–5 bounded retries for transient verification failures (default 0).
 The library's `RetryConfig` now applies only to verification.
 
+The [Python test client](service/scripts/kite_x402_client.py) exits with `0`
+only after receiving a payment challenge and a successful HTTP response with a
+settlement receipt for the requested network and a nonempty transaction ID.
+When the client reports an unconfirmed settlement, reconcile the original
+payment before signing another authorization.
+
 ## Health, Liveness & Diagnostics
 
 The service exposes endpoints outside `/v1/*` that are unmetered (free) and never invoke payment verification or settlement:
@@ -354,6 +360,7 @@ request; the same commands work locally:
 | msrv | `cargo check --workspace --all-targets --locked` on Rust 1.88 |
 | rustdoc | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked` |
 | package | `cargo package -p kite-x402-axum --locked` |
+| scripts | Compile the Python client and run its settlement regression tests with `python -m unittest discover -s service/scripts`. Install `eth-account` and `requests` first. |
 | scripts | `python -m py_compile service/scripts/kite_x402_client.py` |
 | Docker Compose smoke test | Checks required settings, builds and starts the image, then verifies `/healthz` and the unsigned payment challenge. |
 
