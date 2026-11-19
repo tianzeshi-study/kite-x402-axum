@@ -172,6 +172,47 @@ jobs:
         if: always()
         run: docker compose --env-file /dev/null down
 
+  docker:
+    name: docker build + smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: kite-x402-service:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # The image must start with only the two required variables and report
+      # healthy. Nothing here needs secrets or external network access.
+      - name: Start container and wait for /healthz
+        run: |
+          docker run -d --name svc -p 8402:8402 \
+            -e PAY_TO=0x0000000000000000000000000000000000000001 \
+            -e UPSTREAM_URL=http://127.0.0.1:9 \
+            kite-x402-service:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8402/healthz; then
+              echo
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "service did not become healthy" >&2
+          docker logs svc >&2
+          exit 1
+      - name: Unpaid /v1 request is challenged with 402
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8402/v1/anything)
+          test "$code" = "402" || { echo "expected 402, got $code" >&2; docker logs svc >&2; exit 1; }
+      - name: Show logs on failure
+        if: failure()
+        run: docker logs svc || true
+
   deny:
     name: cargo-deny (licenses, bans, sources)
     runs-on: ubuntu-latest
@@ -189,7 +230,8 @@ jobs:
   ci-success:
     name: CI success
     if: always()
-    needs: [fmt, clippy, test, msrv, docs, package, scripts, compose, deny]
+    needs: [fmt, clippy, test, msrv, docs, package, scripts, compose, deny, docker]
+    needs: [fmt, clippy, test, msrv, docs, package, scripts, deny, docker]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any required job failed or was cancelled
