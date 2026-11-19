@@ -9,6 +9,7 @@ services:
       - PAY_TO=${PAY_TO:?Set PAY_TO to your Kite wallet address}
       - UPSTREAM_URL=${UPSTREAM_URL:?Set UPSTREAM_URL to the API base URL}
       - PRICE_USD=0.001
+      - ROUTE_PRICES_USD=${ROUTE_PRICES_USD:-}
       - KITE_NETWORK=testnet
       - FACILITATOR_URL=https://facilitator.pieverse.io/v2
       - RUST_LOG=info
