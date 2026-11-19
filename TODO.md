@@ -97,13 +97,11 @@ fifth defect found while fixing them — `..` / `%2e%2e` path segments escaping
 the upstream base path — is fixed and covered there too. See the root README's
 "Proxy regression tests" section.
 
-## 6. Payment-requirements matching is single-option only
+## 6. ~~Payment-requirements matching is single-option only~~ — resolved
 
-`x402_payment` compares the client's `accepted` field against exactly one
-`PaymentRequirements` built from this route's static config (one price, one
-network, one asset) — there's no `findMatchingRequirements`-style search
-over multiple accepted options. This matches what both official wrapper
-templates actually do today (one price per route), so it's not a gap
-relative to them, but it means this crate alone isn't a drop-in replacement
-for the full `x402ResourceServer` if a future wrapper template needs
-multiple simultaneous price/network options on one route.
+`payment_options.rs` now carries `PaymentOption`, `requirements_all()` and
+`find_matching_requirements()`; the gate advertises every configured option
+(`x402_payment_multi` / `MultiPaymentConfig`, plus the service-level
+`EXTRA_PAYMENT_OPTIONS` env) and matches the client's `accepted` on the
+semantic fields with TypeScript-SDK semantics (`maxTimeoutSeconds` and
+`extra` are advisory). See PRs #72 and #75.
