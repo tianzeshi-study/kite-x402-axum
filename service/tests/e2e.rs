@@ -2190,6 +2190,86 @@ fn env_with(mut env: Vec<(String, String)>, key: &str, value: &str) -> Vec<(Stri
 }
 
 #[tokio::test]
+async fn background_probe_startup_does_not_fall_back_to_live_requests() {
+    use std::sync::{atomic::Ordering, Arc};
+
+    let mocks = Mocks::start().await;
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let app = axum::Router::new().route(
+        "/supported",
+        axum::routing::get({
+            let hits = Arc::clone(&hits);
+            let release = Arc::clone(&release);
+            move || {
+                let hits = Arc::clone(&hits);
+                let release = Arc::clone(&release);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    // Hold the initial probe open without relying on a slow timer.
+                    release.acquire().await.unwrap().forget();
+                    axum::Json(json!({"kinds": [
+                        {"x402Version": 2, "scheme": "exact", "network": "eip155:2368"}
+                    ]}))
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let env = env_with(
+        Service::base_env(&mocks, free_port()),
+        "FACILITATOR_URL",
+        &format!("http://{addr}"),
+    );
+    let env = env_with(env, "FACILITATOR_HEALTH_INTERVAL_SECS", "86400");
+    let svc = Service::start(env).await;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while hits.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "initial probe never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for _ in 0..10 {
+        let resp = tokio::time::timeout(Duration::from_secs(2), svc.get("/readyz"))
+            .await
+            .expect("readiness must not wait for the initial facilitator probe");
+        assert_eq!(resp.status(), 503);
+        let body = resp.json::<Value>().await.unwrap();
+        assert_eq!(body["status"], "not_ready");
+        assert_eq!(body["facilitator"], "pending");
+        assert!(body.get("checked_at").is_none());
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(svc.get("/healthz").await.status(), 200);
+
+    release.add_permits(1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let resp = svc.get("/readyz").await;
+        if resp.status() == 200 {
+            let body = resp.json::<Value>().await.unwrap();
+            assert_eq!(body["facilitator"], "ok");
+            assert!(body["checked_at"].as_u64().unwrap() > 0);
+            break;
+        }
+        assert_eq!(resp.status(), 503);
+        assert!(
+            Instant::now() < deadline,
+            "initial result never reached the cache"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert!(
+        mocks.timeline().is_empty(),
+        "health polling must not invoke payment or upstream work"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn background_probe_serves_readyz_from_cache_instead_of_probing_per_request() {
     use std::sync::atomic::Ordering;
 
@@ -2237,8 +2317,8 @@ async fn background_probe_reports_an_unreachable_facilitator_as_503_with_check_t
     let env = env_with(env, "FACILITATOR_HEALTH_INTERVAL_SECS", "30");
     let svc = Service::start(env).await;
 
-    // Until the first background result lands, /readyz falls back to a live
-    // probe, so the answer is a 503 either way; the cached one has `checked_at`.
+    // Readiness stays 503 while the initial probe is pending and after it
+    // fails; only a completed probe has `checked_at`.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let resp = svc.get("/readyz").await;
