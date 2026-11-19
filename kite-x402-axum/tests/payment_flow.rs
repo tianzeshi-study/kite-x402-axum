@@ -10,6 +10,31 @@
 
 mod common;
 
+#[tokio::test]
+async fn oversized_verification_never_calls_upstream_or_settlement() {
+    let mocks = Mocks::start().await;
+    mocks.facilitator.set_verify(Reply::Raw {
+        status: 200,
+        body: "x".repeat(kite_x402_axum::facilitator::MAX_FACILITATOR_RESPONSE_BYTES + 1),
+    });
+    let app = mocks.app();
+    let header = payment_header(&probe_requirements(&app, "/v1/forecast").await);
+    let response = send(
+        &app,
+        req_with(
+            "GET",
+            "/v1/forecast",
+            &[("PAYMENT-SIGNATURE", &header)],
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(mocks.facilitator.verify_count(), 1);
+    assert_eq!(mocks.upstream.count(), 0);
+    assert_eq!(mocks.facilitator.settle_count(), 0);
+}
+
 use axum::http::{header, StatusCode};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use common::*;
