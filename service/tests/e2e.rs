@@ -2523,3 +2523,82 @@ fn refuses_invalid_facilitator_health_interval() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// EXTRA_PAYMENT_OPTIONS
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn extra_payment_options_are_advertised_after_the_primary() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push(("EXTRA_PAYMENT_OPTIONS".into(), "mainnet:$0.05".into()));
+    let svc = Service::start(env).await;
+
+    let resp = svc.get("/v1/forecast").await;
+    assert_eq!(resp.status(), 402);
+    let challenge = header_json(&resp, "payment-required");
+    let accepts = challenge["accepts"].as_array().unwrap();
+    assert_eq!(accepts.len(), 2, "primary plus one extra option");
+
+    // Primary first: testnet pieUSD, 18 decimals.
+    assert_eq!(accepts[0]["network"], "eip155:2368");
+    assert_eq!(accepts[0]["amount"], "1000000000000000");
+    // The extra option follows in configured order: mainnet USDC.e, 6 decimals.
+    assert_eq!(accepts[1]["network"], "eip155:2366");
+    assert_eq!(accepts[1]["amount"], "50000");
+    assert_eq!(accepts[1]["payTo"], PAY_TO);
+
+    // Paying the extra option settles against that option's requirements.
+    let chosen: PaymentRequirements = serde_json::from_value(accepts[1].clone()).unwrap();
+    let resp = svc
+        .http
+        .get(svc.url("/v1/forecast"))
+        .header("PAYMENT-SIGNATURE", payment_header(&chosen))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        mocks.timeline(),
+        vec!["verify", "upstream", "settle"],
+        "the extra option must verify and settle like the primary"
+    );
+    let sent = mocks.facilitator.verify_requests.lock().unwrap()[0].clone();
+    assert_eq!(
+        sent["paymentRequirements"]["network"], "eip155:2366",
+        "the facilitator must see the option the client chose"
+    );
+}
+
+#[tokio::test]
+async fn extra_payment_options_keep_the_single_option_shape_when_unset() {
+    let mocks = Mocks::start().await;
+    let svc = Service::start_with(&mocks).await;
+
+    let resp = svc.get("/v1/forecast").await;
+    assert_eq!(resp.status(), 402);
+    let challenge = header_json(&resp, "payment-required");
+    assert_eq!(
+        challenge["accepts"].as_array().unwrap().len(),
+        1,
+        "no EXTRA_PAYMENT_OPTIONS means exactly the primary option"
+    );
+}
+
+#[test]
+fn refuses_malformed_extra_payment_options() {
+    for value in ["no-colon-here", "devnet:0.01"] {
+        let (status, stderr) = run_expecting_failure(vec![
+            ("PAY_TO", PAY_TO),
+            ("UPSTREAM_URL", "http://localhost:1"),
+            ("EXTRA_PAYMENT_OPTIONS", value),
+            ("RUST_LOG", "off"),
+        ]);
+        assert!(!status.success(), "{value} must fail startup");
+        assert!(
+            stderr.contains("EXTRA_PAYMENT_OPTIONS"),
+            "{value}: {stderr}"
+        );
+    }
+}

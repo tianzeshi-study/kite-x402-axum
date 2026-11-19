@@ -28,6 +28,7 @@ use kite_x402_axum::{
     facilitator::{FacilitatorClient, RetryConfig},
     kite::{kite_chain_by_name, FACILITATOR_URL},
     middleware::PaymentConfig,
+    payment_options::PaymentOption,
     proxy::{proxy, same_origin_redirect_policy, UpstreamConfig},
     PaymentMetrics, PaymentMetricsSnapshot,
 };
@@ -72,6 +73,7 @@ async fn main() {
     let chain = kite_chain_by_name(&network_name)
         .unwrap_or_else(|e| panic!("invalid KITE_NETWORK={network_name:?}: {e}"));
     let facilitator_url = env_or("FACILITATOR_URL", FACILITATOR_URL);
+    let extra_payment_options = parse_extra_payment_options(&env_or("EXTRA_PAYMENT_OPTIONS", ""));
     let description = env_or("SERVICE_DESCRIPTION", "Paid API access via Kite x402");
     let upstream_auth_header = env_or("UPSTREAM_AUTH_HEADER", "Authorization");
     let upstream_auth_value = env_or("UPSTREAM_AUTH_VALUE", "");
@@ -243,8 +245,12 @@ async fn main() {
                 .expect("ROUTE_PRICES_USD must be valid UTF-8")
         })
         .unwrap_or_default();
-    let route_prices = RoutePrices::parse(&route_prices_env, Arc::clone(&payment_cfg))
-        .unwrap_or_else(|err| panic!("invalid ROUTE_PRICES_USD: {err}"));
+    let route_prices = RoutePrices::parse(
+        &route_prices_env,
+        Arc::clone(&payment_cfg),
+        extra_payment_options,
+    )
+    .unwrap_or_else(|err| panic!("invalid ROUTE_PRICES_USD: {err}"));
 
     // Redirects can move a verified request to a differently priced route.
     let redirect_policy = if route_prices.has_overrides() {
@@ -773,6 +779,24 @@ fn env_or(key: &str, fallback: &str) -> String {
         Ok(v) if !v.trim().is_empty() => v.trim().to_owned(),
         _ => fallback.to_owned(),
     }
+}
+
+/// Parses `EXTRA_PAYMENT_OPTIONS` — a comma-separated list of
+/// `<network>:<price>` entries, e.g. `"testnet:0.002,mainnet:$0.05"`.
+/// These are advertised in the 402 challenge after the primary
+/// `KITE_NETWORK`/`PRICE_USD` pair. Unknown networks abort startup; prices
+/// are validated at request time like the primary price.
+fn parse_extra_payment_options(spec: &str) -> Vec<PaymentOption> {
+    let mut options = Vec::new();
+    for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some((network, price)) = entry.split_once(':') else {
+            panic!("invalid EXTRA_PAYMENT_OPTIONS entry {entry:?}: want <network>:<price>");
+        };
+        let chain = kite_chain_by_name(network.trim())
+            .unwrap_or_else(|e| panic!("invalid EXTRA_PAYMENT_OPTIONS entry {entry:?}: {e}"));
+        options.push(PaymentOption::new(chain, price.trim()));
+    }
+    options
 }
 
 async fn shutdown_signal() {

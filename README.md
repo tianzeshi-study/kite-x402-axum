@@ -178,6 +178,7 @@ The service exposes endpoints outside `/v1/*` that are unmetered (free) and neve
 | `KITE_NETWORK` | `mainnet` | `mainnet` or `testnet`. |
 | `PRICE_USD` | `0.001` | Default price per call in USD. |
 | `ROUTE_PRICES_USD` | Empty | Optional JSON array of [route price overrides](#pricing-by-route). |
+| `EXTRA_PAYMENT_OPTIONS` | *(unset)* | Comma-separated `<network>:<price>` options advertised after each route's primary pair, e.g. `testnet:0.002,mainnet:$0.05`. Clients may pay with any advertised option. |
 | `PORT` | `8402` | Port for the reverse proxy service. |
 | `FACILITATOR_URL` | `https://facilitator.pieverse.io/v2` | Kite facilitator URL (retaining `/v2`). |
 | `UPSTREAM_TIMEOUT_MS` | `10000` | Upstream request timeout in milliseconds (100..=300000). |
