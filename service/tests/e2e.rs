@@ -1233,7 +1233,10 @@ async fn route_prices_resolve_extra_payment_options_per_route() {
     }
     assert!(mocks.timeline().is_empty());
 
-    let alternative = serde_json::from_value(accepts[1].clone()).unwrap();
+    let alternative: PaymentRequirements = serde_json::from_value(accepts[1].clone()).unwrap();
+    mocks
+        .facilitator
+        .set_settle(settle_ok(&alternative.network));
     let paid = svc
         .http
         .post(svc.url("/v1/report"))
@@ -1242,6 +1245,10 @@ async fn route_prices_resolve_extra_payment_options_per_route() {
         .await
         .unwrap();
     assert_eq!(paid.status(), 200);
+    assert_eq!(
+        header_json(&paid, "payment-response")["network"],
+        alternative.network
+    );
     assert_eq!(mocks.timeline(), vec!["verify", "upstream", "settle"]);
     for recorded in [
         &mocks.facilitator.verify_requests,
