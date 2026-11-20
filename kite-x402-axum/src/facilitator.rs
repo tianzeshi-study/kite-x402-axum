@@ -166,6 +166,14 @@ impl FacilitatorClient {
     pub fn with_timeout(base_url: impl Into<String>, timeout: Duration) -> Self {
         let http = reqwest::Client::builder()
             .timeout(timeout)
+            // Every request built here carries the buyer's signed payment
+            // authorization in its body. reqwest's default policy follows a
+            // redirect to any host and keeps the POST body on 307/308, which
+            // would hand that signature to whatever host the facilitator
+            // points at. Reuse the proxy's policy: follow same-origin hops
+            // (so a trailing-slash or http->https redirect still works) and
+            // stop at everything else, surfacing the 3xx as an error.
+            .redirect(crate::proxy::same_origin_redirect_policy())
             .build()
             .expect("reqwest client with default TLS backend");
         Self {
