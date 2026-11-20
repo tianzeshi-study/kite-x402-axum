@@ -6,11 +6,12 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use kite_x402_axum::middleware::{
-    x402_payment, x402_payment_multi, MultiPaymentConfig, PaymentConfig,
+use kite_x402_axum::{
+    kite::kite_chain_by_name,
+    middleware::{x402_payment, x402_payment_multi, MultiPaymentConfig, PaymentConfig},
+    payment_options::PaymentOption,
 };
-use kite_x402_axum::payment_options::PaymentOption;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,15 +19,35 @@ struct Rule {
     method: String,
     path: String,
     price: String,
+    #[serde(default, deserialize_with = "deserialize_extra_options")]
+    extra_payment_options: Option<Vec<ExtraOption>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtraOption {
+    network: String,
+    price: String,
+}
+
+fn deserialize_extra_options<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<ExtraOption>>, D::Error> {
+    // An omitted field inherits defaults. Require an explicit array when present.
+    Vec::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug)]
+struct RoutePrice {
+    primary: Arc<PaymentConfig>,
+    extras: Option<Vec<PaymentOption>>,
 }
 
 #[derive(Debug)]
 pub(super) struct RoutePrices {
     default: Arc<PaymentConfig>,
-    overrides: HashMap<String, HashMap<Method, Arc<PaymentConfig>>>,
-    /// Additional `(network, price)` options advertised after each route's
-    /// own option (from `EXTRA_PAYMENT_OPTIONS`); empty keeps the
-    /// single-option gate.
+    overrides: HashMap<String, HashMap<Method, RoutePrice>>,
+    /// Default extras for routes without an explicit list.
     extras: Vec<PaymentOption>,
 }
 
@@ -36,7 +57,7 @@ impl RoutePrices {
         default: Arc<PaymentConfig>,
         extras: Vec<PaymentOption>,
     ) -> Result<Self, String> {
-        let mut overrides: HashMap<String, HashMap<Method, Arc<PaymentConfig>>> = HashMap::new();
+        let mut overrides: HashMap<String, HashMap<Method, RoutePrice>> = HashMap::new();
         if !value.trim().is_empty() {
             let rules: Vec<Rule> = serde_json::from_str(value).map_err(|err| err.to_string())?;
             for (index, rule) in rules.into_iter().enumerate() {
@@ -53,14 +74,21 @@ impl RoutePrices {
                     .parse_price(&rule.price)
                     .map_err(|err| format!("rule {} has an invalid USD price: {err}", index + 1))?;
 
-                let config = Arc::new(PaymentConfig {
-                    price_usd: rule.price,
-                    ..default.as_ref().clone()
-                });
+                let extras = rule
+                    .extra_payment_options
+                    .map(|extras| parse_extra_options(extras, index + 1))
+                    .transpose()?;
+                let price = RoutePrice {
+                    primary: Arc::new(PaymentConfig {
+                        price_usd: rule.price,
+                        ..default.as_ref().clone()
+                    }),
+                    extras,
+                };
                 if overrides
                     .entry(rule.path)
                     .or_default()
-                    .insert(method, config)
+                    .insert(method, price)
                     .is_some()
                 {
                     return Err(format!("rule {} duplicates a method and path", index + 1));
@@ -77,6 +105,29 @@ impl RoutePrices {
     pub(super) fn has_overrides(&self) -> bool {
         !self.overrides.is_empty()
     }
+}
+
+fn parse_extra_options(
+    extras: Vec<ExtraOption>,
+    rule: usize,
+) -> Result<Vec<PaymentOption>, String> {
+    extras
+        .into_iter()
+        .enumerate()
+        .map(|(index, extra)| {
+            let network = extra.network.trim();
+            let location = || format!("rule {rule} extra_payment_options entry {}", index + 1);
+            if network.is_empty() {
+                return Err(format!("{} needs a network", location()));
+            }
+            let chain =
+                kite_chain_by_name(network).map_err(|err| format!("{}: {err}", location()))?;
+            chain
+                .parse_price(&extra.price)
+                .map_err(|err| format!("{} has an invalid USD price: {err}", location()))?;
+            Ok(PaymentOption::new(chain, extra.price))
+        })
+        .collect()
 }
 
 fn is_paid_path(path: &str) -> bool {
@@ -121,18 +172,20 @@ pub(super) async fn route_payment(
             .into_response();
     }
     // Match the full public path before Axum strips the /v1 prefix.
-    let config = prices
+    let route = prices
         .overrides
         .get(uri.path())
-        .and_then(|methods| methods.get(req.method()))
-        .unwrap_or(&prices.default);
-    if prices.extras.is_empty() {
+        .and_then(|methods| methods.get(req.method()));
+    let config = route.map_or(&prices.default, |route| &route.primary);
+    let extras = route
+        .and_then(|route| route.extras.as_deref())
+        .unwrap_or(&prices.extras);
+    if extras.is_empty() {
         return x402_payment(State(Arc::clone(config)), req, next).await;
     }
-    // Advertise the route's own option first, then every configured extra;
-    // the client picks one and verification settles against its choice.
+    // Use the same route options for the challenge, verification and settlement.
     let mut options = vec![PaymentOption::new(config.chain, config.price_usd.clone())];
-    options.extend(prices.extras.iter().cloned());
+    options.extend_from_slice(extras);
     let multi = Arc::new(MultiPaymentConfig {
         pay_to: config.pay_to.clone(),
         options,

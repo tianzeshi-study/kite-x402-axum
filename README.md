@@ -49,6 +49,23 @@ not affect pricing. Unmatched metered requests use `PRICE_USD`. When the array i
 empty or unset, all metered requests use that default. Invalid or duplicate
 rules fail at startup.
 
+Use `extra_payment_options` in a rule to set the alternatives for that route.
+Omit the field to inherit `EXTRA_PAYMENT_OPTIONS`, use `[]` to offer only the
+primary option, or provide an array of `{"network":"mainnet","price":"0.06"}`
+objects to replace the defaults. The primary option stays first. Each extra uses
+`mainnet` or `testnet` and a positive USD amount valid for that network's token.
+An invalid local list prevents the service from starting. Unmatched routes use
+`PRICE_USD` and `EXTRA_PAYMENT_OPTIONS`.
+
+```dotenv
+EXTRA_PAYMENT_OPTIONS=mainnet:0.002
+ROUTE_PRICES_USD='[{"method":"GET","path":"/v1/forecast","price":"0.001"},{"method":"POST","path":"/v1/report","price":"0.05","extra_payment_options":[{"network":"mainnet","price":"0.06"}]}]'
+```
+
+With `KITE_NETWORK=testnet`, this example offers the forecast for `$0.001` on
+testnet or `$0.002` on mainnet. The report costs `$0.05` on testnet or `$0.06`
+on mainnet.
+
 Configure the same price for each public path or method your upstream treats as
 an alias of the same operation. With at least one pricing rule, the proxy rejects
 upstream redirects it would otherwise follow with HTTP `502` and skips settlement.
@@ -178,7 +195,7 @@ The service exposes endpoints outside `/v1/*` that are unmetered (free) and neve
 | `KITE_NETWORK` | `mainnet` | `mainnet` or `testnet`. |
 | `PRICE_USD` | `0.001` | Default price per call in USD. |
 | `ROUTE_PRICES_USD` | Empty | Optional JSON array of [route price overrides](#pricing-by-route). |
-| `EXTRA_PAYMENT_OPTIONS` | *(unset)* | Comma-separated `<network>:<price>` options advertised after each route's primary pair, e.g. `testnet:0.002,mainnet:$0.05`. Clients may pay with any advertised option. |
+| `EXTRA_PAYMENT_OPTIONS` | *(unset)* | Comma-separated default alternatives, e.g. `testnet:0.002,mainnet:$0.05`. A route rule can replace or disable them. |
 | `PORT` | `8402` | Port for the reverse proxy service. |
 | `FACILITATOR_URL` | `https://facilitator.pieverse.io/v2` | Kite facilitator URL (retaining `/v2`). |
 | `UPSTREAM_TIMEOUT_MS` | `10000` | Upstream request timeout in milliseconds (100..=300000). |
