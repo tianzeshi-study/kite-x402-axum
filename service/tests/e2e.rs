@@ -561,6 +561,40 @@ async fn readyz_probes_facilitator_and_returns_status() {
     assert_eq!(body["status"], "ready");
     assert_eq!(body["facilitator"], "ok");
     assert_eq!(body["network"], "eip155:2368");
+    assert_eq!(body["networks"], json!(["eip155:2368"]));
+}
+
+#[tokio::test]
+async fn readyz_checks_global_extra_networks_in_one_probe() {
+    use std::sync::atomic::Ordering;
+
+    let mocks = Mocks::start().await;
+    for version in [1, 2] {
+        let (facilitator_url, hits) = counting_facilitator(json!([
+            {"x402Version": 2, "scheme": "exact", "network": "eip155:2368"},
+            {"x402Version": version, "scheme": "exact", "network": "eip155:2366"}
+        ]))
+        .await;
+        let env = env_with(
+            Service::base_env(&mocks, free_port()),
+            "FACILITATOR_URL",
+            &facilitator_url,
+        );
+        let env = env_with(env, "EXTRA_PAYMENT_OPTIONS", "mainnet:0.002,mainnet:0.003");
+        let svc = Service::start(env).await;
+
+        let resp = svc.get("/readyz").await;
+        assert_eq!(resp.status(), if version == 2 { 200 } else { 503 });
+        let body = resp.json::<Value>().await.unwrap();
+        assert_eq!(body["networks"], json!(["eip155:2366", "eip155:2368"]));
+        if version == 2 {
+            assert_eq!(body["network"], "eip155:2368");
+        } else {
+            assert!(body["error"].as_str().unwrap().contains("eip155:2366"));
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(svc.get("/healthz").await.status(), 200);
+    }
 }
 
 #[tokio::test]
@@ -1086,6 +1120,89 @@ async fn route_prices_control_challenges_and_settlement() {
 }
 
 #[tokio::test]
+async fn route_prices_resolve_extra_payment_options_per_route() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.extend([
+        ("EXTRA_PAYMENT_OPTIONS".into(), "mainnet:0.002".into()),
+        (
+            "ROUTE_PRICES_USD".into(),
+            json!([
+                {"method": "GET", "path": "/v1/forecast", "price": "0.001"},
+                {"method": "POST", "path": "/v1/report", "price": "0.05",
+                 "extra_payment_options": [{"network": "mainnet", "price": "0.06"}]},
+                {"method": "GET", "path": "/v1/private", "price": "0.07",
+                 "extra_payment_options": []},
+            ])
+            .to_string(),
+        ),
+    ]);
+    let svc = Service::start(env).await;
+
+    let forecast = svc.get("/v1/forecast").await;
+    let inherited = header_json(&forecast, "payment-required")["accepts"].clone();
+    let unmatched = svc.get("/v1/report").await;
+    assert_eq!(
+        header_json(&unmatched, "payment-required")["accepts"],
+        inherited
+    );
+    assert_eq!(inherited.as_array().unwrap().len(), 2);
+    assert_eq!(inherited[1]["network"], "eip155:2366");
+    assert_eq!(inherited[1]["amount"], "2000");
+
+    let report = svc.http.post(svc.url("/v1/report")).send().await.unwrap();
+    assert_eq!(report.status(), 402);
+    let challenge = header_json(&report, "payment-required");
+    let accepts = challenge["accepts"].as_array().unwrap();
+    assert_eq!(accepts.len(), 2);
+    assert_eq!(accepts[0]["network"], "eip155:2368");
+    assert_eq!(accepts[0]["amount"], "50000000000000000");
+    assert_eq!(accepts[1]["network"], "eip155:2366");
+    assert_eq!(accepts[1]["amount"], "60000");
+
+    let cheaper = serde_json::from_value(inherited[1].clone()).unwrap();
+    let private = svc.get("/v1/private").await;
+    let private_challenge = header_json(&private, "payment-required");
+    let private_options = private_challenge["accepts"].as_array().unwrap();
+    assert_eq!(private_options.len(), 1);
+    assert_eq!(private_options[0]["network"], "eip155:2368");
+    assert_eq!(private_options[0]["amount"], "70000000000000000");
+
+    for (method, path) in [
+        (reqwest::Method::POST, "/v1/report"),
+        (reqwest::Method::GET, "/v1/private"),
+    ] {
+        let rejected = svc
+            .http
+            .request(method, svc.url(path))
+            .header("PAYMENT-SIGNATURE", payment_header(&cheaper))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), 402);
+    }
+    assert!(mocks.timeline().is_empty());
+
+    let alternative = serde_json::from_value(accepts[1].clone()).unwrap();
+    let paid = svc
+        .http
+        .post(svc.url("/v1/report"))
+        .header("PAYMENT-SIGNATURE", payment_header(&alternative))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(paid.status(), 200);
+    assert_eq!(mocks.timeline(), vec!["verify", "upstream", "settle"]);
+    for recorded in [
+        &mocks.facilitator.verify_requests,
+        &mocks.facilitator.settle_requests,
+    ] {
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(recorded[0]["paymentRequirements"], accepts[1]);
+    }
+}
+
+#[tokio::test]
 async fn route_prices_reject_upstream_redirects_without_settling() {
     let mocks = Mocks::start().await;
     let mut redirect = UpstreamReply::json(307);
@@ -1136,8 +1253,26 @@ async fn route_prices_require_encoded_paths() {
 #[test]
 fn route_prices_reject_invalid_configuration_at_startup() {
     let rule = json!({"method": "GET", "path": "/v1/forecast", "price": "0.001"});
+    let with_extras = |extras| {
+        let mut rule = rule.clone();
+        rule["extra_payment_options"] = extras;
+        json!([rule]).to_string()
+    };
     for (rules, expected_error) in [
         ("{".into(), "invalid ROUTE_PRICES_USD"),
+        (with_extras(json!(null)), "expected a sequence"),
+        (
+            with_extras(json!([{"network": "", "price": "0.002"}])),
+            "extra_payment_options entry 1 needs a network",
+        ),
+        (
+            with_extras(json!([{"network": "unknown", "price": "0.002"}])),
+            "extra_payment_options entry 1: unknown KITE_NETWORK",
+        ),
+        (
+            with_extras(json!([{"network": "mainnet", "price": "0.0000001"}])),
+            "extra_payment_options entry 1 has an invalid USD price",
+        ),
         (
             json!([&rule, &rule]).to_string(),
             "duplicates a method and path",
@@ -2331,7 +2466,9 @@ fn _unused(_: Reply) {}
 // ---------------------------------------------------------------------------
 
 /// A facilitator whose `/supported` endpoint counts how often it is hit.
-async fn counting_facilitator() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+async fn counting_facilitator(
+    kinds: Value,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
     use std::sync::{atomic::Ordering, Arc};
 
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2340,11 +2477,10 @@ async fn counting_facilitator() -> (String, std::sync::Arc<std::sync::atomic::At
         "/supported",
         axum::routing::get(move || {
             let counter = Arc::clone(&counter);
+            let kinds = kinds.clone();
             async move {
                 counter.fetch_add(1, Ordering::SeqCst);
-                axum::Json(json!({"kinds": [
-                    {"x402Version": 2, "scheme": "exact", "network": "eip155:2368"}
-                ]}))
+                axum::Json(json!({"kinds": kinds}))
             }
         }),
     );
@@ -2447,7 +2583,10 @@ async fn background_probe_serves_readyz_from_cache_instead_of_probing_per_reques
     use std::sync::atomic::Ordering;
 
     let mocks = Mocks::start().await;
-    let (facilitator_url, hits) = counting_facilitator().await;
+    let (facilitator_url, hits) = counting_facilitator(json!([
+        {"x402Version": 2, "scheme": "exact", "network": "eip155:2368"}
+    ]))
+    .await;
     let env = env_with(
         Service::base_env(&mocks, free_port()),
         "FACILITATOR_URL",
@@ -2477,6 +2616,46 @@ async fn background_probe_serves_readyz_from_cache_instead_of_probing_per_reques
         before,
         "/readyz must not contact the facilitator when the background probe is on"
     );
+}
+
+#[tokio::test]
+async fn background_probe_checks_route_specific_networks() {
+    use std::sync::atomic::Ordering;
+
+    let mocks = Mocks::start().await;
+    let (facilitator_url, hits) = counting_facilitator(json!([
+        {"x402Version": 2, "scheme": "exact", "network": "eip155:2368"}
+    ]))
+    .await;
+    let env = env_with(
+        Service::base_env(&mocks, free_port()),
+        "FACILITATOR_URL",
+        &facilitator_url,
+    );
+    let env = env_with(env, "FACILITATOR_HEALTH_INTERVAL_SECS", "86400");
+    let env = env_with(
+        env,
+        "ROUTE_PRICES_USD",
+        r#"[{"method":"GET","path":"/v1/report","price":"0.05","extra_payment_options":[{"network":"mainnet","price":"0.06"}]}]"#,
+    );
+    let svc = Service::start(env).await;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let resp = svc.get("/readyz").await;
+        let status = resp.status();
+        let body = resp.json::<Value>().await.unwrap();
+        if body.get("checked_at").is_some() {
+            assert_eq!(status, 503);
+            assert_eq!(body["networks"], json!(["eip155:2366", "eip155:2368"]));
+            assert!(body["error"].as_str().unwrap().contains("eip155:2366"));
+            break;
+        }
+        assert!(Instant::now() < deadline, "no cached result within 10s");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(svc.get("/readyz").await.status(), 503);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

@@ -49,6 +49,23 @@ not affect pricing. Unmatched metered requests use `PRICE_USD`. When the array i
 empty or unset, all metered requests use that default. Invalid or duplicate
 rules fail at startup.
 
+Use `extra_payment_options` in a rule to set the alternatives for that route.
+Omit the field to inherit `EXTRA_PAYMENT_OPTIONS`, use `[]` to offer only the
+primary option, or provide an array of `{"network":"mainnet","price":"0.06"}`
+objects to replace the defaults. The primary option stays first. Each extra uses
+`mainnet` or `testnet` and a positive USD amount valid for that network's token.
+An invalid local list prevents the service from starting. Unmatched routes use
+`PRICE_USD` and `EXTRA_PAYMENT_OPTIONS`.
+
+```dotenv
+EXTRA_PAYMENT_OPTIONS=mainnet:0.002
+ROUTE_PRICES_USD='[{"method":"GET","path":"/v1/forecast","price":"0.001"},{"method":"POST","path":"/v1/report","price":"0.05","extra_payment_options":[{"network":"mainnet","price":"0.06"}]}]'
+```
+
+With `KITE_NETWORK=testnet`, this example offers the forecast for `$0.001` on
+testnet or `$0.002` on mainnet. The report costs `$0.05` on testnet or `$0.06`
+on mainnet.
+
 Configure the same price for each public path or method your upstream treats as
 an alias of the same operation. With at least one pricing rule, the proxy rejects
 upstream redirects it would otherwise follow with HTTP `502` and skips settlement.
@@ -178,7 +195,7 @@ The service exposes endpoints outside `/v1/*` that are unmetered (free) and neve
 | `KITE_NETWORK` | `mainnet` | `mainnet` or `testnet`. |
 | `PRICE_USD` | `0.001` | Default price per call in USD. |
 | `ROUTE_PRICES_USD` | Empty | Optional JSON array of [route price overrides](#pricing-by-route). |
-| `EXTRA_PAYMENT_OPTIONS` | *(unset)* | Comma-separated `<network>:<price>` options advertised after each route's primary pair, e.g. `testnet:0.002,mainnet:$0.05`. Clients may pay with any advertised option. |
+| `EXTRA_PAYMENT_OPTIONS` | *(unset)* | Comma-separated default alternatives, e.g. `testnet:0.002,mainnet:$0.05`. A route rule can replace or disable them. |
 | `PORT` | `8402` | Port for the reverse proxy service. |
 | `FACILITATOR_URL` | `https://facilitator.pieverse.io/v2` | Kite facilitator URL (retaining `/v2`). |
 | `UPSTREAM_TIMEOUT_MS` | `10000` | Upstream request timeout in milliseconds (100..=300000). |
@@ -255,9 +272,10 @@ completion; it cannot guarantee that a disconnected buyer receives every byte.
 The service exposes lightweight Kubernetes-compatible health endpoints outside the metered `/v1/*` namespace:
 
 - **`GET /healthz`** (Liveness probe): Returns `200 OK` (`"ok"`) immediately without contacting backends. Free and unmetered.
-- **`GET /readyz`** (Readiness probe): Checks that the configured facilitator advertises x402 v2 `exact` support for this service's network (it calls the facilitator's `/supported` endpoint). It returns `200` when ready and `503` otherwise. By default every request triggers a live check; set `FACILITATOR_HEALTH_INTERVAL_SECS` (1 to 86400) to probe in the background instead, so `/readyz` answers from the latest result (and reports its `checked_at` Unix time) without adding load on the facilitator. Until the first background probe finishes, it returns `503` with `{"status":"not_ready","facilitator":"pending"}` and no `checked_at`; readiness requests never launch additional probes in background mode. `/healthz` remains available during this wait.
-  - Returns `200 OK` with JSON `{"status":"ready","facilitator":"ok","network":"…"}` only when `/supported` returns valid JSON advertising x402 v2, `exact`, and the configured network. A reachable 404, malformed body, or incompatible capability returns 503. This does not prove that a funded payment will settle.
-  - Returns `503 Service Unavailable` with JSON `{"status":"unavailable","facilitator":"error","error":"..."}` if the facilitator cannot be reached. Useful for load balancers and orchestrators to avoid routing traffic before the settlement gateway is operational.
+- **`GET /readyz`** checks x402 v2 `exact` support for every network advertised by the service. Each probe uses a single facilitator `/supported` request and checks the primary network plus all global and route-specific alternatives. The `networks` field lists the configured networks without duplicates. On success, `network` still identifies the primary network.
+  - Returns `200` when all configured networks are supported, or `503` when the response is unsuccessful, malformed, or missing support for a configured network. This checks advertised capabilities only. Confirm funded settlements separately.
+  - By default, each readiness request runs a live check. Set `FACILITATOR_HEALTH_INTERVAL_SECS` (1 to 86400) to probe in the background and return the cached result with its Unix `checked_at` timestamp. Until the first probe completes, `/readyz` returns `503` with `status` set to `not_ready` and `facilitator` set to `pending`. `/healthz` remains available during this wait.
+
 ## Browser CORS support
 
 The wrapper service supports Cross-Origin Resource Sharing (CORS) for web frontends, browser-based agents, and sandbox environments:
