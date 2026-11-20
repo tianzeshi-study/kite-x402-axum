@@ -21,7 +21,8 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use common::{
-    payment_header, settle_failed, verify_invalid, Mocks, Reply, UpstreamReply, PAYER, TX_HASH,
+    payment_header, settle_failed, settle_ok, verify_invalid, Mocks, Reply, UpstreamReply, PAYER,
+    TX_HASH,
 };
 use kite_x402_axum::types::PaymentRequirements;
 use serde_json::{json, Value};
@@ -796,6 +797,55 @@ async fn a_failed_settlement_withholds_the_upstream_data() {
         "nonce_already_used"
     );
     assert_eq!(resp.json::<Value>().await.unwrap(), json!({}));
+}
+
+#[tokio::test]
+async fn an_invalid_successful_settlement_receipt_withholds_the_upstream_data() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push(("EXTRA_PAYMENT_OPTIONS".into(), "mainnet:$0.05".into()));
+    let svc = Service::start(env).await;
+    let challenge = svc.get("/v1/forecast").await;
+    let challenge = header_json(&challenge, "payment-required");
+    let chosen: PaymentRequirements =
+        serde_json::from_value(challenge["accepts"][1].clone()).unwrap();
+    let payment = payment_header(&chosen);
+
+    let invalid_receipts = [
+        ("", chosen.network.as_str()),
+        ("  \t", chosen.network.as_str()),
+        (TX_HASH, "eip155:2368"),
+    ];
+    for (transaction, network) in invalid_receipts {
+        mocks.facilitator.set_settle(Reply::Json(json!({
+            "success": true,
+            "transaction": transaction,
+            "network": network,
+        })));
+        let resp = svc
+            .http
+            .get(svc.url("/v1/forecast"))
+            .header("PAYMENT-SIGNATURE", &payment)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 402, "receipt {transaction:?} on {network}");
+        assert_eq!(resp.headers()["cache-control"], "no-store");
+        let receipt = header_json(&resp, "payment-response");
+        assert_eq!(receipt["success"], false);
+        assert_eq!(receipt["errorReason"], "invalid_settlement_receipt");
+        assert_eq!(receipt["transaction"], transaction);
+        assert_eq!(receipt["network"], network);
+        assert_eq!(resp.json::<Value>().await.unwrap(), json!({}));
+    }
+
+    let metrics: kite_x402_axum::PaymentMetricsSnapshot =
+        svc.get("/metrics/x402").await.json().await.unwrap();
+    assert_eq!(metrics.settlements_success, 0);
+    assert_eq!(metrics.settlements_failed, invalid_receipts.len() as u64);
+    assert_eq!(mocks.upstream.count(), invalid_receipts.len());
+    assert_eq!(mocks.facilitator.settle_count(), invalid_receipts.len());
 }
 
 #[tokio::test]
@@ -2730,6 +2780,7 @@ async fn extra_payment_options_are_advertised_after_the_primary() {
 
     // Paying the extra option settles against that option's requirements.
     let chosen: PaymentRequirements = serde_json::from_value(accepts[1].clone()).unwrap();
+    mocks.facilitator.set_settle(settle_ok(&chosen.network));
     let resp = svc
         .http
         .get(svc.url("/v1/forecast"))
@@ -2738,6 +2789,10 @@ async fn extra_payment_options_are_advertised_after_the_primary() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    assert_eq!(
+        header_json(&resp, "payment-response")["network"],
+        chosen.network
+    );
     assert_eq!(
         mocks.timeline(),
         vec!["verify", "upstream", "settle"],

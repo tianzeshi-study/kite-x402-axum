@@ -166,6 +166,12 @@ nonzero legacy settings fail startup. `FACILITATOR_VERIFY_RETRIES` optionally
 enables 0–5 bounded retries for transient verification failures (default 0).
 The library's `RetryConfig` now applies only to verification.
 
+The server returns paid content only when a successful settlement receipt
+matches the selected payment network and includes a nonblank transaction ID.
+A receipt that fails either check returns `402` with `success: false` and
+`errorReason: invalid_settlement_receipt` in `PAYMENT-RESPONSE`. The reported
+network and transaction are kept for reconciliation before signing again.
+
 The [Python test client](service/scripts/kite_x402_client.py) exits with `0`
 only after receiving a payment challenge and a successful HTTP response with a
 settlement receipt for the requested network and a nonempty transaction ID.
