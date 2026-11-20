@@ -437,13 +437,8 @@ async fn payment_gate_inner(
     let settle_start = std::time::Instant::now();
     let settle_outcome = cfg.facilitator.settle(&payload, requirements).await;
     let settle_duration = settle_start.elapsed();
-    let settle = match settle_outcome {
-        Ok(s) => {
-            if let Some(metrics) = &cfg.metrics {
-                metrics.record_settlement(s.success, settle_duration);
-            }
-            s
-        }
+    let mut settle = match settle_outcome {
+        Ok(settle) => settle,
         Err(e) => {
             if let Some(metrics) = &cfg.metrics {
                 metrics.record_settlement(false, settle_duration);
@@ -465,6 +460,26 @@ async fn payment_gate_inner(
             return settlement_failure_response(&failure);
         }
     };
+
+    if settle.success {
+        let receipt_error = if settle.network != requirements.network {
+            Some("Settlement receipt network does not match the selected payment option")
+        } else if settle.transaction.trim().is_empty() {
+            Some("Settlement receipt is missing a transaction ID")
+        } else {
+            None
+        };
+        if let Some(message) = receipt_error {
+            // Preserve the reported network and transaction for reconciliation.
+            settle.success = false;
+            settle.error_reason = Some("invalid_settlement_receipt".to_owned());
+            settle.error_message =
+                Some(format!("{message}. Reconcile the payment before retrying."));
+        }
+    }
+    if let Some(metrics) = &cfg.metrics {
+        metrics.record_settlement(settle.success, settle_duration);
+    }
 
     if !settle.success {
         tracing::error!(
@@ -553,10 +568,11 @@ async fn payment_gate_inner(
 ///    crate-level docs for why facilitator-unreachable is also a `402`).
 /// 4. Verified → the inner handler runs. If it answers `>= 400`, that
 ///    response is returned unchanged and **no settlement is attempted**.
-/// 5. If it answers `< 400`, `/settle` is called. On success, a
-///    `PAYMENT-RESPONSE` header is attached and `Cache-Control` gets
-///    `private` merged in. On failure, a `402` with `PAYMENT-RESPONSE`
-///    (`success: false`) is returned instead of the handler's response.
+/// 5. If it answers `< 400`, `/settle` is called. A successful receipt must
+///    identify the selected network and carry a nonblank transaction ID. It
+///    is attached as `PAYMENT-RESPONSE` and `Cache-Control` gets `private`
+///    merged in. On failure, a `402` with `PAYMENT-RESPONSE` (`success: false`)
+///    is returned instead of the handler's response.
 pub async fn x402_payment(
     State(cfg): State<Arc<PaymentConfig>>,
     req: Request,
