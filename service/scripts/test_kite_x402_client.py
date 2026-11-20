@@ -43,7 +43,12 @@ class ClientSettlementTests(unittest.TestCase):
             "maxTimeoutSeconds": 60,
             "extra": {"name": "pieUSD", "version": "1"},
         }
-        challenge = {"x402Version": 2, "accepts": [requirements]}
+        cls.resource = {
+            "url": URL,
+            "description": "Example paid endpoint",
+            "mimeType": "application/json",
+        }
+        challenge = {"x402Version": 2, "resource": cls.resource, "accepts": [requirements]}
         cls.challenge = response(402, **{"Payment-Required": encode_header(challenge)})
         cls.receipt = {"success": True, "network": NETWORK, "transaction": "0x" + "42" * 32}
 
@@ -71,6 +76,24 @@ class ClientSettlementTests(unittest.TestCase):
         status, _, send = self.run_client(response(200))
         self.assertEqual(status, 1)
         self.assertEqual(send.call_count, 1)
+
+    def test_payment_signature_carries_the_challenge_resource(self):
+        settled = response(200, **{"Payment-Response": encode_header(self.receipt)})
+        status, _, send = self.run_client(self.challenge, settled)
+        self.assertEqual(status, 0)
+        header = send.call_args.kwargs["headers"]["PAYMENT-SIGNATURE"]
+        self.assertEqual(json.loads(base64.b64decode(header))["resource"], self.resource)
+
+    def test_invalid_challenge_resource_stops_before_the_signed_request(self):
+        challenge = client.b64_decode_json(self.challenge.headers["Payment-Required"])
+        for resource in ("not an object", {}, {"url": " "}):
+            with self.subTest(resource=resource):
+                challenge["resource"] = resource
+                invalid = response(402, **{"Payment-Required": encode_header(challenge)})
+                status, errors, send = self.run_client(invalid)
+                self.assertEqual(status, 1)
+                self.assertIn("invalid `resource`", errors)
+                self.assertEqual(send.call_count, 1)
 
     def test_unconfirmed_settlement_is_not_successful(self):
         cases = {

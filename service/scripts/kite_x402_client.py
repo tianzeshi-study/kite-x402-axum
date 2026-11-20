@@ -17,7 +17,7 @@ What it does, step by step:
      your private key (EIP-712, matching the official @x402/evm SDK's wire
      format exactly — see the comment above `AUTHORIZATION_TYPES` below).
   4. Retry the same request with a `PAYMENT-SIGNATURE` header carrying the
-     base64-encoded payment payload.
+     base64-encoded payment payload and the challenge's resource metadata.
   5. Print the final response. Exit successfully only when the HTTP request
      succeeds and `PAYMENT-RESPONSE` confirms settlement on the requested network.
 
@@ -46,6 +46,7 @@ import os
 import secrets
 import sys
 import time
+from typing import Optional
 
 import requests
 from eth_account import Account
@@ -119,7 +120,9 @@ def sign_authorization(private_key: str, requirements: dict, authorization: dict
     return "0x" + signed.signature.hex()
 
 
-def build_payment_header(private_key: str, payer_address: str, requirements: dict) -> str:
+def build_payment_header(
+    private_key: str, payer_address: str, requirements: dict, *, resource: Optional[dict] = None
+) -> str:
     now = int(time.time())
     authorization = {
         "from": payer_address,
@@ -136,6 +139,8 @@ def build_payment_header(private_key: str, payer_address: str, requirements: dic
         "accepted": requirements,
         "payload": {"authorization": authorization, "signature": signature},
     }
+    if resource is not None:
+        payload["resource"] = resource
     return b64_encode_json(payload)
 
 
@@ -192,9 +197,19 @@ def main() -> int:
         print("error: 402 challenge has an empty `accepts` list", file=sys.stderr)
         return 1
     requirements = accepts[0]
+    resource = challenge.get("resource")
+    if resource is not None and (
+        not isinstance(resource, dict)
+        or not isinstance(resource.get("url"), str)
+        or not resource["url"].strip()
+    ):
+        print("error: 402 challenge has an invalid `resource`", file=sys.stderr)
+        return 1
 
     print("\n--- 2) signing EIP-3009 TransferWithAuthorization")
-    payment_header = build_payment_header(args.private_key, account.address, requirements)
+    payment_header = build_payment_header(
+        args.private_key, account.address, requirements, resource=resource
+    )
 
     print(f"\n--- 3) retrying {args.method} {args.url} with PAYMENT-SIGNATURE")
     try:
