@@ -378,6 +378,27 @@ go wrong:
 See [`TODO.md`](TODO.md) for other known follow-ups (an upstream
 SDK-disagreement decision that may need revisiting, a live testnet run, etc.).
 
+
+### Paying the service end to end, no Passport agent needed
+
+TODO item 2 tracks a run against a live Kite Passport agent, which needs a
+funded wallet. For everything short of on-chain settlement you can pay the
+real service binary locally with any x402 client. The
+[kx402](https://github.com/wilsonqc223/kite-x402-client) toolkit ships a
+one-command harness that starts a mock facilitator and upstream, launches
+this service exactly as a deployment would (pure env vars), and pays it
+with a real EIP-3009 signature:
+
+```bash
+git clone https://github.com/wilsonqc223/kite-x402-client
+cd kite-x402-client
+go run ./examples/e2e-axum-service -bin ../kite-x402-axum/target/release/kite-x402-service
+```
+
+The signature format is the same one the live facilitator at
+`facilitator.pieverse.io/v2` verifies (see that repo's
+`examples/facilitator-livecheck`), so a green run here means only the
+on-chain funds transfer is left untested.
 ## Continuous integration
 
 `.github/workflows/ci.yml` runs on every push to `main` and every pull
