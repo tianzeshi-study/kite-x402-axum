@@ -25,7 +25,7 @@ pub enum FirewallRule {
     SubnetV4 {
         /// Network address of the subnet.
         network: Ipv4Addr,
-        /// Prefix length (0..=32).
+        /// Prefix length; values above 32 are clamped to 32 when matching.
         prefix: u8,
     },
 }
@@ -49,7 +49,8 @@ impl FirewallRule {
                 if *prefix == 0 {
                     return true;
                 }
-                let mask = !((1u32 << (32 - *prefix)) - 1);
+                // The public variant can bypass subnet_v4; keep its clamping policy.
+                let mask = u32::MAX << (32 - (*prefix).min(32));
                 let net_u32 = u32::from(*network) & mask;
                 let client_u32 = u32::from(*client_v4) & mask;
                 net_u32 == client_u32
