@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 
 use axum::{
     extract::{OriginalUri, Request, State},
@@ -100,6 +103,25 @@ impl RoutePrices {
             overrides,
             extras,
         })
+    }
+
+    pub(super) fn advertised_networks(&self) -> Vec<&'static str> {
+        // Unmatched routes always retain the default options.
+        let route_extras = self
+            .overrides
+            .values()
+            .flat_map(HashMap::values)
+            .filter_map(|route| route.extras.as_deref())
+            .flatten();
+        let networks: BTreeSet<_> = std::iter::once(self.default.chain.network)
+            .chain(
+                self.extras
+                    .iter()
+                    .chain(route_extras)
+                    .map(|option| option.chain.network),
+            )
+            .collect();
+        networks.into_iter().collect()
     }
 
     pub(super) fn has_overrides(&self) -> bool {

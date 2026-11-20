@@ -204,16 +204,18 @@ impl FacilitatorClient {
 
     /// Checks that the facilitator advertises a valid x402 v2 exact capability.
     pub async fn probe(&self) -> Result<(), FacilitatorError> {
-        self.probe_capability(None).await
+        self.probe_networks(&[]).await
     }
 
     /// Checks x402 v2 exact support for the configured CAIP-2 network.
     /// This is a readiness check, not proof of successful settlement.
     pub async fn probe_network(&self, network: &str) -> Result<(), FacilitatorError> {
-        self.probe_capability(Some(network)).await
+        self.probe_networks(&[network]).await
     }
 
-    async fn probe_capability(&self, network: Option<&str>) -> Result<(), FacilitatorError> {
+    /// Checks x402 v2 exact support for every configured CAIP-2 network in one request.
+    /// An empty slice checks that at least one such capability exists, as [`Self::probe`] does.
+    pub async fn probe_networks(&self, networks: &[&str]) -> Result<(), FacilitatorError> {
         #[derive(Deserialize)]
         struct Supported {
             kinds: Vec<Kind>,
@@ -243,18 +245,32 @@ impl FacilitatorClient {
                 body: format!("could not parse facilitator supported response: {error}"),
             }
         })?;
-        if supported.kinds.iter().any(|kind| {
-            kind.version == 2
-                && kind.scheme == "exact"
-                && !kind.network.is_empty()
-                && network.is_none_or(|expected| expected == kind.network)
-        }) {
+        let exact_networks: std::collections::HashSet<_> = supported
+            .kinds
+            .iter()
+            .filter(|kind| kind.version == 2 && kind.scheme == "exact" && !kind.network.is_empty())
+            .map(|kind| kind.network.as_str())
+            .collect();
+        let missing: Vec<_> = networks
+            .iter()
+            .copied()
+            .filter(|network| !exact_networks.contains(network))
+            .collect();
+        if !exact_networks.is_empty() && missing.is_empty() {
             return Ok(());
         }
+        let body = if networks.len() > 1 {
+            format!(
+                "x402 v2 exact capability is not offered for: {}",
+                missing.join(", ")
+            )
+        } else {
+            "configured x402 v2 exact capability is not offered".into()
+        };
         Err(FacilitatorError::BadResponse {
             op: "probe",
             status: status.as_u16(),
-            body: "configured x402 v2 exact capability is not offered".into(),
+            body,
         })
     }
 

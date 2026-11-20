@@ -273,6 +273,8 @@ async fn main() {
         auth_value: upstream_auth_value,
     });
 
+    let advertised_networks = route_prices.advertised_networks();
+
     // Everything under /v1 is metered: verify before the handler runs,
     // proxy to the upstream, settle only on a < 400 response.
     let paid = Router::new()
@@ -291,33 +293,27 @@ async fn main() {
             concurrency_limiter,
         ));
 
-    let readiness = health_interval.map(|interval| {
-        let state = ReadinessState::new();
-        let cfg = Arc::clone(&payment_cfg);
+    let readyz_state = Arc::new(ReadyzState {
+        payment_cfg,
+        networks: advertised_networks,
+        cached: health_interval.map(|_| ReadinessState::new()),
+    });
+    if let (Some(interval), Some(cached)) = (health_interval, &readyz_state.cached) {
+        let readyz = Arc::clone(&readyz_state);
         tokio::spawn(health::run_probe_loop(
-            state.clone(),
+            cached.clone(),
             interval,
             shutdown_rx.clone(),
             move || {
-                let cfg = Arc::clone(&cfg);
-                async move {
-                    cfg.facilitator
-                        .probe_network(cfg.chain.network)
-                        .await
-                        .map_err(|e| e.to_string())
-                }
+                let readyz = Arc::clone(&readyz);
+                async move { readyz.probe().await.map_err(|e| e.to_string()) }
             },
         ));
         tracing::info!(
             interval_secs = interval.as_secs(),
             "Background facilitator health probe enabled"
         );
-        state
-    });
-    let readyz_state = Arc::new(ReadyzState {
-        payment_cfg: Arc::clone(&payment_cfg),
-        cached: readiness,
-    });
+    }
 
     let service_metrics = Arc::new(ServiceMetrics::new());
 
@@ -713,7 +709,17 @@ async fn healthz() -> Json<serde_json::Value> {
 /// cached result of the background probe when one is enabled.
 struct ReadyzState {
     payment_cfg: Arc<PaymentConfig>,
+    networks: Vec<&'static str>,
     cached: Option<ReadinessState>,
+}
+
+impl ReadyzState {
+    async fn probe(&self) -> Result<(), kite_x402_axum::facilitator::FacilitatorError> {
+        self.payment_cfg
+            .facilitator
+            .probe_networks(&self.networks)
+            .await
+    }
 }
 
 async fn readyz(
@@ -721,6 +727,7 @@ async fn readyz(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     tracing::debug!("Handling /readyz request");
     let network = state.payment_cfg.chain.network;
+    let networks = &state.networks;
 
     // Background mode never probes from a request, including while the first
     // result is pending, so startup polling cannot amplify facilitator load.
@@ -731,6 +738,7 @@ async fn readyz(
                 Json(json!({
                     "status": "not_ready",
                     "facilitator": "pending",
+                    "networks": networks,
                 })),
             ));
         };
@@ -739,6 +747,7 @@ async fn readyz(
                 "status": "ready",
                 "facilitator": "ok",
                 "network": network,
+                "networks": networks,
                 "checked_at": latest.checked_at,
             })))
         } else {
@@ -747,6 +756,7 @@ async fn readyz(
                 Json(json!({
                     "status": "not_ready",
                     "facilitator": "unreachable",
+                    "networks": networks,
                     "error": latest.error,
                     "checked_at": latest.checked_at,
                 })),
@@ -754,19 +764,21 @@ async fn readyz(
         };
     }
 
-    match state.payment_cfg.facilitator.probe_network(network).await {
+    match state.probe().await {
         Ok(()) => Ok(Json(json!({
             "status": "ready",
             "facilitator": "ok",
             "network": network,
+                "networks": networks,
         }))),
         Err(err) => {
-            tracing::warn!(error = %err, "Readiness probe failed: facilitator unreachable");
+            tracing::warn!(error = %err, "Facilitator readiness probe failed");
             Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
                     "status": "not_ready",
                     "facilitator": "unreachable",
+                    "networks": networks,
                     "error": err.to_string(),
                 })),
             ))

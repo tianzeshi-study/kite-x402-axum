@@ -561,6 +561,40 @@ async fn readyz_probes_facilitator_and_returns_status() {
     assert_eq!(body["status"], "ready");
     assert_eq!(body["facilitator"], "ok");
     assert_eq!(body["network"], "eip155:2368");
+    assert_eq!(body["networks"], json!(["eip155:2368"]));
+}
+
+#[tokio::test]
+async fn readyz_checks_global_extra_networks_in_one_probe() {
+    use std::sync::atomic::Ordering;
+
+    let mocks = Mocks::start().await;
+    for version in [1, 2] {
+        let (facilitator_url, hits) = counting_facilitator(json!([
+            {"x402Version": 2, "scheme": "exact", "network": "eip155:2368"},
+            {"x402Version": version, "scheme": "exact", "network": "eip155:2366"}
+        ]))
+        .await;
+        let env = env_with(
+            Service::base_env(&mocks, free_port()),
+            "FACILITATOR_URL",
+            &facilitator_url,
+        );
+        let env = env_with(env, "EXTRA_PAYMENT_OPTIONS", "mainnet:0.002,mainnet:0.003");
+        let svc = Service::start(env).await;
+
+        let resp = svc.get("/readyz").await;
+        assert_eq!(resp.status(), if version == 2 { 200 } else { 503 });
+        let body = resp.json::<Value>().await.unwrap();
+        assert_eq!(body["networks"], json!(["eip155:2366", "eip155:2368"]));
+        if version == 2 {
+            assert_eq!(body["network"], "eip155:2368");
+        } else {
+            assert!(body["error"].as_str().unwrap().contains("eip155:2366"));
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(svc.get("/healthz").await.status(), 200);
+    }
 }
 
 #[tokio::test]
@@ -2432,7 +2466,9 @@ fn _unused(_: Reply) {}
 // ---------------------------------------------------------------------------
 
 /// A facilitator whose `/supported` endpoint counts how often it is hit.
-async fn counting_facilitator() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+async fn counting_facilitator(
+    kinds: Value,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
     use std::sync::{atomic::Ordering, Arc};
 
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2441,11 +2477,10 @@ async fn counting_facilitator() -> (String, std::sync::Arc<std::sync::atomic::At
         "/supported",
         axum::routing::get(move || {
             let counter = Arc::clone(&counter);
+            let kinds = kinds.clone();
             async move {
                 counter.fetch_add(1, Ordering::SeqCst);
-                axum::Json(json!({"kinds": [
-                    {"x402Version": 2, "scheme": "exact", "network": "eip155:2368"}
-                ]}))
+                axum::Json(json!({"kinds": kinds}))
             }
         }),
     );
@@ -2548,7 +2583,10 @@ async fn background_probe_serves_readyz_from_cache_instead_of_probing_per_reques
     use std::sync::atomic::Ordering;
 
     let mocks = Mocks::start().await;
-    let (facilitator_url, hits) = counting_facilitator().await;
+    let (facilitator_url, hits) = counting_facilitator(json!([
+        {"x402Version": 2, "scheme": "exact", "network": "eip155:2368"}
+    ]))
+    .await;
     let env = env_with(
         Service::base_env(&mocks, free_port()),
         "FACILITATOR_URL",
@@ -2578,6 +2616,46 @@ async fn background_probe_serves_readyz_from_cache_instead_of_probing_per_reques
         before,
         "/readyz must not contact the facilitator when the background probe is on"
     );
+}
+
+#[tokio::test]
+async fn background_probe_checks_route_specific_networks() {
+    use std::sync::atomic::Ordering;
+
+    let mocks = Mocks::start().await;
+    let (facilitator_url, hits) = counting_facilitator(json!([
+        {"x402Version": 2, "scheme": "exact", "network": "eip155:2368"}
+    ]))
+    .await;
+    let env = env_with(
+        Service::base_env(&mocks, free_port()),
+        "FACILITATOR_URL",
+        &facilitator_url,
+    );
+    let env = env_with(env, "FACILITATOR_HEALTH_INTERVAL_SECS", "86400");
+    let env = env_with(
+        env,
+        "ROUTE_PRICES_USD",
+        r#"[{"method":"GET","path":"/v1/report","price":"0.05","extra_payment_options":[{"network":"mainnet","price":"0.06"}]}]"#,
+    );
+    let svc = Service::start(env).await;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let resp = svc.get("/readyz").await;
+        let status = resp.status();
+        let body = resp.json::<Value>().await.unwrap();
+        if body.get("checked_at").is_some() {
+            assert_eq!(status, 503);
+            assert_eq!(body["networks"], json!(["eip155:2366", "eip155:2368"]));
+            assert!(body["error"].as_str().unwrap().contains("eip155:2366"));
+            break;
+        }
+        assert!(Instant::now() < deadline, "no cached result within 10s");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(svc.get("/readyz").await.status(), 503);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
