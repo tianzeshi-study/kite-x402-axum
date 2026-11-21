@@ -30,19 +30,27 @@ pub struct CorsSecurityGuard {
 }
 
 impl CorsSecurityGuard {
-    /// Creates a guard that allows exactly the given origins.
+    /// Creates a guard that allows exactly the given origins, with the
+    /// remaining settings at their defaults (`allow_credentials = true`).
     #[must_use]
     pub fn new(allowed_origins: Vec<impl Into<String>>) -> Self {
         let mut origins = HashSet::new();
         for o in allowed_origins {
             origins.insert(o.into());
         }
-        Self {
-            config: CorsGuardConfig {
-                allowed_origins: origins,
-                ..Default::default()
-            },
-        }
+        Self::with_config(CorsGuardConfig {
+            allowed_origins: origins,
+            ..Default::default()
+        })
+    }
+
+    /// Creates a guard from an explicit configuration.
+    ///
+    /// Use this when credentials must be disabled or the preflight max-age
+    /// needs to change — [`Self::new`] can only produce the default values.
+    #[must_use]
+    pub fn with_config(config: CorsGuardConfig) -> Self {
+        Self { config }
     }
 
     /// Returns `true` if `origin` is on the allow-list.
@@ -61,7 +69,7 @@ impl CorsSecurityGuard {
             return None;
         }
 
-        Some(vec![
+        let mut headers = vec![
             ("Access-Control-Allow-Origin", origin.to_owned()),
             (
                 "Access-Control-Allow-Methods",
@@ -79,6 +87,14 @@ impl CorsSecurityGuard {
                 "Access-Control-Max-Age",
                 self.config.max_age_secs.to_string(),
             ),
-        ])
+        ];
+        // Without this header the browser drops any response to a request
+        // carrying `Authorization` — the default way an x402 client pays.
+        // `allow_credentials` was previously never read, so the default
+        // `true` was a promise the emitted headers did not keep.
+        if self.config.allow_credentials {
+            headers.push(("Access-Control-Allow-Credentials", "true".to_owned()));
+        }
+        Some(headers)
     }
 }
