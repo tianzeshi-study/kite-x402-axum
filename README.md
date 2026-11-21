@@ -318,7 +318,7 @@ above; no duplicate response-header layer is installed.
 cargo test --workspace
 ```
 
-235 tests pass, organized in three layers:
+409 tests pass at the time of writing (the suite grows with every feature PR), organized in three layers:
 
 - **Unit tests** (120), inside `src/` next to the code they cover, `#[cfg(test)]`:
   - `kite-x402-axum/src/kite.rs` — network constants and the `$0.001`-style
@@ -401,7 +401,6 @@ go wrong:
 
 See [`TODO.md`](TODO.md) for other known follow-ups (an upstream
 SDK-disagreement decision that may need revisiting, a live testnet run, etc.).
-
 
 ### Paying the service end to end, no Passport agent needed
 
