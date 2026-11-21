@@ -354,3 +354,34 @@ async fn redirect_loops_end_in_a_bad_gateway() {
 
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 }
+
+/// Over-encoded or alternative-separator spellings of `..` are opaque path
+/// bytes, not dot segments. The proxy must neither decode them into a
+/// traversal nor mangle them: they reach the upstream byte-for-byte, still
+/// under the configured base path. (What the upstream does with an encoded
+/// separator is the upstream's own concern.)
+#[tokio::test]
+async fn encoded_lookalikes_of_dot_segments_are_forwarded_verbatim_under_the_base_path() {
+    for incoming in [
+        "/v1/%252e%252e/secret",
+        "/v1/..%2fsecret",
+        "/v1/%2e%2e%2fsecret",
+        "/v1/..%5csecret",
+        "/v1/%2e%2e%5csecret",
+        "/v1/a%2f..%2f..%2fsecret",
+        "/v1/%c0%ae%c0%ae/secret",
+    ] {
+        let mocks = Mocks::start().await;
+        let app = build_proxy_only(upstream_cfg(&format!("{}/public", mocks.upstream_url)));
+
+        let resp = send(&app, get_req(incoming)).await;
+
+        assert_eq!(resp.status(), StatusCode::OK, "{incoming}");
+        assert_eq!(mocks.upstream.count(), 1, "{incoming}");
+        assert_eq!(
+            mocks.upstream.last().path_and_query,
+            incoming.replacen("/v1", "/public", 1),
+            "{incoming} must be forwarded unchanged under /public"
+        );
+    }
+}
