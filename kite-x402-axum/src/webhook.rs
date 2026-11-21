@@ -141,6 +141,14 @@ impl WebhookDispatcher {
         tx_hash: Option<String>,
         request_path: Option<String>,
     ) -> Vec<u64> {
+        // A zero-capacity queue must schedule nothing. Without this guard the
+        // check below is `0 >= 0` on an empty queue, `pop_front()` is a no-op,
+        // and the `push_back` still leaves one pending delivery: the caller
+        // gets a delivery id that silently ignores the configured bound.
+        if self.config.max_queue_size == 0 {
+            return Vec::new();
+        }
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -178,7 +186,21 @@ impl WebhookDispatcher {
             };
 
             if state.queue.len() >= self.config.max_queue_size {
-                state.queue.pop_front();
+                if let Some(evicted) = state.queue.pop_front() {
+                    // The caller was handed this delivery_id by an earlier
+                    // enqueue_event call and will never receive a result for
+                    // it: dropping it without a trace loses the notification
+                    // entirely. Park it in history as abandoned so the loss is
+                    // observable. Reuse `Abandoned` rather than adding an enum
+                    // variant, which would break downstream exhaustive matches.
+                    let mut evicted = evicted;
+                    evicted.status = DeliveryStatus::Abandoned;
+                    evicted.last_error = Some("evicted: webhook queue full".into());
+                    if state.history.len() >= self.config.max_queue_size {
+                        state.history.pop_front();
+                    }
+                    state.history.push_back(evicted);
+                }
             }
             state.queue.push_back(record);
             delivery_ids.push(delivery_id);
@@ -249,6 +271,16 @@ impl WebhookDispatcher {
     pub fn history_count(&self) -> usize {
         let state = self.state.read().expect("lock poisoned");
         state.history.len()
+    }
+
+    /// Completed and abandoned deliveries, oldest first.
+    ///
+    /// Includes deliveries abandoned because a full queue evicted them, so a
+    /// caller holding an old `delivery_id` can find out what happened to it.
+    #[must_use]
+    pub fn history(&self) -> Vec<WebhookDeliveryRecord> {
+        let state = self.state.read().expect("lock poisoned");
+        state.history.iter().cloned().collect()
     }
 }
 
@@ -325,5 +357,85 @@ mod tests {
         assert_eq!(d2.unwrap().status, DeliveryStatus::Abandoned);
         assert_eq!(dispatcher.pending_count(), 0);
         assert_eq!(dispatcher.history_count(), 1);
+    }
+
+    #[test]
+    fn zero_queue_capacity_never_schedules_a_delivery() {
+        let dispatcher = WebhookDispatcher::new(WebhookConfig {
+            target_urls: vec!["https://example.com/webhook".into()],
+            max_queue_size: 0,
+            ..Default::default()
+        });
+
+        let ids = dispatcher.enqueue_event(
+            WebhookEventType::PaymentSettled,
+            None,
+            None,
+            Some("1000".into()),
+            None,
+            None,
+        );
+
+        assert!(
+            ids.is_empty(),
+            "a queue configured with zero capacity must not hand out delivery ids"
+        );
+        assert_eq!(
+            dispatcher.pending_count(),
+            0,
+            "max_queue_size = 0 was silently exceeded"
+        );
+    }
+
+    #[test]
+    fn evicting_a_pending_delivery_leaves_an_audit_record() {
+        let dispatcher = WebhookDispatcher::new(WebhookConfig {
+            target_urls: vec!["https://example.com/webhook".into()],
+            max_queue_size: 1,
+            max_retries: 3,
+            ..Default::default()
+        });
+
+        let first = dispatcher.enqueue_event(
+            WebhookEventType::PaymentPrompted,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(dispatcher.pending_count(), 1);
+
+        // The first delivery id was already returned to the caller. Evicting it
+        // must not erase every trace of it.
+        let _second = dispatcher.enqueue_event(
+            WebhookEventType::PaymentSettled,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(dispatcher.pending_count(), 1);
+        assert_eq!(
+            dispatcher.history_count(),
+            1,
+            "the evicted delivery disappeared without any audit record"
+        );
+
+        let history = dispatcher.history();
+        let evicted = history
+            .iter()
+            .find(|record| record.delivery_id == first[0])
+            .expect("the evicted delivery must be inspectable in history");
+        assert_eq!(evicted.status, DeliveryStatus::Abandoned);
+        assert_eq!(evicted.attempts, 0);
+        assert!(
+            evicted
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("queue")),
+            "the reason for abandoning it must be recorded"
+        );
     }
 }
