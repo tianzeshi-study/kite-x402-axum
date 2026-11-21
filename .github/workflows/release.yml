@@ -1,0 +1,60 @@
+name: Release
+
+# Push a tag like v0.1.2 to cut a release. The tag must match the
+# kite-x402-axum crate version, so a release can never be published from a
+# forgotten version bump.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify tag and run the full test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tag must match the crate version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(cargo metadata --no-deps --format-version 1 --locked \
+            | python3 -c 'import json,sys; m=json.load(sys.stdin); print(next(p["version"] for p in m["packages"] if p["name"]=="kite-x402-axum"))')
+          echo "tag=$tag crate=$crate"
+          test "$tag" = "$crate" || { echo "tag v$tag does not match kite-x402-axum $crate" >&2; exit 1; }
+      - run: cargo test --workspace --locked
+      - run: cargo package -p kite-x402-axum --locked
+
+  github-release:
+    name: create GitHub release
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create release with the CHANGELOG section as notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # Notes: the matching "## [x.y.z]" section of CHANGELOG.md, if present.
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" {on=1; next}
+            on && /^## \[/ {exit}
+            on {print}
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "No CHANGELOG entry for $version; using auto-generated notes."
+            gh release create "$GITHUB_REF_NAME" --generate-notes --title "$GITHUB_REF_NAME"
+          else
+            prerelease=""
+            case "$version" in *-*) prerelease="--prerelease";; esac
+            gh release create "$GITHUB_REF_NAME" --notes-file notes.md --title "$GITHUB_REF_NAME" $prerelease
+          fi
