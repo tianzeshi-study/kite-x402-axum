@@ -52,12 +52,16 @@ fn transaction_key(record: &SettlementRecord) -> Option<(String, String)> {
     (!tx.is_empty()).then(|| (record.network.clone(), tx))
 }
 
+fn payer_key(payer: &str) -> String {
+    payer.to_lowercase()
+}
+
 impl Inner {
     fn remove_indexes(&mut self, record: &SettlementRecord) {
         if let Some(key) = transaction_key(record) {
             self.by_tx.remove(&key);
         }
-        let payer = record.payer.to_ascii_lowercase();
+        let payer = payer_key(&record.payer);
         if let Some(records) = self.by_payer.get_mut(&payer) {
             if let Some(index) = records.iter().position(|item| item == record) {
                 records.remove(index);
@@ -116,13 +120,13 @@ impl SettlementLedger {
             }
         }
 
-        let payer_key = record.payer.to_lowercase();
+        let payer = payer_key(&record.payer);
         if let Some(key) = transaction_key(&record) {
             inner.by_tx.insert(key, record.clone());
         }
         inner
             .by_payer
-            .entry(payer_key)
+            .entry(payer)
             .or_default()
             .push(record.clone());
         inner.records.push_back(record);
@@ -155,7 +159,7 @@ impl SettlementLedger {
         let inner = self.inner.lock().expect("settlement ledger mutex poisoned");
         inner
             .by_payer
-            .get(&payer.to_lowercase())
+            .get(&payer_key(payer))
             .cloned()
             .unwrap_or_default()
     }
@@ -253,6 +257,42 @@ mod tests {
         assert_eq!(ledger.find_by_payer("0xABCD").len(), 100);
         assert!(ledger.get_by_tx("tx-0").is_none());
         assert_eq!(ledger.summary().total_settled_volume, 700);
+    }
+
+    #[test]
+    fn eviction_removes_payer_records_with_non_ascii_case() {
+        let ledger = SettlementLedger::new(100);
+        let old = SettlementRecord {
+            payer: "PÄYER".into(),
+            ..record("old", "a", true)
+        };
+        ledger.record(old.clone());
+        assert_eq!(ledger.find_by_payer("päyer"), vec![old]);
+
+        for i in 0..100 {
+            ledger.record(record(&format!("tx-{i}"), "a", true));
+        }
+
+        assert!(ledger.get_by_tx("old").is_none());
+        assert!(ledger.find_by_payer("päyer").is_empty());
+    }
+
+    #[test]
+    fn confirmation_replaces_payer_records_with_non_ascii_case() {
+        let ledger = SettlementLedger::new(100);
+        let failed = SettlementRecord {
+            payer: "PÄYER".into(),
+            ..record("tx", "a", false)
+        };
+        let confirmed = SettlementRecord {
+            payer: "päyer".into(),
+            success: true,
+            ..failed.clone()
+        };
+        ledger.record(failed);
+        ledger.record(confirmed.clone());
+
+        assert_eq!(ledger.find_by_payer("PÄYER"), vec![confirmed]);
     }
 
     #[test]
