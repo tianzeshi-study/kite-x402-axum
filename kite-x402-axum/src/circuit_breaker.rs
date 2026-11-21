@@ -62,6 +62,23 @@ struct Inner {
     total_trips: u64,
 }
 
+impl Inner {
+    /// Advance Open -> HalfOpen once the cooldown has elapsed.
+    ///
+    /// Every public observer calls this so the state a caller sees cannot
+    /// depend on which method it happened to use.
+    fn advance(&mut self, config: &CircuitBreakerConfig, now: Instant) {
+        if self.state != CircuitState::Open {
+            return;
+        }
+        if now.duration_since(self.last_state_change) >= config.recovery_timeout {
+            self.state = CircuitState::HalfOpen;
+            self.consecutive_successes = 0;
+            self.last_state_change = now;
+        }
+    }
+}
+
 /// Thread-safe circuit breaker wrapper.
 #[derive(Debug, Clone)]
 pub struct CircuitBreaker {
@@ -114,23 +131,17 @@ impl CircuitBreaker {
     pub fn can_execute(&self) -> Result<(), CircuitBreakerError> {
         let mut inner = self.inner.lock().expect("circuit breaker mutex poisoned");
         let now = Instant::now();
+        inner.advance(&self.config, now);
 
         match inner.state {
             CircuitState::Closed | CircuitState::HalfOpen => Ok(()),
             CircuitState::Open => {
+                inner.total_rejected += 1;
                 let elapsed = now.duration_since(inner.last_state_change);
-                if elapsed >= self.config.recovery_timeout {
-                    inner.state = CircuitState::HalfOpen;
-                    inner.consecutive_successes = 0;
-                    inner.last_state_change = now;
-                    Ok(())
-                } else {
-                    inner.total_rejected += 1;
-                    let remaining = self.config.recovery_timeout.saturating_sub(elapsed);
-                    Err(CircuitBreakerError::CircuitOpen {
-                        retry_after_secs: remaining.as_secs().max(1),
-                    })
-                }
+                let remaining = self.config.recovery_timeout.saturating_sub(elapsed);
+                Err(CircuitBreakerError::CircuitOpen {
+                    retry_after_secs: remaining.as_secs().max(1),
+                })
             }
         }
     }
@@ -178,21 +189,15 @@ impl CircuitBreaker {
     #[must_use]
     pub fn state(&self) -> CircuitState {
         let mut inner = self.inner.lock().expect("circuit breaker mutex poisoned");
-        if inner.state == CircuitState::Open {
-            let elapsed = Instant::now().duration_since(inner.last_state_change);
-            if elapsed >= self.config.recovery_timeout {
-                inner.state = CircuitState::HalfOpen;
-                inner.consecutive_successes = 0;
-                inner.last_state_change = Instant::now();
-            }
-        }
+        inner.advance(&self.config, Instant::now());
         inner.state
     }
 
     /// Takes a snapshot of current metrics.
     #[must_use]
     pub fn snapshot(&self) -> CircuitBreakerSnapshot {
-        let inner = self.inner.lock().expect("circuit breaker mutex poisoned");
+        let mut inner = self.inner.lock().expect("circuit breaker mutex poisoned");
+        inner.advance(&self.config, Instant::now());
         CircuitBreakerSnapshot {
             state: inner.state,
             consecutive_failures: inner.consecutive_failures,
@@ -206,5 +211,72 @@ impl CircuitBreaker {
 impl Default for CircuitBreaker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A breaker that trips on the first failure. Passing a zero cooldown makes
+    /// the Open -> HalfOpen transition deterministic without sleeping.
+    fn breaker_with_cooldown(recovery_timeout: Duration) -> CircuitBreaker {
+        CircuitBreaker::with_config(CircuitBreakerConfig {
+            failure_threshold: 1,
+            recovery_timeout,
+            half_open_success_threshold: 1,
+        })
+    }
+
+    #[test]
+    fn snapshot_advances_after_cooldown_like_state_does() {
+        let breaker = breaker_with_cooldown(Duration::ZERO);
+        breaker.record_failure();
+
+        // Both `state()` and `can_execute()` advance Open -> HalfOpen once the
+        // cooldown has elapsed. A metrics read at the same instant must not
+        // keep reporting Open forever: a dashboard polling only `snapshot()`
+        // would never see the recovery that the request path already observes.
+        assert_eq!(
+            breaker.snapshot().state,
+            CircuitState::HalfOpen,
+            "snapshot never advances the state machine after cooldown"
+        );
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn snapshot_keeps_open_while_the_cooldown_is_running() {
+        let breaker = breaker_with_cooldown(Duration::from_secs(3600));
+        breaker.record_failure();
+
+        assert_eq!(breaker.snapshot().state, CircuitState::Open);
+        assert!(matches!(
+            breaker.can_execute(),
+            Err(CircuitBreakerError::CircuitOpen { .. })
+        ));
+        // Reading metrics must not shorten a cooldown the request path still
+        // honours.
+        assert_eq!(breaker.snapshot().state, CircuitState::Open);
+    }
+
+    #[test]
+    fn snapshot_and_state_agree_when_state_drove_the_transition() {
+        let breaker = breaker_with_cooldown(Duration::ZERO);
+        breaker.record_failure();
+
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+        // Guard the shared-state behaviour: once anything has advanced the
+        // machine, both observers must report the same thing.
+        assert_eq!(breaker.snapshot().state, breaker.state());
+    }
+
+    #[test]
+    fn repeated_snapshots_are_stable() {
+        let breaker = breaker_with_cooldown(Duration::ZERO);
+        breaker.record_failure();
+        let first = breaker.snapshot();
+        let second = breaker.snapshot();
+        assert_eq!(first, second, "reading metrics must not itself cause churn");
     }
 }
