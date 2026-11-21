@@ -105,14 +105,17 @@ impl ExpirationGuardConfig {
             });
         }
 
-        // Check minimum remaining validity
-        if now_secs > valid_before {
-            return Err(ExpirationError::Expired {
-                valid_before,
-                now: now_secs,
-            });
-        }
-
+        // `latest_allowed` above is the single expiry decision. An earlier
+        // unconditional `now > valid_before` check made the drift tolerance
+        // unreachable: anything inside `[now - drift, now]` passed the
+        // tolerance check and was then rejected by that second check with the
+        // identical `Expired` error. A buyer whose clock runs behind the
+        // server would have every authorization refused at the boundary.
+        //
+        // Remaining validity is a separate, stricter gate below: it uses a
+        // saturating subtraction so an authorization inside the drift window
+        // reports 0 remaining and is accepted only when the configured
+        // minimum is also 0.
         let remaining = valid_before.saturating_sub(now_secs);
         if remaining < self.min_remaining_validity_seconds {
             return Err(ExpirationError::InsufficientRemainingValidity {
@@ -204,6 +207,63 @@ mod tests {
             Err(ExpirationError::InsufficientRemainingValidity {
                 remaining: 3,
                 min_required: 5,
+            })
+        );
+    }
+
+    /// A buyer whose clock is 20s behind the server signs an authorization with
+    /// `validBefore = buyer_now + 40`. On the server, `validBefore` is 20s in
+    /// the past — inside the 30s drift tolerance, so this is exactly the case
+    /// `max_drift_seconds` exists to accept. With no minimum-remaining
+    /// requirement, the only check that should apply is the drift-aware one.
+    #[test]
+    fn accepts_an_authorization_inside_the_expiry_drift_window() {
+        let guard = ExpirationGuardConfig::new(30, 0);
+        let now = 10_000;
+        // validBefore is 20s before server now, within the 30s tolerance.
+        assert_eq!(guard.validate(now - 100, now - 20, now), Ok(()));
+    }
+
+    /// The same drift window must still fail once the configured minimum
+    /// remaining validity is non-zero: remaining is 0 after saturating, which
+    /// is below the 5s floor. This is the independent settlement-safety gate,
+    /// not the drift check.
+    #[test]
+    fn drift_window_still_respects_minimum_remaining_validity() {
+        let guard = ExpirationGuardConfig::new(30, 5);
+        let now = 10_000;
+        assert_eq!(
+            guard.validate(now - 100, now - 20, now),
+            Err(ExpirationError::InsufficientRemainingValidity {
+                remaining: 0,
+                min_required: 5,
+            })
+        );
+    }
+
+    /// Pin the production default: with the shipped `min_remaining = 5`, an
+    /// authorization in the drift window is still refused. The fix changes
+    /// *why* it is refused (insufficient remaining, not expired), never the
+    /// accept/reject decision on the default path.
+    #[test]
+    fn default_config_still_rejects_inside_the_drift_window() {
+        let guard = ExpirationGuardConfig::default();
+        let now = 10_000;
+        assert!(guard.validate(now - 100, now - 20, now).is_err());
+    }
+
+    /// Beyond the drift tolerance the authorization is expired regardless of
+    /// the minimum-remaining setting — guard against a fix that removes the
+    /// expiry check entirely.
+    #[test]
+    fn rejects_authorization_past_the_expiry_drift_window() {
+        let guard = ExpirationGuardConfig::new(30, 0);
+        let now = 10_000;
+        assert_eq!(
+            guard.validate(now - 100, now - 31, now),
+            Err(ExpirationError::Expired {
+                valid_before: now - 31,
+                now,
             })
         );
     }
