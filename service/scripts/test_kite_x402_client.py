@@ -77,6 +77,16 @@ class ClientSettlementTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(send.call_count, 1)
 
+    def test_initial_request_failure_stops_before_signing(self):
+        for failure in (requests.ConnectionError, requests.Timeout):
+            with self.subTest(failure=failure.__name__):
+                with patch.object(client, "build_payment_header") as sign:
+                    status, errors, send = self.run_client(failure())
+                self.assertEqual(status, 1)
+                self.assertIn(f"initial request failed ({failure.__name__})", errors)
+                self.assertEqual(send.call_count, 1)
+                sign.assert_not_called()
+
     def test_payment_signature_carries_the_challenge_resource(self):
         settled = response(200, **{"Payment-Response": encode_header(self.receipt)})
         status, _, send = self.run_client(self.challenge, settled)
