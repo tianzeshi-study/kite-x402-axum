@@ -192,9 +192,9 @@ async fn main() {
         "Configured kite-x402 wrapper"
     );
 
-    let clock_drift_secs = env::var("PAYMENT_CLOCK_DRIFT_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok());
+    let clock_drift_secs =
+        parse_clock_drift_secs(env::var("PAYMENT_CLOCK_DRIFT_SECS").ok().as_deref())
+            .unwrap_or_else(|message| panic!("{message}"));
     let expiration_guard =
         clock_drift_secs.map(|drift| kite_x402_axum::ExpirationGuardConfig::new(drift, 5));
 
@@ -793,6 +793,23 @@ fn env_or(key: &str, fallback: &str) -> String {
     }
 }
 
+/// Parses `PAYMENT_CLOCK_DRIFT_SECS` from a raw environment value.
+///
+/// `None` and blank mean the guard is not configured (`Ok(None)`); a value
+/// must be a non-negative `u64`. A present-but-invalid value is an error
+/// rather than a silent `None`, so a typo cannot quietly disable the drift
+/// tolerance (which would reject legitimate payments from slow client clocks).
+/// Callers treat `Err` as a startup failure, matching the other numeric
+/// settings in this service.
+fn parse_clock_drift_secs(raw: Option<&str>) -> Result<Option<u64>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    raw.parse::<u64>()
+        .map(Some)
+        .map_err(|_| "PAYMENT_CLOCK_DRIFT_SECS must be a non-negative integer".to_owned())
+}
+
 /// Parses `EXTRA_PAYMENT_OPTIONS` — a comma-separated list of
 /// `<network>:<price>` entries, e.g. `"testnet:0.002,mainnet:$0.05"`.
 /// These are advertised in the 402 challenge after the primary
@@ -1017,13 +1034,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_payment_clock_drift_secs() {
-        env::set_var("PAYMENT_CLOCK_DRIFT_SECS", "45");
-        let parsed = env::var("PAYMENT_CLOCK_DRIFT_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok());
-        assert_eq!(parsed, Some(45));
-        env::remove_var("PAYMENT_CLOCK_DRIFT_SECS");
+    fn clock_drift_config_is_disabled_only_when_absent_or_blank() {
+        // Absent / blank keeps the existing "guard not configured" behaviour.
+        assert_eq!(parse_clock_drift_secs(None), Ok(None));
+        assert_eq!(parse_clock_drift_secs(Some("")), Ok(None));
+        assert_eq!(parse_clock_drift_secs(Some("   ")), Ok(None));
+
+        // Valid values are accepted, with surrounding whitespace trimmed.
+        assert_eq!(parse_clock_drift_secs(Some("45")), Ok(Some(45)));
+        assert_eq!(parse_clock_drift_secs(Some(" 30 ")), Ok(Some(30)));
+        assert_eq!(parse_clock_drift_secs(Some("0")), Ok(Some(0)));
+
+        // A present but malformed value must be rejected, not silently turn
+        // into Ok(None) and disable the drift tolerance.
+        for bad in ["abc", "-1", "1.5", "18446744073709551616"] {
+            assert!(
+                parse_clock_drift_secs(Some(bad)).is_err(),
+                "{bad} must be rejected instead of disabling the guard"
+            );
+        }
     }
 
     #[tokio::test]
