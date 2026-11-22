@@ -7,6 +7,7 @@
 //! the TypeScript SDK's `500`/`502` split.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{OriginalUri, Request, State},
@@ -44,6 +45,10 @@ pub struct PaymentConfig {
     pub metrics: Option<Arc<crate::metrics::PaymentMetrics>>,
     /// Optional nonce replay guard to reject duplicate payment signatures before calling facilitator.
     pub nonce_guard: Option<Arc<crate::nonce_guard::PaymentNonceReplayGuard>>,
+    /// Optional settlement ledger that retains settle outcomes for
+    /// reconciliation. Recording is local to the process, exactly like the
+    /// other in-memory guards.
+    pub settlement_ledger: Option<Arc<crate::settlement_ledger::SettlementLedger>>,
 }
 
 impl PaymentConfig {
@@ -64,6 +69,7 @@ impl PaymentConfig {
             expiration_guard: None,
             metrics: None,
             nonce_guard: None,
+            settlement_ledger: None,
         }
     }
 
@@ -91,6 +97,20 @@ impl PaymentConfig {
         guard: Arc<crate::nonce_guard::PaymentNonceReplayGuard>,
     ) -> Self {
         self.nonce_guard = Some(guard);
+        self
+    }
+
+    /// Retains settle outcomes in the given ledger for post-settlement
+    /// reconciliation and auditing. Attempts whose on-chain outcome is unknown
+    /// (a settle transport error) are recorded as failures so an operator can
+    /// find and reconcile them; a later confirmation with the same network and
+    /// transaction hash replaces that record.
+    #[must_use]
+    pub fn with_settlement_ledger(
+        mut self,
+        ledger: Arc<crate::settlement_ledger::SettlementLedger>,
+    ) -> Self {
+        self.settlement_ledger = Some(ledger);
         self
     }
 
@@ -149,6 +169,80 @@ fn settlement_failure_response(settle: &crate::types::SettleResponse) -> Respons
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The settled amount in atomic units, preferring the facilitator's receipt and
+/// falling back to the advertised requirement. An unparsable or overflowing
+/// value becomes `0` rather than failing the request: ledger volume is a
+/// diagnostic, not a money decision.
+fn atomic_amount(requirements: &PaymentRequirements, settle: &crate::types::SettleResponse) -> u64 {
+    fn parse(value: &str) -> Option<u64> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        trimmed
+            .parse::<u128>()
+            .ok()
+            .map(|value| u64::try_from(value).unwrap_or(u64::MAX))
+    }
+
+    settle
+        .amount
+        .as_deref()
+        .and_then(parse)
+        .or_else(|| parse(&requirements.amount))
+        .unwrap_or(0)
+}
+
+/// Appends one settle outcome to the configured ledger, if any. Called only
+/// after a settle attempt (including one whose outcome is unknown), and only
+/// with the requirements the buyer actually matched, so the record's amount,
+/// asset and `payTo` describe the payment that was attempted.
+fn record_settlement(
+    cfg: &PaymentConfig,
+    requirements: &PaymentRequirements,
+    verified_payer: Option<&str>,
+    settle: &crate::types::SettleResponse,
+) {
+    let Some(ledger) = cfg.settlement_ledger.as_ref() else {
+        return;
+    };
+    let payer = settle
+        .payer
+        .as_deref()
+        .filter(|payer| !payer.trim().is_empty())
+        .or(verified_payer)
+        .unwrap_or_default();
+    let network = if settle.network.trim().is_empty() {
+        requirements.network.clone()
+    } else {
+        settle.network.clone()
+    };
+    let record = crate::settlement_ledger::SettlementRecord {
+        tx_hash: settle.transaction.clone(),
+        payer: payer.to_owned(),
+        pay_to: requirements.pay_to.clone(),
+        amount: atomic_amount(requirements, settle),
+        network,
+        timestamp_secs: unix_now_secs(),
+        success: settle.success,
+        error_reason: settle.error_reason.clone(),
+    };
+    tracing::debug!(
+        tx = %record.tx_hash,
+        success = record.success,
+        network = %record.network,
+        "Recording settlement outcome in ledger"
+    );
+    ledger.record(record);
 }
 
 /// Shared gate engine.
@@ -457,6 +551,11 @@ async fn payment_gate_inner(
                 network: requirements.network.clone(),
                 amount: None,
             };
+            // The settle transport failed, so the on-chain outcome is unknown
+            // rather than known-failed. Record it (no transaction hash) so an
+            // operator can find and reconcile this attempt instead of only
+            // having it in a log line.
+            record_settlement(cfg, requirements, verify.payer.as_deref(), &failure);
             return settlement_failure_response(&failure);
         }
     };
@@ -495,6 +594,7 @@ async fn payment_gate_inner(
             error_reason = ?settle.error_reason,
             "Payment settlement audit: failed"
         );
+        record_settlement(cfg, requirements, verify.payer.as_deref(), &settle);
         return settlement_failure_response(&settle);
     }
 
@@ -520,6 +620,7 @@ async fn payment_gate_inner(
         settle = ?settle,
         "Full settlement response details"
     );
+    record_settlement(cfg, requirements, verify.payer.as_deref(), &settle);
 
     let (mut parts, body) = response.into_parts();
     parts.headers.insert(
@@ -617,6 +718,8 @@ pub struct MultiPaymentConfig {
     pub metrics: Option<Arc<crate::metrics::PaymentMetrics>>,
     /// Optional nonce replay guard.
     pub nonce_guard: Option<Arc<crate::nonce_guard::PaymentNonceReplayGuard>>,
+    /// Optional settlement ledger shared with the single-option gate.
+    pub settlement_ledger: Option<Arc<crate::settlement_ledger::SettlementLedger>>,
 }
 
 impl MultiPaymentConfig {
@@ -635,7 +738,19 @@ impl MultiPaymentConfig {
             expiration_guard: None,
             metrics: None,
             nonce_guard: None,
+            settlement_ledger: None,
         }
+    }
+
+    /// Retains settle outcomes in the given ledger, like the single-option
+    /// [`PaymentConfig::with_settlement_ledger`].
+    #[must_use]
+    pub fn with_settlement_ledger(
+        mut self,
+        ledger: Arc<crate::settlement_ledger::SettlementLedger>,
+    ) -> Self {
+        self.settlement_ledger = Some(ledger);
+        self
     }
 
     /// Builds a `PaymentConfig` view over this config's shared infrastructure.
@@ -656,6 +771,7 @@ impl MultiPaymentConfig {
             expiration_guard: self.expiration_guard,
             metrics: self.metrics.clone(),
             nonce_guard: self.nonce_guard.clone(),
+            settlement_ledger: self.settlement_ledger.clone(),
         }
     }
 }
@@ -733,6 +849,7 @@ mod tests {
             expiration_guard: None,
             metrics: None,
             nonce_guard: None,
+            settlement_ledger: None,
         })
     }
 

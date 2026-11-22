@@ -216,6 +216,7 @@ pub(super) async fn route_payment(
         expiration_guard: config.expiration_guard,
         metrics: config.metrics.clone(),
         nonce_guard: config.nonce_guard.clone(),
+        settlement_ledger: config.settlement_ledger.clone(),
     });
     x402_payment_multi(State(multi), req, next).await
 }

@@ -187,6 +187,16 @@ impl SettlementLedger {
         )
     }
 
+    /// Returns up to `limit` of the most recently recorded entries, newest
+    /// first. Intended for read-only reconciliation views: a caller can look at
+    /// the newest attempts (including ones whose outcome is unknown) without
+    /// scanning the whole retained history.
+    #[must_use]
+    pub fn recent(&self, limit: usize) -> Vec<SettlementRecord> {
+        let inner = self.inner.lock().expect("settlement ledger mutex poisoned");
+        inner.records.iter().rev().take(limit).cloned().collect()
+    }
+
     /// Number of entries currently stored in the ledger.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -293,6 +303,37 @@ mod tests {
         ledger.record(confirmed.clone());
 
         assert_eq!(ledger.find_by_payer("PÄYER"), vec![confirmed]);
+    }
+
+    #[test]
+    fn recent_returns_newest_first_and_respects_the_limit() {
+        let ledger = SettlementLedger::new(100);
+        assert!(ledger.recent(10).is_empty(), "a new ledger has no history");
+        assert!(ledger.recent(0).is_empty(), "a zero limit returns nothing");
+
+        for i in 0..5 {
+            ledger.record(record(&format!("tx-{i}"), "a", true));
+        }
+
+        let recent = ledger.recent(2);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].tx_hash, "tx-4");
+        assert_eq!(recent[1].tx_hash, "tx-3");
+
+        // Asking for more than retained returns the whole history, still newest first.
+        assert_eq!(ledger.recent(usize::MAX).len(), 5);
+        assert_eq!(ledger.recent(usize::MAX)[0].tx_hash, "tx-4");
+    }
+
+    #[test]
+    fn recent_reflects_confirmation_replacing_a_failed_attempt() {
+        let ledger = SettlementLedger::new(100);
+        ledger.record(record("tx", "a", false));
+        ledger.record(record("tx", "a", true));
+
+        let recent = ledger.recent(10);
+        assert_eq!(recent.len(), 1, "a confirmation replaces its failed record");
+        assert!(recent[0].success);
     }
 
     #[test]
