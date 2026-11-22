@@ -171,7 +171,14 @@ def main() -> int:
     headers = {}
 
     print(f"\n--- 1) unauthenticated {args.method} {args.url}")
-    first = requests.request(args.method, args.url, json=body, headers=headers, timeout=30)
+    try:
+        first = requests.request(args.method, args.url, json=body, headers=headers, timeout=30)
+    except requests.RequestException as error:
+        print(
+            f"error: initial request failed ({type(error).__name__}); no payment was signed",
+            file=sys.stderr,
+        )
+        return 1
     print(f"HTTP {first.status_code}")
 
     if first.status_code != 402:
