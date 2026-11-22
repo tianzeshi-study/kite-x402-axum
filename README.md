@@ -208,6 +208,24 @@ The service exposes endpoints outside `/v1/*` that are unmetered (free) and neve
 | `FACILITATOR_TIMEOUT_MS` | `30000` | Facilitator verification/settlement timeout in milliseconds (100..=300000). |
 | `UPSTREAM_AUTH_HEADER` | `Authorization` | Credential header injected into upstream calls. |
 | `UPSTREAM_AUTH_VALUE` | Empty | Upstream secret credential (redacted from logs). |
+| `SERVICE_DESCRIPTION` | `Paid API access via Kite x402` | Resource description shown in the 402 challenge. |
+| `SHUTDOWN_TIMEOUT_SECONDS` | `30` | Bounded graceful-shutdown window in seconds (1..=86400). |
+| `CORS_ORIGIN` | Empty (disabled) | `*` for any origin, or a comma-separated allowlist; see [Browser CORS support](#browser-cors-support). |
+| `RATE_LIMIT_RPS` | `0` (off) | Per-client requests per second. |
+| `RATE_LIMIT_BURST` | `=RATE_LIMIT_RPS` | Token-bucket burst size. |
+| `RATE_LIMIT_TRUSTED_PROXIES` | Empty | Comma-separated proxy IPs/CIDRs whose `X-Forwarded-For` is trusted for client identification. |
+| `RATE_LIMIT_MAX_CLIENTS` | `10000` | Tracked client buckets (1..=1000000). |
+| `RATE_LIMIT_IDLE_TIMEOUT_SECS` | `300` | Idle client bucket retention in seconds. |
+| `MAX_CONCURRENT_REQUESTS` | `64` | Concurrency admission cap; excess requests queue. |
+| `FACILITATOR_VERIFY_RETRIES` | `0` | Retries for facilitator verify on transient failures. |
+| `FACILITATOR_VERIFY_BACKOFF_MS` | `150` | Backoff between verify retries in milliseconds. |
+| `FACILITATOR_SETTLE_RETRIES` | `0` | Must be 0 — settlement is never retried (indeterminate outcomes stay visible). |
+| `FACILITATOR_HEALTH_INTERVAL_SECS` | Empty (off) | Background facilitator probe interval; 60..=86400 enables. |
+| `PAYMENT_CLOCK_DRIFT_SECS` | Empty (off) | Enables the expiration guard with this clock-drift tolerance. |
+| `PAYMENT_REPLAY_CACHE_SIZE` | Empty (off) | Enables nonce replay protection with this cache capacity (1..=1000000). |
+| `SECURITY_CSP` | `default-src 'none'; frame-ancestors 'none'` | Content-Security-Policy header value. |
+| `SECURITY_REFERRER_POLICY` | `strict-origin-when-cross-origin` | Referrer-Policy header value. |
+| `SECURITY_HEADERS_ENABLED` | `true` | Set `false` to drop the security-header layer. |
 
 Facilitator response bodies from verification, settlement, and readiness checks
 are limited to 64 KiB, including HTTP error responses. The limit is enforced
