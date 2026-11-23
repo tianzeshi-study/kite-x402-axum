@@ -123,7 +123,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: wilsonqc223/kite-x402-client
-          ref: v0.1.0
+          ref: v0.2.0
           path: kx402-client
       - name: Pay the service end to end (mock facilitator)
         run: go run ./examples/e2e-axum-service -bin ../kite-x402-axum/target/release/kite-x402-service
@@ -253,7 +253,7 @@ jobs:
   ci-success:
     name: CI success
     if: always()
-    needs: [fmt, clippy, test, msrv, docs, package, scripts, compose, deny, docker]
+    needs: [fmt, clippy, test, msrv, docs, package, scripts, kx402, compose, deny, docker]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any required job failed or was cancelled
