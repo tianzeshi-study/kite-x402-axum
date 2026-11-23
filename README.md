@@ -178,6 +178,40 @@ settlement receipt for the requested network and a nonempty transaction ID.
 When the client reports an unconfirmed settlement, reconcile the original
 payment before signing another authorization.
 
+### Reconcile an uncertain Kite payment
+
+Before sending `PAYMENT-SIGNATURE`, the Python client prints a reconciliation
+command to stderr with the original authorization's nonce and expected payment
+details. Save that line and run the printed command if the signed request times
+out or the settlement receipt is missing. It queries Kite RPC using public chain
+data, without a private key or a new signature. To build the command manually:
+
+```sh
+python service/scripts/kite_x402_reconcile.py \
+  --network eip155:2368 --asset 0x38129cf4CE5E183eFF248F42A7D345Bb1B47621A \
+  --payer "$PAYER" --pay-to "$PAY_TO" --amount "$ATOMIC_AMOUNT" --nonce "$NONCE"
+```
+
+Use the original payer, recipient, nonce, and amount in atomic token units.
+`--transaction <hash>` checks a known transaction directly. Otherwise the tool
+searches the last 1,000 blocks by nonce. Use `--blocks` to change that window
+(1–10,000), subject to provider limits. Kite's default mainnet endpoint does
+not serve `eth_getLogs`. For mainnet nonce searches, set `--rpc-url` to a Kite
+RPC endpoint that supports it. The command supports the USDC.e and pieUSD
+contracts configured for this service.
+
+| JSON `status` | Exit code | Meaning |
+| --- | --- | --- |
+| `confirmed` | 0 | A successful receipt pairs the nonce's authorization event with a transfer matching the token, payer, recipient, and amount. |
+| `canceled` | 2 | A successful receipt contains the nonce's cancellation event. |
+| `consumed_unverified` | 2 | The contract marks the nonce as consumed, but the query could not prove the expected payment or a cancellation. |
+| `not_observed` | 2 | The contract has not consumed the nonce at `observed_block`. A pending settlement can still land. |
+
+RPC errors exit with code 1 and print a diagnostic to stderr. Results depend
+on the RPC's chain view and can change after a reorganization. A missing match
+does not establish that it is safe to pay again. A confirmed transfer proves the
+payment only. It does not show whether the upstream service fulfilled the request.
+
 ## Health, Liveness & Diagnostics
 
 The service exposes endpoints outside `/v1/*` that are unmetered (free) and never invoke payment verification or settlement:
@@ -453,8 +487,7 @@ request; the same commands work locally:
 | msrv | `cargo check --workspace --all-targets --locked` on Rust 1.88 |
 | rustdoc | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked` |
 | package | `cargo package -p kite-x402-axum --locked` |
-| scripts | Compile the Python client and run its settlement regression tests with `python -m unittest discover -s service/scripts`. Install `eth-account` and `requests` first. |
-| scripts | `python -m py_compile service/scripts/kite_x402_client.py` |
+| scripts | Compile the Python scripts with `python -m py_compile service/scripts/kite_x402_client.py service/scripts/kite_x402_reconcile.py` and run the payment and reconciliation tests with `python -m unittest discover -s service/scripts -p 'test_kite_x402_*.py'`. Install `eth-account` and `requests` first. |
 | Docker Compose smoke test | Checks required settings, builds and starts the image, then verifies `/healthz` and the unsigned payment challenge. |
 
 Mark **CI success** as the required check in branch protection; it passes only

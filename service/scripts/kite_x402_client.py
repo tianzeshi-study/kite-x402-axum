@@ -44,8 +44,10 @@ import base64
 import json
 import os
 import secrets
+import shlex
 import sys
 import time
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -217,6 +219,18 @@ def main() -> int:
     payment_header = build_payment_header(
         args.private_key, account.address, requirements, resource=resource
     )
+    authorization = b64_decode_json(payment_header)["payload"]["authorization"]
+    reconcile_command = [
+        sys.executable,
+        str(Path(__file__).resolve().with_name("kite_x402_reconcile.py")),
+        "--network", requirements["network"],
+        "--asset", requirements["asset"],
+        "--payer", authorization["from"],
+        "--pay-to", authorization["to"],
+        "--amount", str(int(authorization["value"])),
+        "--nonce", authorization["nonce"],
+    ]
+    print(f"To reconcile this authorization: {shlex.join(reconcile_command)}", file=sys.stderr, flush=True)
 
     print(f"\n--- 3) retrying {args.method} {args.url} with PAYMENT-SIGNATURE")
     try:
