@@ -110,6 +110,31 @@ jobs:
           service/scripts/kite_x402_testnet_smoke.py
       - run: python -m unittest discover -s service/scripts -p 'test_kite_x402_*.py'
 
+
+  kx402:
+    name: kx402 client contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p kite-x402-service --locked
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Check out the kx402 client at a pinned tag
+        uses: actions/checkout@v4
+        with:
+          repository: wilsonqc223/kite-x402-client
+          ref: v0.2.0
+          path: kx402-client
+      - name: Pay the service end to end (mock facilitator)
+        # The service is built at the workspace root; the client was checked
+        # out one level down, so from its directory the binary is ../target/…
+        run: go run ./examples/e2e-axum-service -bin ../target/release/kite-x402-service
+        working-directory: kx402-client
+
   compose:
     name: Docker Compose smoke test
     runs-on: ubuntu-latest
@@ -234,7 +259,7 @@ jobs:
   ci-success:
     name: CI success
     if: always()
-    needs: [fmt, clippy, test, msrv, docs, package, scripts, compose, deny, docker]
+    needs: [fmt, clippy, test, msrv, docs, package, scripts, kx402, compose, deny, docker]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any required job failed or was cancelled

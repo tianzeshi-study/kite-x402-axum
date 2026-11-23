@@ -529,6 +529,9 @@ request; the same commands work locally:
 | msrv | `cargo check --workspace --all-targets --locked` on Rust 1.88 |
 | rustdoc | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked` |
 | package | `cargo package -p kite-x402-axum --locked` |
+| scripts | Compile the Python client and run its settlement regression tests with `python -m unittest discover -s service/scripts`. Install `eth-account` and `requests` first. |
+| scripts | `python -m py_compile service/scripts/kite_x402_client.py` |
+| kx402 client contract | Builds the service, then pays it end to end with the [kx402](https://github.com/wilsonqc223/kite-x402-client) reference client (pinned tag, mock facilitator) — the server↔client wire contract in CI. |
 | scripts | Compile the client, reconciliation, and testnet smoke scripts with `python -m py_compile` and run their offline tests with `python -m unittest discover -s service/scripts -p 'test_kite_x402_*.py'`. Install `eth-account` and `requests` first. |
 | Docker Compose smoke test | Checks required settings, builds and starts the image, then verifies `/healthz` and the unsigned payment challenge. |
 
