@@ -385,6 +385,7 @@ mod tests {
             0,
             "max_queue_size = 0 was silently exceeded"
         );
+        assert_eq!(dispatcher.history_count(), 0);
     }
 
     #[test]
@@ -437,5 +438,154 @@ mod tests {
                 .is_some_and(|error| error.contains("queue")),
             "the reason for abandoning it must be recorded"
         );
+    }
+
+    fn dispatcher(targets: &[&str], max_retries: u32, max_queue_size: usize) -> WebhookDispatcher {
+        WebhookDispatcher::new(WebhookConfig {
+            target_urls: targets.iter().map(|target| (*target).to_owned()).collect(),
+            max_retries,
+            max_queue_size,
+            ..Default::default()
+        })
+    }
+
+    fn enqueue(dispatcher: &WebhookDispatcher) -> Vec<u64> {
+        dispatcher.enqueue_event(
+            WebhookEventType::PaymentSettled,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn one_event_fans_out_to_every_target_with_distinct_delivery_ids() {
+        let dispatcher = dispatcher(&["https://a.example/hook", "https://b.example/hook"], 3, 10);
+        let ids = enqueue(&dispatcher);
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(dispatcher.pending_count(), 2);
+
+        let first = dispatcher
+            .record_attempt_result(ids[0], true, Some(200), None)
+            .unwrap();
+        let second = dispatcher
+            .record_attempt_result(ids[1], true, Some(204), None)
+            .unwrap();
+        assert_eq!(first.target_url, "https://a.example/hook");
+        assert_eq!(second.target_url, "https://b.example/hook");
+        assert_eq!(
+            first.payload.event_id, second.payload.event_id,
+            "one event, two deliveries"
+        );
+    }
+
+    #[test]
+    fn no_targets_means_nothing_is_queued() {
+        let dispatcher = dispatcher(&[], 3, 10);
+        assert!(enqueue(&dispatcher).is_empty());
+        assert_eq!(dispatcher.pending_count(), 0);
+    }
+
+    #[test]
+    fn unknown_or_finished_delivery_ids_are_ignored() {
+        let dispatcher = dispatcher(&["https://a.example/hook"], 3, 10);
+        assert!(dispatcher
+            .record_attempt_result(999, true, Some(200), None)
+            .is_none());
+
+        let id = enqueue(&dispatcher)[0];
+        assert!(dispatcher
+            .record_attempt_result(id, true, Some(200), None)
+            .is_some());
+        assert!(
+            dispatcher
+                .record_attempt_result(id, true, Some(200), None)
+                .is_none(),
+            "a delivered record must not be accepted twice"
+        );
+        assert_eq!(dispatcher.history_count(), 1);
+    }
+
+    #[test]
+    fn attempt_results_are_recorded_and_cleared_on_success() {
+        let dispatcher = dispatcher(&["https://a.example/hook"], 3, 10);
+        let id = enqueue(&dispatcher)[0];
+
+        let failed = dispatcher
+            .record_attempt_result(id, false, Some(503), Some("unavailable".into()))
+            .unwrap();
+        assert_eq!(failed.status, DeliveryStatus::Failed);
+        assert_eq!(failed.attempts, 1);
+        assert_eq!(failed.last_status_code, Some(503));
+        assert_eq!(failed.last_error.as_deref(), Some("unavailable"));
+        assert!(failed.last_attempt_ms.is_some());
+
+        let delivered = dispatcher
+            .record_attempt_result(id, true, Some(200), None)
+            .unwrap();
+        assert_eq!(delivered.status, DeliveryStatus::Delivered);
+        assert_eq!(delivered.attempts, 2);
+        assert_eq!(delivered.last_status_code, Some(200));
+        assert!(
+            delivered.last_error.is_none(),
+            "stale error must not survive a success"
+        );
+    }
+
+    #[test]
+    fn a_delivery_is_abandoned_after_max_retries_plus_the_first_attempt() {
+        let dispatcher = dispatcher(&["https://a.example/hook"], 2, 10);
+        let id = enqueue(&dispatcher)[0];
+        for expected in [
+            DeliveryStatus::Failed,
+            DeliveryStatus::Failed,
+            DeliveryStatus::Abandoned,
+        ] {
+            let record = dispatcher
+                .record_attempt_result(id, false, Some(500), None)
+                .unwrap();
+            assert_eq!(record.status, expected);
+        }
+        assert_eq!(dispatcher.pending_count(), 0);
+        assert_eq!(dispatcher.history_count(), 1);
+    }
+
+    #[test]
+    fn a_full_queue_drops_the_oldest_pending_delivery() {
+        let dispatcher = dispatcher(&["https://a.example/hook"], 3, 2);
+        let first = enqueue(&dispatcher)[0];
+        let second = enqueue(&dispatcher)[0];
+        let third = enqueue(&dispatcher)[0];
+        assert_eq!(dispatcher.pending_count(), 2);
+        assert!(dispatcher
+            .record_attempt_result(first, true, Some(200), None)
+            .is_none());
+        assert!(dispatcher
+            .record_attempt_result(second, true, Some(200), None)
+            .is_some());
+        assert!(dispatcher
+            .record_attempt_result(third, true, Some(200), None)
+            .is_some());
+    }
+
+    #[test]
+    fn history_is_bounded_and_keeps_the_newest_records() {
+        let dispatcher = dispatcher(&["https://a.example/hook"], 0, 2);
+        let mut delivered_ids = Vec::new();
+        for _ in 0..5 {
+            let id = enqueue(&dispatcher)[0];
+            assert!(dispatcher
+                .record_attempt_result(id, true, Some(200), None)
+                .is_some());
+            delivered_ids.push(id);
+        }
+
+        assert_eq!(dispatcher.history_count(), 2);
+        let history = dispatcher.history();
+        assert_eq!(history[0].delivery_id, delivered_ids[3]);
+        assert_eq!(history[1].delivery_id, delivered_ids[4]);
     }
 }
