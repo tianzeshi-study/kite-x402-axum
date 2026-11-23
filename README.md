@@ -474,6 +474,48 @@ The signature format is the same one the live facilitator at
 `facilitator.pieverse.io/v2` verifies (see that repo's
 `examples/facilitator-livecheck`), so a green run here means only the
 on-chain funds transfer is left untested.
+
+### Verify a payment on Kite testnet
+
+The manual smoke test sends one paid GET through the live Kite facilitator.
+Use a dedicated testnet payer with at least `0.001` pieUSD and a different
+recipient address that you control. Set `PAY_TO` to that recipient in the
+service and client shells. Pass the payer's key via `X402_PRIVATE_KEY` in the
+client shell only.
+
+From the repository root, serve a deterministic upstream fixture in one shell:
+
+```sh
+fixture_dir=$(mktemp -d)
+printf '%s\n' '{"status":"paid"}' > "$fixture_dir/smoke.json"
+python -m http.server 8403 --bind 127.0.0.1 --directory "$fixture_dir"
+```
+
+Start the service in another shell using the real facilitator:
+
+```sh
+KITE_NETWORK=testnet PRICE_USD=0.001 PAY_TO="$PAY_TO" PORT=8402 \
+  UPSTREAM_URL=http://127.0.0.1:8403 FACILITATOR_URL=https://facilitator.pieverse.io/v2 \
+  cargo run -p kite-x402-service --locked
+```
+
+Run the smoke test from the client shell:
+
+```sh
+python -m pip install eth-account requests
+python service/scripts/kite_x402_testnet_smoke.py \
+  --url http://127.0.0.1:8402/v1/smoke.json --pay-to "$PAY_TO" \
+  --amount 1000000000000000 --expect-json '{"status":"paid"}'
+```
+
+The script checks the challenge and payer's pieUSD balance before signing.
+Exit code `0` and `upstream_verified: true` mean the paid HTTP response matched
+the fixture and the transaction in `PAYMENT-RESPONSE` proved the expected
+transfer on Kite testnet. Save the transaction hash from the JSON output as
+evidence. Once the script prints the nonce to stderr, reconcile that nonce
+before rerunning after an uncertain outcome. Only the read-only receipt lookup
+is retried. The automated tests mock the network and use no funded wallet.
+
 ## Continuous integration
 
 `.github/workflows/ci.yml` runs on every push to `main` and every pull
@@ -487,7 +529,7 @@ request; the same commands work locally:
 | msrv | `cargo check --workspace --all-targets --locked` on Rust 1.88 |
 | rustdoc | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked` |
 | package | `cargo package -p kite-x402-axum --locked` |
-| scripts | Compile the Python scripts with `python -m py_compile service/scripts/kite_x402_client.py service/scripts/kite_x402_reconcile.py` and run the payment and reconciliation tests with `python -m unittest discover -s service/scripts -p 'test_kite_x402_*.py'`. Install `eth-account` and `requests` first. |
+| scripts | Compile the client, reconciliation, and testnet smoke scripts with `python -m py_compile` and run their offline tests with `python -m unittest discover -s service/scripts -p 'test_kite_x402_*.py'`. Install `eth-account` and `requests` first. |
 | Docker Compose smoke test | Checks required settings, builds and starts the image, then verifies `/healthz` and the unsigned payment challenge. |
 
 Mark **CI success** as the required check in branch protection; it passes only
