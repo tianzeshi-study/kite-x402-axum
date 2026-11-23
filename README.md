@@ -455,6 +455,7 @@ request; the same commands work locally:
 | package | `cargo package -p kite-x402-axum --locked` |
 | scripts | Compile the Python client and run its settlement regression tests with `python -m unittest discover -s service/scripts`. Install `eth-account` and `requests` first. |
 | scripts | `python -m py_compile service/scripts/kite_x402_client.py` |
+| kx402 client contract | Builds the service, then pays it end to end with the [kx402](https://github.com/wilsonqc223/kite-x402-client) reference client (pinned tag, mock facilitator) — the server↔client wire contract in CI. |
 | Docker Compose smoke test | Checks required settings, builds and starts the image, then verifies `/healthz` and the unsigned payment challenge. |
 
 Mark **CI success** as the required check in branch protection; it passes only
