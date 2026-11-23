@@ -2,10 +2,11 @@ import base64
 import io
 import json
 import os
+import shlex
 import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import requests
 from eth_account import Account
@@ -67,7 +68,8 @@ class ClientSettlementTests(unittest.TestCase):
     def test_success_requires_a_matching_settlement_receipt(self):
         settled = response(200, **{"Payment-Response": encode_header(self.receipt)})
         status, errors, send = self.run_client(self.challenge, settled)
-        self.assertEqual((status, errors), (0, ""))
+        self.assertEqual(status, 0)
+        self.assertIn("To reconcile this authorization:", errors)
         self.assertEqual(send.call_count, 2)
         self.assertNotIn("PAYMENT-SIGNATURE", send.call_args_list[0].kwargs["headers"])
         self.assertIn("PAYMENT-SIGNATURE", send.call_args_list[1].kwargs["headers"])
@@ -133,7 +135,42 @@ class ClientSettlementTests(unittest.TestCase):
         self.assertEqual(status, 1)
 
     def test_signed_request_timeout_requires_reconciliation(self):
-        status, errors, send = self.run_client(self.challenge, requests.Timeout())
+        challenge = client.b64_decode_json(self.challenge.headers["Payment-Required"])
+        challenge["accepts"][0]["amount"] = 1000
+        challenge_response = response(402, **{"Payment-Required": encode_header(challenge)})
+        errors = io.StringIO()
+        errors.flush = Mock()
+
+        def send(*args, **kwargs):
+            headers = kwargs["headers"]
+            if "PAYMENT-SIGNATURE" not in headers:
+                return challenge_response
+
+            signed = client.b64_decode_json(headers["PAYMENT-SIGNATURE"])
+            authorization = signed["payload"]["authorization"]
+            output = errors.getvalue()
+            errors.flush.assert_called()
+            prefix = "To reconcile this authorization: "
+            self.assertTrue(output.startswith(prefix))
+            command = shlex.split(output.removeprefix(prefix))
+            self.assertTrue(command[1].endswith("kite_x402_reconcile.py"))
+            self.assertEqual(command[2:], [
+                "--network", NETWORK, "--asset", signed["accepted"]["asset"],
+                "--payer", authorization["from"], "--pay-to", authorization["to"],
+                "--amount", "1000", "--nonce", authorization["nonce"],
+            ])
+            self.assertNotIn(self.payer_key, output)
+            self.assertNotIn(signed["payload"]["signature"], output)
+            raise requests.Timeout()
+
+        with (
+            patch.object(sys, "argv", ["kite_x402_client.py", "--url", URL]),
+            patch.dict(os.environ, {"X402_PRIVATE_KEY": self.payer_key}),
+            patch.object(requests, "request", side_effect=send) as request,
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(errors),
+        ):
+            status = client.main()
         self.assertEqual(status, 1)
-        self.assertIn("Reconcile the original payment", errors)
-        self.assertEqual(send.call_count, 2)
+        self.assertIn("Reconcile the original payment", errors.getvalue())
+        self.assertEqual(request.call_count, 2)
