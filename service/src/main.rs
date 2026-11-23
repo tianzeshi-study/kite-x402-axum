@@ -237,6 +237,9 @@ async fn main() {
         expiration_guard,
         metrics: Some(Arc::clone(&metrics)),
         nonce_guard,
+        // The library records settlement outcomes when a ledger is supplied; the
+        // service opts in separately so the gate keeps working without one.
+        settlement_ledger: None,
     });
     let route_prices_env = env::var_os("ROUTE_PRICES_USD")
         .map(|value| {
