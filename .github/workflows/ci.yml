@@ -126,7 +126,9 @@ jobs:
           ref: v0.2.0
           path: kx402-client
       - name: Pay the service end to end (mock facilitator)
-        run: go run ./examples/e2e-axum-service -bin ../kite-x402-axum/target/release/kite-x402-service
+        # The service is built at the workspace root; the client was checked
+        # out one level down, so from its directory the binary is ../target/…
+        run: go run ./examples/e2e-axum-service -bin ../target/release/kite-x402-service
         working-directory: kx402-client
 
   compose:
