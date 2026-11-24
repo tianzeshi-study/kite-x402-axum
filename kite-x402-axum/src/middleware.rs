@@ -191,7 +191,7 @@ fn atomic_amount(requirements: &PaymentRequirements, settle: &crate::types::Sett
         trimmed
             .parse::<u128>()
             .ok()
-            .map(|value| u64::try_from(value).unwrap_or(u64::MAX))
+            .and_then(|value| u64::try_from(value).ok())
     }
 
     settle
@@ -947,6 +947,42 @@ mod tests {
         let d = (*c).clone();
         assert_eq!(d.pay_to, PAY_TO);
         assert!(format!("{d:?}").contains("Unit test service"));
+    }
+
+    #[test]
+    fn atomic_amount_rejects_overflow_instead_of_saturating() {
+        // The doc contract says an unparsable OR overflowing value becomes 0,
+        // because ledger volume is only a diagnostic. A `u64` overflow that is
+        // nevertheless a valid `u128` must not be recorded as u64::MAX — that
+        // would inject a fake, astronomically large settlement into the ledger
+        // and into summary().total_settled_volume.
+        let req = requirements();
+        let settle = |amount: Option<&str>| SettleResponse {
+            success: true,
+            error_reason: None,
+            error_message: None,
+            payer: None,
+            transaction: "0xdead".into(),
+            network: req.network.clone(),
+            amount: amount.map(str::to_owned),
+        };
+
+        // A valid u128 that does not fit u64 must NOT become u64::MAX — that
+        // would inject a fake, astronomically huge settlement into the ledger.
+        // It is unrepresentable, so it falls back to the advertised requirement.
+        let overflow = "18446744073709551616"; // 2^64
+        let advertised = req.amount.parse::<u64>().unwrap();
+        assert_eq!(atomic_amount(&req, &settle(Some(overflow))), advertised);
+        assert_ne!(atomic_amount(&req, &settle(Some(overflow))), u64::MAX);
+        // When the advertised requirement also overflows, the documented zero
+        // is the final fallback — not u64::MAX.
+        let mut big_req = req.clone();
+        big_req.amount = overflow.into();
+        assert_eq!(atomic_amount(&big_req, &settle(None)), 0);
+        // Normal values still parse. An unparsable receipt amount also falls
+        // back to the advertised requirement (by design).
+        assert_eq!(atomic_amount(&req, &settle(Some(" 42 "))), 42);
+        assert_eq!(atomic_amount(&req, &settle(Some("1.5"))), advertised);
     }
 
     // ---- response builders -------------------------------------------------
