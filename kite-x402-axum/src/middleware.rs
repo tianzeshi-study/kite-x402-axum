@@ -329,7 +329,10 @@ fn record_settlement(
     };
     let record = crate::settlement_ledger::SettlementRecord {
         tx_hash: settle.transaction.clone(),
-        payer: payer.to_owned(),
+        // The emptiness filter above already trims, and `payer_key` only
+        // lowercases. Store the trimmed form so find_by_payer(clean_address)
+        // can actually find this record.
+        payer: payer.trim().to_owned(),
         pay_to: requirements.pay_to.clone(),
         amount: atomic_amount(requirements, settle),
         network,
@@ -1206,6 +1209,56 @@ mod tests {
             ledger.get_by_network_tx(&clean_network, "0xdead").is_some(),
             "a settle network with surrounding whitespace must be stored trimmed, \
              otherwise the same network produces two different ledger identities"
+        );
+    }
+
+    #[test]
+    fn settle_payer_is_trimmed_before_it_becomes_a_ledger_key() {
+        use crate::settlement_ledger::SettlementLedger;
+        use std::sync::Arc;
+
+        let ledger = Arc::new(SettlementLedger::new(100));
+        let cfg = PaymentConfig {
+            pay_to: PAY_TO.to_owned(),
+            chain: KITE_TESTNET,
+            price_usd: "0.001".to_owned(),
+            description: "test".to_owned(),
+            facilitator: dead_facilitator(),
+            expiration_guard: None,
+            metrics: None,
+            nonce_guard: None,
+            settlement_ledger: Some(ledger.clone()),
+        };
+        let req = requirements();
+        let settle = SettleResponse {
+            success: false,
+            error_reason: Some("boom".to_owned()),
+            error_message: None,
+            // Padded payer: the emptiness filter calls trim(), so whitespace
+            // is meant to be insignificant — but the raw value is stored.
+            payer: Some("  0xABC  ".to_owned()),
+            transaction: "0xdead".to_owned(),
+            network: req.network.clone(),
+            amount: None,
+        };
+        // #152 added the decoded payload argument; it is required even when
+        // this settlement has a transaction hash.
+        let payload = PaymentPayload {
+            x402_version: 2,
+            resource: None,
+            accepted: req.clone(),
+            payload: serde_json::Value::Null,
+            extensions: None,
+        };
+        record_settlement(&cfg, &payload, &req, Some("0xabc"), &settle);
+
+        // payer_key() only lowercases; it does not trim. Looking up the clean
+        // address must still find the record.
+        assert_eq!(
+            ledger.find_by_payer("0xabc").len(),
+            1,
+            "a settle payer with surrounding whitespace must be stored trimmed, \
+             otherwise find_by_payer with the clean address misses the record"
         );
     }
 
