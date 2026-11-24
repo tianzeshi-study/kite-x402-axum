@@ -62,15 +62,36 @@ impl CorsSecurityGuard {
         self.config.allowed_origins.contains(origin)
     }
 
+    /// Whether the allow-list is the `*` wildcard.
+    #[must_use]
+    fn is_wildcard(&self) -> bool {
+        self.config.allowed_origins.contains("*")
+    }
+
     /// Returns the CORS headers to attach for `origin`, or `None` if it is not allowed.
+    ///
+    /// With the `*` wildcard the response carries a literal
+    /// `Access-Control-Allow-Origin: *` and never `Access-Control-Allow-Credentials`,
+    /// even when credentials are enabled in the config. Echoing the request
+    /// origin back instead would let any site read credentialed responses
+    /// (the browser accepts a specific origin together with
+    /// `Allow-Credentials: true`), so the two settings cannot be combined.
     #[must_use]
     pub fn get_cors_headers(&self, origin: &str) -> Option<Vec<(&'static str, String)>> {
         if !self.is_origin_allowed(origin) {
             return None;
         }
 
+        let wildcard = self.is_wildcard();
         let mut headers = vec![
-            ("Access-Control-Allow-Origin", origin.to_owned()),
+            (
+                "Access-Control-Allow-Origin",
+                if wildcard {
+                    "*".to_owned()
+                } else {
+                    origin.to_owned()
+                },
+            ),
             (
                 "Access-Control-Allow-Methods",
                 "GET, POST, OPTIONS".to_owned(),
@@ -92,7 +113,11 @@ impl CorsSecurityGuard {
         // carrying `Authorization` — the default way an x402 client pays.
         // `allow_credentials` was previously never read, so the default
         // `true` was a promise the emitted headers did not keep.
-        if self.config.allow_credentials {
+        //
+        // It is deliberately skipped for the wildcard: browsers reject
+        // `*` plus credentials, and echoing the caller's origin instead turns
+        // the wildcard into "any origin may read authenticated responses".
+        if self.config.allow_credentials && !wildcard {
             headers.push(("Access-Control-Allow-Credentials", "true".to_owned()));
         }
         Some(headers)

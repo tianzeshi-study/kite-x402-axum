@@ -67,3 +67,55 @@ fn credentials_header_is_omitted_when_disabled() {
         .iter()
         .any(|(name, value)| *name == "Access-Control-Max-Age" && value == "600"));
 }
+
+/// A wildcard allow-list must answer with a literal `*` and no
+/// `Allow-Credentials`, even though `allow_credentials` defaults to `true`.
+/// Echoing the caller's origin (the old behaviour) combined with the credentials
+/// header let any site read authenticated responses, which is exactly what
+/// browsers forbid for `*`.
+#[test]
+fn wildcard_does_not_reflect_origin_or_grant_credentials() {
+    let guard = CorsSecurityGuard::new(vec!["*"]);
+    let headers = guard.get_cors_headers("https://evil.example").unwrap();
+
+    let allow_origin = headers
+        .iter()
+        .find(|(name, _)| *name == "Access-Control-Allow-Origin")
+        .map(|(_, value)| value.as_str());
+    assert_eq!(allow_origin, Some("*"));
+    assert!(
+        headers
+            .iter()
+            .all(|(_, value)| value != "https://evil.example"),
+        "the wildcard must not echo the request origin"
+    );
+    assert!(
+        headers
+            .iter()
+            .all(|(name, _)| *name != "Access-Control-Allow-Credentials"),
+        "credentials cannot be combined with a wildcard origin"
+    );
+}
+
+/// The same wildcard rule holds when credentials are configured explicitly.
+#[test]
+fn wildcard_stays_credentialless_with_explicit_config() {
+    let config = CorsGuardConfig {
+        allowed_origins: ["*".to_owned()].into_iter().collect(),
+        allow_credentials: true,
+        max_age_secs: 60,
+    };
+    let guard = CorsSecurityGuard::with_config(config);
+    let headers = guard.get_cors_headers("https://app.gokite.ai").unwrap();
+
+    assert_eq!(
+        headers
+            .iter()
+            .find(|(name, _)| *name == "Access-Control-Allow-Origin")
+            .map(|(_, value)| value.as_str()),
+        Some("*")
+    );
+    assert!(headers
+        .iter()
+        .all(|(name, _)| *name != "Access-Control-Allow-Credentials"));
+}
