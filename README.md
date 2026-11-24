@@ -172,6 +172,10 @@ A receipt that fails either check returns `402` with `success: false` and
 `errorReason: invalid_settlement_receipt` in `PAYMENT-RESPONSE`. The reported
 network and transaction are kept for reconciliation before signing again.
 
+Use the final endpoint URL with the Python client. A `3xx` response stops
+it at either request. If the signed request returns `3xx`, run the printed
+reconciliation command before retrying.
+
 The [Python test client](service/scripts/kite_x402_client.py) exits with `0`
 only after receiving a payment challenge and a successful HTTP response with a
 settlement receipt for the requested network and a nonempty transaction ID.
