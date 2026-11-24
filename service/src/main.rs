@@ -8,7 +8,7 @@
 
 use std::{
     env,
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{
         atomic::{AtomicI64, AtomicU64, Ordering},
         Arc,
@@ -30,7 +30,7 @@ use kite_x402_axum::{
     middleware::PaymentConfig,
     payment_options::PaymentOption,
     proxy::{proxy, same_origin_redirect_policy, UpstreamConfig},
-    PaymentMetrics, PaymentMetricsSnapshot,
+    PaymentMetrics, PaymentMetricsSnapshot, SettlementLedger,
 };
 use serde_json::json;
 
@@ -38,6 +38,7 @@ mod cors;
 mod health;
 mod rate_limit;
 mod route_prices;
+mod settlement_query;
 use cors::{cors_middleware, CorsConfig};
 use health::ReadinessState;
 use rate_limit::{
@@ -223,6 +224,8 @@ async fn main() {
         health::parse_interval(env::var("FACILITATOR_HEALTH_INTERVAL_SECS").ok().as_deref())
             .unwrap_or_else(|message| panic!("{message}"));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let settlement_port = settlement_query::configured_port().unwrap_or_else(|err| panic!("{err}"));
+    let settlement_ledger = settlement_port.map(|_| Arc::new(SettlementLedger::default()));
 
     let payment_cfg = Arc::new(PaymentConfig {
         pay_to,
@@ -237,9 +240,7 @@ async fn main() {
         expiration_guard,
         metrics: Some(Arc::clone(&metrics)),
         nonce_guard,
-        // The library records settlement outcomes when a ledger is supplied; the
-        // service opts in separately so the gate keeps working without one.
-        settlement_ledger: None,
+        settlement_ledger: settlement_ledger.clone(),
     });
     let route_prices_env = env::var_os("ROUTE_PRICES_USD")
         .map(|value| {
@@ -382,18 +383,41 @@ async fn main() {
         "kite-x402 wrapper listening on 0.0.0.0:{port} (network={network_name})"
     );
 
+    let settlement_listener = if let Some(port) = settlement_port {
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .unwrap_or_else(|e| panic!("could not bind settlement query listener at {addr}: {e}"));
+        tracing::info!(%addr, "Settlement query listener ready");
+        Some((listener, addr))
+    } else {
+        None
+    };
+
     let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
+    let (settlement_shutdown_tx, mut settlement_shutdown_rx) = tokio::sync::watch::channel(false);
     let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
         shutdown_signal().await;
+        let _ = settlement_shutdown_tx.send(true);
         let _ = signal_tx.send(());
     });
+    let settlement_server = async move {
+        if let Some(((listener, addr), ledger)) = settlement_listener.zip(settlement_ledger) {
+            axum::serve(listener, settlement_query::router(ledger, addr))
+                .with_graceful_shutdown(async move {
+                    let _ = settlement_shutdown_rx.wait_for(|stopping| *stopping).await;
+                })
+                .await?;
+        }
+        Ok::<(), std::io::Error>(())
+    };
 
     tokio::select! {
-        res = server => {
+        res = async { tokio::try_join!(async { server.await }, settlement_server) } => {
             res.expect("server error");
             tracing::info!("Server shut down gracefully");
         }
