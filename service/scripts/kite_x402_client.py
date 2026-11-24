@@ -246,7 +246,7 @@ def pretty(obj) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--url", required=True, help="Full URL of the paid endpoint, e.g. http://localhost:8402/v1/forecast?...")
+    parser.add_argument("--url", required=True, help="Final URL of the paid endpoint, e.g. http://localhost:8402/v1/forecast?...")
     parser.add_argument("--method", default="GET", help="HTTP method (default: GET)")
     parser.add_argument("--body", default=None, help="JSON string request body, for POST/PUT")
     parser.add_argument(
@@ -284,7 +284,9 @@ def main() -> int:
 
     print(f"\n--- 1) unauthenticated {args.method} {args.url}")
     try:
-        first = requests.request(args.method, args.url, json=body, headers=headers, timeout=30)
+        first = requests.request(
+            args.method, args.url, json=body, headers=headers, timeout=30, allow_redirects=False,
+        )
     except requests.RequestException as error:
         print(
             f"error: initial request failed ({type(error).__name__}); no payment was signed",
@@ -292,6 +294,14 @@ def main() -> int:
         )
         return 1
     print(f"HTTP {first.status_code}")
+
+    if 300 <= first.status_code < 400:
+        print(
+            "error: initial request returned a redirect status. "
+            "Use the final endpoint URL; no payment was signed",
+            file=sys.stderr,
+        )
+        return 1
 
     if first.status_code != 402:
         print("Expected 402 Payment Required. Response body:")
@@ -380,6 +390,7 @@ def main() -> int:
             json=body,
             headers={**headers, "PAYMENT-SIGNATURE": payment_header},
             timeout=30,
+            allow_redirects=False,
         )
     except requests.RequestException:
         print(
@@ -388,6 +399,14 @@ def main() -> int:
         )
         return 1
     print(f"HTTP {second.status_code}")
+
+    if 300 <= second.status_code < 400:
+        print(
+            "error: signed request returned a redirect status. "
+            "Reconcile the original payment before retrying with the final endpoint URL",
+            file=sys.stderr,
+        )
+        return 1
 
     settlement = None
     settle_header = second.headers.get("PAYMENT-RESPONSE")

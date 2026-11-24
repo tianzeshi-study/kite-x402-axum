@@ -89,6 +89,34 @@ class ClientSettlementTests(unittest.TestCase):
                 self.assertEqual(send.call_count, 1)
                 sign.assert_not_called()
 
+    def test_initial_redirect_stops_before_signing(self):
+        redirected = response(302, Location="/v1/final")
+        with patch.object(client, "build_payment_header") as sign:
+            status, errors, send = self.run_client(redirected)
+
+        self.assertEqual(status, 1)
+        self.assertIn("Use the final endpoint URL", errors)
+        self.assertNotIn("To reconcile this authorization:", errors)
+        sign.assert_not_called()
+        send.assert_called_once()
+        self.assertIs(send.call_args.kwargs["allow_redirects"], False)
+
+    def test_signed_redirect_requires_reconciliation_even_with_a_receipt(self):
+        redirected = response(
+            307, Location="/v1/final", **{"Payment-Response": encode_header(self.receipt)}
+        )
+        status, errors, send = self.run_client(self.challenge, redirected)
+
+        self.assertEqual(status, 1)
+        self.assertIn("Reconcile the original payment before retrying", errors)
+        self.assertEqual(send.call_count, 2)
+        signed_request = send.call_args_list[1]
+        self.assertEqual(signed_request.args[1], URL)
+        self.assertIs(signed_request.kwargs["allow_redirects"], False)
+        payment = client.b64_decode_json(signed_request.kwargs["headers"]["PAYMENT-SIGNATURE"])
+        nonce = payment["payload"]["authorization"]["nonce"]
+        self.assertIn(f"--nonce {nonce}", errors)
+
     def test_payment_signature_carries_the_challenge_resource(self):
         settled = response(200, **{"Payment-Response": encode_header(self.receipt)})
         status, _, send = self.run_client(self.challenge, settled)
