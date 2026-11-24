@@ -44,7 +44,7 @@ use health::ReadinessState;
 use rate_limit::{
     rate_limit_middleware, RateLimiterConfig, TokenBucketRateLimiter, TrustedProxies,
 };
-use route_prices::{route_payment, RoutePrices};
+use route_prices::{route_payment, validate_payment_options, RoutePrices};
 
 #[tokio::main]
 async fn main() {
@@ -75,6 +75,15 @@ async fn main() {
         .unwrap_or_else(|e| panic!("invalid KITE_NETWORK={network_name:?}: {e}"));
     let facilitator_url = env_or("FACILITATOR_URL", FACILITATOR_URL);
     let extra_payment_options = parse_extra_payment_options(&env_or("EXTRA_PAYMENT_OPTIONS", ""));
+    if !extra_payment_options.is_empty() {
+        let primary_payment_option = PaymentOption::new(chain, price_usd.clone());
+        validate_payment_options(
+            &primary_payment_option,
+            &extra_payment_options,
+            "default payment options",
+        )
+        .unwrap_or_else(|err| panic!("invalid EXTRA_PAYMENT_OPTIONS: {err}"));
+    }
     let description = env_or("SERVICE_DESCRIPTION", "Paid API access via Kite x402");
     let upstream_auth_header = env_or("UPSTREAM_AUTH_HEADER", "Authorization");
     let upstream_auth_value = env_or("UPSTREAM_AUTH_VALUE", "");
