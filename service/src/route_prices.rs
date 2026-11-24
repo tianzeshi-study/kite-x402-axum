@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -58,8 +58,13 @@ impl RoutePrices {
     pub(super) fn parse(
         value: &str,
         default: Arc<PaymentConfig>,
-        extras: Vec<PaymentOption>,
+        default_extras: Vec<PaymentOption>,
     ) -> Result<Self, String> {
+        if !default_extras.is_empty() {
+            let default_option = PaymentOption::new(default.chain, default.price_usd.clone());
+            validate_payment_options(&default_option, &default_extras, "default payment options")?;
+        }
+
         let mut overrides: HashMap<String, HashMap<Method, RoutePrice>> = HashMap::new();
         if !value.trim().is_empty() {
             let rules: Vec<Rule> = serde_json::from_str(value).map_err(|err| err.to_string())?;
@@ -81,13 +86,21 @@ impl RoutePrices {
                     .extra_payment_options
                     .map(|extras| parse_extra_options(extras, index + 1))
                     .transpose()?;
-                let price = RoutePrice {
-                    primary: Arc::new(PaymentConfig {
-                        price_usd: rule.price,
-                        ..default.as_ref().clone()
-                    }),
-                    extras,
-                };
+                let primary = Arc::new(PaymentConfig {
+                    price_usd: rule.price,
+                    ..default.as_ref().clone()
+                });
+                let effective_extras = extras.as_deref().unwrap_or(&default_extras);
+                if !effective_extras.is_empty() {
+                    let primary_option =
+                        PaymentOption::new(primary.chain, primary.price_usd.clone());
+                    validate_payment_options(
+                        &primary_option,
+                        effective_extras,
+                        &format!("rule {} payment options", index + 1),
+                    )?;
+                }
+                let price = RoutePrice { primary, extras };
                 if overrides
                     .entry(rule.path)
                     .or_default()
@@ -101,7 +114,7 @@ impl RoutePrices {
         Ok(Self {
             default,
             overrides,
-            extras,
+            extras: default_extras,
         })
     }
 
@@ -127,6 +140,32 @@ impl RoutePrices {
     pub(super) fn has_overrides(&self) -> bool {
         !self.overrides.is_empty()
     }
+}
+
+/// Reject duplicate wire-level payment requirements before serving a 402 challenge.
+///
+/// Prices are normalized to asset units so equivalent values such as `"0.05"`
+/// and `"$0.05"` cannot appear as separate choices. Invalid prices are left to
+/// the request-time validation used by the existing payment middleware.
+pub(super) fn validate_payment_options(
+    primary: &PaymentOption,
+    extras: &[PaymentOption],
+    context: &str,
+) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for (index, option) in std::iter::once(primary).chain(extras.iter()).enumerate() {
+        let Ok(amount) = option.chain.parse_price(&option.price_usd) else {
+            continue;
+        };
+        let key = (option.chain.network, amount.asset, amount.amount);
+        if !seen.insert(key) {
+            return Err(format!(
+                "{context} option {} duplicates an earlier payment option",
+                index + 1
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_extra_options(

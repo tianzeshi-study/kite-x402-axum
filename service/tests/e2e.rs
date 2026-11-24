@@ -1445,6 +1445,10 @@ fn route_prices_reject_invalid_configuration_at_startup() {
             "extra_payment_options entry 1 has an invalid USD price",
         ),
         (
+            with_extras(json!([{"network": "mainnet", "price": "0.001"}])),
+            "rule 1 payment options option 2 duplicates an earlier payment option",
+        ),
+        (
             json!([&rule, &rule]).to_string(),
             "duplicates a method and path",
         ),
@@ -2955,5 +2959,28 @@ fn refuses_malformed_extra_payment_options() {
             stderr.contains("EXTRA_PAYMENT_OPTIONS"),
             "{value}: {stderr}"
         );
+    }
+}
+
+#[test]
+fn refuses_duplicate_extra_payment_options() {
+    for (value, expected_error) in [
+        (
+            "mainnet:0.001",
+            "default payment options option 2 duplicates an earlier payment option",
+        ),
+        (
+            "mainnet:0.05,mainnet:$0.05",
+            "default payment options option 3 duplicates an earlier payment option",
+        ),
+    ] {
+        let (status, stderr) = run_expecting_failure(vec![
+            ("PAY_TO", PAY_TO),
+            ("UPSTREAM_URL", "http://localhost:1"),
+            ("EXTRA_PAYMENT_OPTIONS", value),
+            ("RUST_LOG", "off"),
+        ]);
+        assert!(!status.success(), "{value} must fail startup");
+        assert!(stderr.contains(expected_error), "{value}: {stderr}");
     }
 }
