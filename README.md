@@ -178,6 +178,15 @@ settlement receipt for the requested network and a nonempty transaction ID.
 When the client reports an unconfirmed settlement, reconcile the original
 payment before signing another authorization.
 
+With `EXTRA_PAYMENT_OPTIONS` or `ROUTE_PRICES_USD` the challenge can offer
+several payment options. The Python test client pays the first one unless
+`--network <CAIP-2>` names another (for example `--network eip155:2368` for
+Kite testnet); a network the challenge does not offer stops the client
+before it signs. No single payment may cost more than **$1** unless you
+raise the limit with `--max-usd` (or `X402_MAX_PAYMENT_USD`); `--max-usd 0`
+removes it. A pricier challenge is refused before anything is signed, and
+so is one on a network whose token decimals the client does not know.
+
 ### Reconcile an uncertain Kite payment
 
 Before sending `PAYMENT-SIGNATURE`, the Python client prints a reconciliation
