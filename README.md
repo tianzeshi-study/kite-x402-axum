@@ -493,10 +493,26 @@ Each record contains `network`, `transaction`, `payer`, `pay_to`,
 the facilitator supplied no hash. Amounts are decimal strings, or `null` if
 the amount is unknown or reached the ledger's `u64` limit. `reported_success`
 means the service accepted a successful receipt. `unconfirmed` covers
-rejections, incomplete receipts, and unknown outcomes such as timeouts. Use
-the buyer's original authorization details and the [chain reconciliation
-command](#reconcile-an-uncertain-kite-payment) before attempting another
-payment with an unknown outcome.
+rejections, incomplete receipts, and unknown outcomes such as timeouts.
+
+When a Kite EIP-3009 attempt is `unconfirmed` and has no transaction hash,
+`GET /settlements` includes a `reconciliation` object if the service has all
+the original authorization details. It contains `network`, `asset`, `payer`,
+`pay_to`, `amount_atomic`, and `nonce`. The nested amount is the full decimal
+amount from the signed authorization, including amounts above the ledger's
+`u64` limit. The object carries no payment signature. It is omitted if the
+original authorization is incomplete or uses a different payment format.
+
+Select the attempt you want to check and copy its `reconciliation` fields into
+this command to check the observed chain state by nonce. See [reconciliation
+results](#reconcile-an-uncertain-kite-payment) for the possible outcomes.
+Reconcile an unknown outcome before retrying.
+
+```sh
+python service/scripts/kite_x402_reconcile.py \
+  --network "$NETWORK" --asset "$ASSET" --payer "$PAYER" \
+  --pay-to "$PAY_TO" --amount "$AMOUNT_ATOMIC" --nonce "$NONCE"
+```
 
 The ledger retains up to 5,000 entries per process and clears on restart.
 Requests that never reach settlement create no record. To disable recording

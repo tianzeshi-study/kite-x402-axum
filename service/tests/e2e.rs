@@ -21,8 +21,8 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use common::{
-    payment_header, settle_failed, settle_ok, verify_invalid, Mocks, Reply, UpstreamReply, PAYER,
-    TX_HASH,
+    encode_payload, payload_for, payment_header, settle_failed, settle_ok, verify_invalid, Mocks,
+    Reply, UpstreamReply, PAYER, TX_HASH,
 };
 use kite_x402_axum::types::PaymentRequirements;
 use serde_json::{json, Value};
@@ -760,12 +760,37 @@ async fn settlement_queries_show_recent_and_hash_indexed_attempts() {
     assert_eq!(stored["payer"], PAYER);
     assert_eq!(stored["pay_to"], PAY_TO);
     assert_eq!(stored["amount_atomic"], "2000000000000000");
+    assert!(stored.get("reconciliation").is_none());
 
+    mocks
+        .facilitator
+        .set_verify(Reply::Json(json!({ "isValid": true })));
     mocks.facilitator.set_settle(Reply::Delayed(
         Duration::from_secs(10),
         json!({ "success": false }),
     ));
-    assert_eq!(svc.pay_get("/v1/forecast").await.status(), 402);
+    let requirements = svc.requirements("/v1/forecast").await;
+    let payer = "0x11223344556677889900AABBCCDDEEFF00112233";
+    let nonce = format!("0x{}", "AB".repeat(32));
+    let amount = "20000000000000000000";
+    let mut payment = payload_for(&requirements);
+    payment.payload["authorization"] = json!({
+        "from": payer,
+        "to": requirements.pay_to,
+        "value": amount,
+        "nonce": nonce,
+    });
+    let signed = svc
+        .http
+        .get(svc.url("/v1/forecast"))
+        .header("PAYMENT-SIGNATURE", encode_payload(&payment))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(signed.status(), 402);
+    assert!(header_json(&signed, "payment-response")
+        .get("reconciliation")
+        .is_none());
     let latest = svc
         .http
         .get(format!("{recent_url}?limit=1"))
@@ -777,7 +802,19 @@ async fn settlement_queries_show_recent_and_hash_indexed_attempts() {
     assert_eq!(latest.len(), 1);
     assert_eq!(latest[0]["status"], "unconfirmed");
     assert_eq!(latest[0]["transaction"], Value::Null);
+    assert_eq!(latest[0]["amount_atomic"], requirements.amount);
     assert!(!latest[0].as_object().unwrap().contains_key("error_reason"));
+    assert_eq!(
+        latest[0]["reconciliation"],
+        json!({
+            "network": requirements.network,
+            "asset": requirements.asset.to_ascii_lowercase(),
+            "payer": payer.to_ascii_lowercase(),
+            "pay_to": PAY_TO.to_ascii_lowercase(),
+            "amount_atomic": amount,
+            "nonce": nonce.to_ascii_lowercase(),
+        })
+    );
     assert_eq!(
         mocks.timeline(),
         ["verify", "upstream", "settle", "verify", "upstream", "settle"]

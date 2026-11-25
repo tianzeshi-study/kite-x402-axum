@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 /// An immutable record of an x402 payment settlement event.
@@ -28,6 +29,30 @@ pub struct SettlementRecord {
     pub error_reason: Option<String>,
 }
 
+/// 无交易哈希时用于查询 Kite 链上付款的 EIP-3009 授权参数。
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct SettlementReconciliation {
+    /// 匹配的付款网络（CAIP-2）。
+    pub network: String,
+    /// Kite 代币合约地址。
+    pub asset: String,
+    /// 原授权中的付款地址。
+    pub payer: String,
+    /// 原授权中的收款地址。
+    pub pay_to: String,
+    /// 原授权中的原子单位金额，表示为十进制 uint256 字符串。
+    pub amount_atomic: String,
+    /// 原授权中的 32 字节 nonce。
+    pub nonce: String,
+}
+
+impl fmt::Debug for SettlementReconciliation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SettlementReconciliation")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Aggregate statistics for the records currently retained in the ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerSummary {
@@ -41,7 +66,7 @@ pub struct LedgerSummary {
 
 #[derive(Debug)]
 struct Inner {
-    records: VecDeque<SettlementRecord>,
+    records: VecDeque<(SettlementRecord, Option<SettlementReconciliation>)>,
     by_tx: HashMap<(String, String), SettlementRecord>,
     by_payer: HashMap<String, Vec<SettlementRecord>>,
     max_records: usize,
@@ -99,6 +124,14 @@ impl SettlementLedger {
     /// A failed record can be replaced by a confirmation, but a confirmation
     /// is immutable. Attempts without a transaction hash remain independent.
     pub fn record(&self, record: SettlementRecord) {
+        self.record_with_reconciliation(record, None);
+    }
+
+    pub(crate) fn record_with_reconciliation(
+        &self,
+        record: SettlementRecord,
+        reconciliation: Option<SettlementReconciliation>,
+    ) {
         let mut inner = self.inner.lock().expect("settlement ledger mutex poisoned");
 
         if let Some(key) = transaction_key(&record) {
@@ -106,7 +139,7 @@ impl SettlementLedger {
                 if previous.success {
                     return;
                 }
-                if let Some(index) = inner.records.iter().position(|item| item == &previous) {
+                if let Some(index) = inner.records.iter().position(|(item, _)| item == &previous) {
                     inner.records.remove(index);
                 }
                 inner.remove_indexes(&previous);
@@ -115,7 +148,7 @@ impl SettlementLedger {
 
         // Enforce capacity limit
         if inner.records.len() >= inner.max_records {
-            if let Some(evicted) = inner.records.pop_front() {
+            if let Some((evicted, _)) = inner.records.pop_front() {
                 inner.remove_indexes(&evicted);
             }
         }
@@ -129,7 +162,7 @@ impl SettlementLedger {
             .entry(payer)
             .or_default()
             .push(record.clone());
-        inner.records.push_back(record);
+        inner.records.push_back((record, reconciliation));
     }
 
     /// Retrieves a transaction only when its hash identifies one retained network.
@@ -174,7 +207,7 @@ impl SettlementLedger {
                 successful_count: 0,
                 failed_count: 0,
             },
-            |mut summary, record| {
+            |mut summary, (record, _)| {
                 if record.success {
                     summary.successful_count += 1;
                     summary.total_settled_volume =
@@ -193,6 +226,22 @@ impl SettlementLedger {
     /// scanning the whole retained history.
     #[must_use]
     pub fn recent(&self, limit: usize) -> Vec<SettlementRecord> {
+        let inner = self.inner.lock().expect("settlement ledger mutex poisoned");
+        inner
+            .records
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|(record, _)| record.clone())
+            .collect()
+    }
+
+    /// 返回最近的结算记录及可用的对账参数，最新记录排在最前。
+    #[must_use]
+    pub fn recent_with_reconciliation(
+        &self,
+        limit: usize,
+    ) -> Vec<(SettlementRecord, Option<SettlementReconciliation>)> {
         let inner = self.inner.lock().expect("settlement ledger mutex poisoned");
         inner.records.iter().rev().take(limit).cloned().collect()
     }
@@ -334,6 +383,40 @@ mod tests {
         let recent = ledger.recent(10);
         assert_eq!(recent.len(), 1, "a confirmation replaces its failed record");
         assert!(recent[0].success);
+    }
+
+    #[test]
+    fn reconciliation_details_follow_their_attempt_through_eviction() {
+        let ledger = SettlementLedger::new(100);
+        let unconfirmed = record("", "a", false);
+        let first = SettlementReconciliation {
+            network: unconfirmed.network.clone(),
+            asset: "asset".into(),
+            payer: unconfirmed.payer.clone(),
+            pay_to: unconfirmed.pay_to.clone(),
+            amount_atomic: "7".into(),
+            nonce: "first".into(),
+        };
+        let second = SettlementReconciliation {
+            nonce: "second".into(),
+            ..first.clone()
+        };
+        ledger.record_with_reconciliation(unconfirmed.clone(), Some(first.clone()));
+        ledger.record_with_reconciliation(unconfirmed.clone(), Some(second.clone()));
+        assert_eq!(
+            ledger.recent_with_reconciliation(2),
+            vec![
+                (unconfirmed.clone(), Some(second.clone())),
+                (unconfirmed.clone(), Some(first))
+            ]
+        );
+
+        for i in 0..99 {
+            ledger.record(record(&format!("tx-{i}"), "a", true));
+        }
+        let retained = ledger.recent_with_reconciliation(100);
+        assert_eq!(retained.last(), Some(&(unconfirmed, Some(second))));
+        assert!(retained[..99].iter().all(|(_, details)| details.is_none()));
     }
 
     #[test]

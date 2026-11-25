@@ -99,7 +99,9 @@ pub use nonce_guard::{NonceReplayError, PaymentNonceReplayGuard, PaymentNonceRes
 pub use payment_options::{find_matching_requirements, requirements_all, PaymentOption};
 pub use proxy::{proxy, UpstreamConfig};
 pub use security_headers::SecurityHeadersConfig;
-pub use settlement_ledger::{LedgerSummary, SettlementLedger, SettlementRecord};
+pub use settlement_ledger::{
+    LedgerSummary, SettlementLedger, SettlementReconciliation, SettlementRecord,
+};
 pub use sliding_limiter::{SlidingWindowConfig, SlidingWindowLimiter};
 pub use webhook::{
     DeliveryStatus, WebhookConfig, WebhookDeliveryRecord, WebhookDispatcher, WebhookEventType,
