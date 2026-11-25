@@ -64,7 +64,7 @@ async fn main() {
         .parse()
         .expect("PORT must be a number");
 
-    let pay_to = require_pay_to(env::var("PAY_TO").unwrap_or_default());
+    let pay_to = require_pay_to(&env::var("PAY_TO").unwrap_or_default());
     let upstream_url = env::var("UPSTREAM_URL")
         .expect("UPSTREAM_URL is required (the API being wrapped)")
         .trim_end_matches('/')
@@ -766,7 +766,7 @@ fn display_price(price_usd: &str) -> String {
 
 /// `PAY_TO` must be present and be the 20-byte address the facilitator will
 /// settle to. The catalog schema uses the same `0x` + 40 hex pattern.
-fn require_pay_to(raw: String) -> String {
+fn require_pay_to(raw: &str) -> String {
     let pay_to = raw.trim().to_owned();
     if pay_to.is_empty() {
         panic!("PAY_TO is required (the wallet that receives payment)");
@@ -1086,7 +1086,7 @@ mod tests {
     #[test]
     fn pay_to_must_be_a_20_byte_hex_address() {
         assert_eq!(
-            require_pay_to("  0xE2E0000000000000000000000000000000000E2E  ".into()),
+            require_pay_to("  0xE2E0000000000000000000000000000000000E2E  "),
             "0xE2E0000000000000000000000000000000000E2E"
         );
         for bad in [
@@ -1096,7 +1096,7 @@ mod tests {
             "not-an-address",
             "0xZZZZ000000000000000000000000000000000000",
         ] {
-            let result = std::panic::catch_unwind(|| require_pay_to(bad.into()));
+            let result = std::panic::catch_unwind(|| require_pay_to(bad));
             assert!(result.is_err(), "{bad} should be rejected");
         }
     }
