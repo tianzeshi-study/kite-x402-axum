@@ -8,7 +8,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use kite_x402_axum::{SettlementLedger, SettlementRecord};
+use kite_x402_axum::{SettlementLedger, SettlementReconciliation, SettlementRecord};
 use serde::{Deserialize, Serialize};
 
 pub(crate) fn configured_port() -> Result<Option<u16>, &'static str> {
@@ -64,6 +64,8 @@ struct Entry {
     amount_atomic: Option<String>,
     timestamp_secs: u64,
     status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reconciliation: Option<SettlementReconciliation>,
 }
 
 impl From<SettlementRecord> for Entry {
@@ -84,6 +86,7 @@ impl From<SettlementRecord> for Entry {
             } else {
                 "unconfirmed"
             },
+            reconciliation: None,
         }
     }
 }
@@ -102,7 +105,14 @@ async fn recent(
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok(Json(
-        ledger.recent(limit).into_iter().map(Entry::from).collect(),
+        ledger
+            .recent_with_reconciliation(limit)
+            .into_iter()
+            .map(|(record, reconciliation)| Entry {
+                reconciliation,
+                ..Entry::from(record)
+            })
+            .collect(),
     ))
 }
 

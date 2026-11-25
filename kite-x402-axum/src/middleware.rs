@@ -19,8 +19,9 @@ use serde_json::json;
 
 use crate::{
     facilitator::FacilitatorClient,
-    kite::KiteChain,
-    types::{PaymentRequired, PaymentRequirements, ResourceInfo},
+    kite::{KiteChain, KITE_MAINNET, KITE_TESTNET},
+    settlement_ledger::SettlementReconciliation,
+    types::{PaymentPayload, PaymentRequired, PaymentRequirements, ResourceInfo},
     wire::{decode_payment_payload, encode_payment_required, encode_settle_response},
 };
 
@@ -202,12 +203,61 @@ fn atomic_amount(requirements: &PaymentRequirements, settle: &crate::types::Sett
         .unwrap_or(0)
 }
 
-/// Appends one settle outcome to the configured ledger, if any. Called only
-/// after a settle attempt (including one whose outcome is unknown), and only
-/// with the requirements the buyer actually matched, so the record's amount,
-/// asset and `payTo` describe the payment that was attempted.
+fn reconciliation_details(
+    payload: &PaymentPayload,
+    requirements: &PaymentRequirements,
+) -> Option<SettlementReconciliation> {
+    const MAX_UINT256: &str =
+        "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+
+    fn fixed_hex(value: &str, bytes: usize) -> Option<String> {
+        let digits = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))?;
+        (digits.len() == bytes * 2 && digits.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| format!("0x{}", digits.to_ascii_lowercase()))
+    }
+
+    if requirements.scheme != "exact" {
+        return None;
+    }
+    let chain = [KITE_MAINNET, KITE_TESTNET].into_iter().find(|chain| {
+        chain.network == requirements.network
+            && chain
+                .asset_address
+                .eq_ignore_ascii_case(&requirements.asset)
+    })?;
+    let authorization = payload.payload.get("authorization")?;
+    let payer = fixed_hex(authorization.get("from")?.as_str()?, 20)?;
+    let pay_to = fixed_hex(authorization.get("to")?.as_str()?, 20)?;
+    if !pay_to.eq_ignore_ascii_case(&requirements.pay_to) {
+        return None;
+    }
+    let nonce = fixed_hex(authorization.get("nonce")?.as_str()?, 32)?;
+    let value = authorization.get("value")?.as_str()?;
+    let amount = value.trim_start_matches('0');
+    if amount.is_empty()
+        || amount.len() > MAX_UINT256.len()
+        || !amount.bytes().all(|b| b.is_ascii_digit())
+        || (amount.len() == MAX_UINT256.len() && amount > MAX_UINT256)
+    {
+        return None;
+    }
+
+    Some(SettlementReconciliation {
+        network: chain.network.to_owned(),
+        asset: chain.asset_address.to_ascii_lowercase(),
+        payer,
+        pay_to,
+        amount_atomic: amount.to_owned(),
+        nonce,
+    })
+}
+
+/// 使用买家匹配的付款选项记录结算结果。只有未获得交易哈希时才附上链上对账参数。
 fn record_settlement(
     cfg: &PaymentConfig,
+    payload: &PaymentPayload,
     requirements: &PaymentRequirements,
     verified_payer: Option<&str>,
     settle: &crate::types::SettleResponse,
@@ -242,7 +292,12 @@ fn record_settlement(
         network = %record.network,
         "Recording settlement outcome in ledger"
     );
-    ledger.record(record);
+    let reconciliation = if !record.success && record.tx_hash.trim().is_empty() {
+        reconciliation_details(payload, requirements)
+    } else {
+        None
+    };
+    ledger.record_with_reconciliation(record, reconciliation);
 }
 
 /// Shared gate engine.
@@ -555,7 +610,13 @@ async fn payment_gate_inner(
             // rather than known-failed. Record it (no transaction hash) so an
             // operator can find and reconcile this attempt instead of only
             // having it in a log line.
-            record_settlement(cfg, requirements, verify.payer.as_deref(), &failure);
+            record_settlement(
+                cfg,
+                &payload,
+                requirements,
+                verify.payer.as_deref(),
+                &failure,
+            );
             return settlement_failure_response(&failure);
         }
     };
@@ -594,7 +655,13 @@ async fn payment_gate_inner(
             error_reason = ?settle.error_reason,
             "Payment settlement audit: failed"
         );
-        record_settlement(cfg, requirements, verify.payer.as_deref(), &settle);
+        record_settlement(
+            cfg,
+            &payload,
+            requirements,
+            verify.payer.as_deref(),
+            &settle,
+        );
         return settlement_failure_response(&settle);
     }
 
@@ -620,7 +687,13 @@ async fn payment_gate_inner(
         settle = ?settle,
         "Full settlement response details"
     );
-    record_settlement(cfg, requirements, verify.payer.as_deref(), &settle);
+    record_settlement(
+        cfg,
+        &payload,
+        requirements,
+        verify.payer.as_deref(),
+        &settle,
+    );
 
     let (mut parts, body) = response.into_parts();
     parts.headers.insert(
@@ -947,6 +1020,51 @@ mod tests {
         let d = (*c).clone();
         assert_eq!(d.pay_to, PAY_TO);
         assert!(format!("{d:?}").contains("Unit test service"));
+    }
+
+    #[test]
+    fn reconciliation_details_require_a_supported_payment_and_valid_authorization() {
+        let req = config(KITE_MAINNET, "0.001").requirements().unwrap();
+        let max = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+        let payer = "0x11223344556677889900aabbccddeeff00112233";
+        let nonce = format!("0x{}", "55".repeat(32));
+        let mut payment = PaymentPayload {
+            x402_version: 2,
+            resource: None,
+            accepted: req.clone(),
+            payload: json!({
+                "authorization": {
+                    "from": payer,
+                    "to": req.pay_to,
+                    "value": format!("0{max}"),
+                    "nonce": nonce,
+                },
+            }),
+            extensions: None,
+        };
+        let details = reconciliation_details(&payment, &req).unwrap();
+        assert_eq!(details.network, KITE_MAINNET.network);
+        assert_eq!(details.amount_atomic, max);
+
+        let other_asset = PaymentRequirements {
+            asset: KITE_TESTNET.asset_address.to_owned(),
+            ..req.clone()
+        };
+        assert!(reconciliation_details(&payment, &other_asset).is_none());
+        for invalid in [
+            "0",
+            "1.5",
+            "115792089237316195423570985008687907853269984665640564039457584007913129639936",
+        ] {
+            payment.payload["authorization"]["value"] = json!(invalid);
+            assert!(reconciliation_details(&payment, &req).is_none());
+        }
+        payment.payload["authorization"]["value"] = json!("1000");
+        payment.payload["authorization"]["to"] = json!(payer);
+        assert!(reconciliation_details(&payment, &req).is_none());
+        payment.payload["authorization"]["to"] = json!(req.pay_to);
+        payment.payload["authorization"]["nonce"] = json!("0xabc");
+        assert!(reconciliation_details(&payment, &req).is_none());
     }
 
     #[test]
