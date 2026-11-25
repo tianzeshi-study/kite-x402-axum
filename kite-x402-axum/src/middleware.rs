@@ -198,13 +198,16 @@ fn absolute_resource_url(req: &Request, path_and_query: &str) -> String {
 }
 
 /// Accepts a host or host:port and rejects anything that could change the URL
-/// structure (spaces, slashes, userinfo).
+/// structure. Besides whitespace and non-graphic bytes, this rejects the
+/// userinfo delimiter (`@`), path separators (`/`, `\`), and the query and
+/// fragment delimiters (`?`, `#`) — all of which would let a hostile `Host`
+/// turn the advertised `resource.url` into a different URL.
 fn is_resource_host(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= 262
         && host
             .bytes()
-            .all(|b| b.is_ascii_graphic() && b != b'/' && b != b'\\' && b != b'@')
+            .all(|b| b.is_ascii_graphic() && !matches!(b, b'/' | b'\\' | b'@' | b'?' | b'#'))
 }
 
 fn forwarded_scheme(req: &Request) -> Option<&'static str> {
@@ -1353,15 +1356,22 @@ mod tests {
 
     #[tokio::test]
     async fn resource_url_ignores_a_host_that_could_rewrite_the_url() {
-        let (svc, _) = gate(config(KITE_TESTNET, "0.001"));
-        let resp = svc
-            .oneshot(request("/v1/x", &[("host", "evil.example/other")]))
-            .await
-            .unwrap();
-        assert_eq!(
-            decode_header(&resp, "PAYMENT-REQUIRED")["resource"]["url"],
-            "/v1/x"
-        );
+        for host in [
+            "evil.example/other",
+            "evil.example?x=1",
+            "evil.example#frag",
+        ] {
+            let (svc, _) = gate(config(KITE_TESTNET, "0.001"));
+            let resp = svc
+                .oneshot(request("/v1/x", &[("host", host)]))
+                .await
+                .unwrap();
+            assert_eq!(
+                decode_header(&resp, "PAYMENT-REQUIRED")["resource"]["url"],
+                "/v1/x",
+                "host {host} must not change the URL structure"
+            );
+        }
     }
 
     #[tokio::test]
