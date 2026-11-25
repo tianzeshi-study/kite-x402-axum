@@ -81,6 +81,7 @@ pub mod sliding_limiter;
 pub mod types;
 /// Webhook event types and a retrying dispatcher for payment notifications.
 pub mod webhook;
+pub mod webhook_signing;
 pub mod wire;
 
 pub use cache_store::{CachedVerification, VerificationCacheStore};
@@ -106,4 +107,7 @@ pub use sliding_limiter::{SlidingWindowConfig, SlidingWindowLimiter};
 pub use webhook::{
     DeliveryStatus, WebhookConfig, WebhookDeliveryRecord, WebhookDispatcher, WebhookEventType,
     WebhookPayload,
+};
+pub use webhook_signing::{
+    sign_payload, verify_signature, verify_signature_at, SIGNATURE_HEADER, TIMESTAMP_HEADER,
 };
