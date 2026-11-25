@@ -74,10 +74,10 @@ impl From<SettlementRecord> for Entry {
             transaction: (!transaction.is_empty()).then(|| transaction.to_owned()),
             payer: record.payer,
             pay_to: record.pay_to,
-            // 账本将未知金额记作 0，并将超出范围的金额截为 u64::MAX。
-            amount_atomic: (1..u64::MAX)
-                .contains(&record.amount)
-                .then(|| record.amount.to_string()),
+            // The ledger uses 0 as the single "unknown / overflow" fallback;
+            // u64::MAX is a representable amount and must be shown, not hidden
+            // as a sentinel (the old upper bound predated that contract).
+            amount_atomic: (record.amount > 0).then(|| record.amount.to_string()),
             timestamp_secs: record.timestamp_secs,
             status: if record.success {
                 "reported_success"
@@ -124,4 +124,28 @@ async fn by_transaction(
         .get_by_network_tx(&network, &transaction)
         .map(|record| Json(Entry::from(record)))
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entry_must_not_hide_a_legitimate_u64_max_amount() {
+        // Since #142, atomic_amount parses into u64 and uses 0 as the sole
+        // "unknown/overflow" fallback. u64::MAX itself is a representable,
+        // legitimate amount and can be stored in the ledger. The query view
+        // must not treat it as a sentinel and hide it as null.
+        let entry = Entry::from(SettlementRecord {
+            tx_hash: "0xabc".into(),
+            payer: "0xp".into(),
+            pay_to: "0xq".into(),
+            amount: u64::MAX,
+            network: "eip155:2368".into(),
+            timestamp_secs: 1,
+            success: true,
+            error_reason: None,
+        });
+        assert_eq!(entry.amount_atomic.as_deref(), Some("18446744073709551615"));
+    }
 }
