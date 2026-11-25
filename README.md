@@ -172,11 +172,24 @@ A receipt that fails either check returns `402` with `success: false` and
 `errorReason: invalid_settlement_receipt` in `PAYMENT-RESPONSE`. The reported
 network and transaction are kept for reconciliation before signing again.
 
+Use the final endpoint URL with the Python client. A `3xx` response stops
+it at either request. If the signed request returns `3xx`, run the printed
+reconciliation command before retrying.
+
 The [Python test client](service/scripts/kite_x402_client.py) exits with `0`
 only after receiving a payment challenge and a successful HTTP response with a
 settlement receipt for the requested network and a nonempty transaction ID.
 When the client reports an unconfirmed settlement, reconcile the original
 payment before signing another authorization.
+
+With `EXTRA_PAYMENT_OPTIONS` or `ROUTE_PRICES_USD` the challenge can offer
+several payment options. The Python test client pays the first one unless
+`--network <CAIP-2>` names another (for example `--network eip155:2368` for
+Kite testnet); a network the challenge does not offer stops the client
+before it signs. No single payment may cost more than **$1** unless you
+raise the limit with `--max-usd` (or `X402_MAX_PAYMENT_USD`); `--max-usd 0`
+removes it. A pricier challenge is refused before anything is signed, and
+so is one on a network whose token decimals the client does not know.
 
 ### Reconcile an uncertain Kite payment
 
@@ -254,6 +267,7 @@ The service exposes endpoints outside `/v1/*` that are unmetered (free) and neve
 | `FACILITATOR_VERIFY_RETRIES` | `0` | Retries for facilitator verify on transient failures. |
 | `FACILITATOR_VERIFY_BACKOFF_MS` | `150` | Backoff between verify retries in milliseconds. |
 | `FACILITATOR_SETTLE_RETRIES` | `0` | Must be 0 — settlement is never retried (indeterminate outcomes stay visible). |
+| `SETTLEMENT_QUERY_PORT` | Empty (off) | Enables [local settlement queries](#merchant-settlement-queries) on a separate IPv4 loopback port. |
 | `FACILITATOR_HEALTH_INTERVAL_SECS` | Empty (off) | Background facilitator probe interval; 60..=86400 enables. |
 | `PAYMENT_CLOCK_DRIFT_SECS` | Empty (off) | Enables the expiration guard with this clock-drift tolerance. |
 | `PAYMENT_REPLAY_CACHE_SIZE` | Empty (off) | Enables nonce replay protection with this cache capacity (1..=1000000). |
@@ -453,6 +467,40 @@ go wrong:
 
 See [`TODO.md`](TODO.md) for other known follow-ups (an upstream
 SDK-disagreement decision that may need revisiting, a live testnet run, etc.).
+
+### Merchant settlement queries
+
+Set `SETTLEMENT_QUERY_PORT=8412` to record settlement attempts and enable the
+query listener on `127.0.0.1:8412`. Use the numeric address in requests. The
+listener only accepts the configured loopback address and port as the HTTP
+host. In a container, run the query from within its network namespace. Local
+processes that can reach the listener can read the records. Enable this port
+only in a trusted network namespace.
+
+```sh
+curl --fail-with-body 'http://127.0.0.1:8412/settlements?limit=20'
+curl --fail-with-body "http://127.0.0.1:8412/settlements/eip155:2368/$TX_HASH"
+```
+
+`GET /settlements` returns a JSON array, newest entries first. `limit` defaults
+to 20 and accepts 1 through 100. `GET /settlements/{network}/{transaction}`
+returns one record for an `eip155` chain ID and a 32-byte `0x` transaction hash.
+Invalid input returns `400`, an unrecognized host returns `403`, and a missing
+record returns `404`. Responses use `Cache-Control: no-store`.
+
+Each record contains `network`, `transaction`, `payer`, `pay_to`,
+`amount_atomic`, `timestamp_secs`, and `status`. `transaction` is `null` if
+the facilitator supplied no hash. Amounts are decimal strings, or `null` if
+the amount is unknown or reached the ledger's `u64` limit. `reported_success`
+means the service accepted a successful receipt. `unconfirmed` covers
+rejections, incomplete receipts, and unknown outcomes such as timeouts. Use
+the buyer's original authorization details and the [chain reconciliation
+command](#reconcile-an-uncertain-kite-payment) before attempting another
+payment with an unknown outcome.
+
+The ledger retains up to 5,000 entries per process and clears on restart.
+Requests that never reach settlement create no record. To disable recording
+and querying, unset the port and restart the service.
 
 ### Paying the service end to end, no Passport agent needed
 

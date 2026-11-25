@@ -34,6 +34,20 @@ Usage:
     export X402_PRIVATE_KEY=0xYOUR_TESTNET_PRIVATE_KEY
     python kite_x402_client.py --url "http://localhost:8402/v1/forecast?..."
 
+Choosing what to pay:
+    The wrapper may advertise several payment options (see the service's
+    EXTRA_PAYMENT_OPTIONS and ROUTE_PRICES_USD). By default the first one is
+    paid, as before. Pass --network to pay the option advertised on that
+    CAIP-2 network instead (e.g. --network eip155:2368 for Kite testnet).
+
+    No single payment may cost more than $1 unless you raise it:
+        --max-usd 0.01        # refuse anything above one cent
+        --max-usd 0           # disable the cap
+    or export X402_MAX_PAYMENT_USD. A pricier challenge is refused before
+    anything is signed. x402 prices are fractions of a cent, so a dollar is
+    far above any legitimate per-call price — and it is what stops a mistyped
+    or hostile challenge from draining the wallet.
+
 ⚠️  Only ever use a throwaway testnet key with this script (a wallet you
     funded from https://faucet.gokite.ai / `kpass faucet drop`, holding no
     real funds). Never paste a mainnet private key into a script.
@@ -68,6 +82,22 @@ AUTHORIZATION_TYPES = {
         {"name": "nonce", "type": "bytes32"},
     ],
 }
+
+# Smallest-unit decimals of the stablecoin each Kite network settles in.
+# Keep in step with `asset_decimals` in kite-x402-axum/src/kite.rs: a
+# challenge quotes its price in these units, and a USD cap is only
+# meaningful against them.
+ASSET_DECIMALS = {
+    "eip155:2366": 6,  # mainnet: Bridged USDC (USDC.e)
+    "eip155:2368": 18,  # testnet: pieUSD
+}
+
+# Default per-payment cap, as a USD amount ("0" disables it).
+DEFAULT_MAX_USD = "1"
+
+# USD amounts are compared as integer micro-dollars, so the price check is
+# exact: no float ever touches a price.
+MICRO_USD = 10**6
 
 
 def b64_encode_json(obj: dict) -> str:
@@ -122,6 +152,70 @@ def sign_authorization(private_key: str, requirements: dict, authorization: dict
     return "0x" + signed.signature.hex()
 
 
+def usd_to_micro(value: str) -> int:
+    """Exact USD amount -> integer micro-dollars: '$0.001' -> 1000.
+
+    Raises ValueError for anything that is not a plain decimal with at most
+    six fractional digits (no sign, no exponent, no thousands separator).
+    """
+    text = value.strip().removeprefix("$").strip()
+    whole, dot, fraction = text.partition(".")
+    if not (whole.isascii() and whole.isdigit()):
+        raise ValueError(f"not a USD amount: {value!r}")
+    if dot and not (fraction.isascii() and fraction.isdigit()):
+        raise ValueError(f"not a USD amount: {value!r}")
+    if len(fraction) > 6:
+        raise ValueError(f"a USD amount has at most 6 decimals: {value!r}")
+    return int(whole) * MICRO_USD + int((fraction + "000000")[:6])
+
+
+def exceeds_cap(amount, network: Optional[str], max_usd: str) -> bool:
+    """Whether `amount` atomic units on `network` costs more than `max_usd`.
+
+    The comparison is exact integer arithmetic:
+        amount * 10**6  >  cap_in_micro_dollars * 10**decimals
+    A price exactly at the cap is allowed. A cap of "0" disables the check.
+    A network whose decimals are unknown cannot be priced, so that is an
+    error rather than a silent pass; pass --max-usd 0 to pay without a cap.
+    """
+    cap = usd_to_micro(max_usd)
+    if cap == 0:
+        return False
+    decimals = ASSET_DECIMALS.get(network)
+    if decimals is None:
+        raise ValueError(
+            f"cannot price a payment on unknown network {network!r} "
+            "(pass --max-usd 0 to pay without a cap)"
+        )
+    units = str(amount)
+    if not (units.isascii() and units.isdigit()):
+        raise ValueError(f"the challenge advertises a non-numeric price {amount!r}")
+    return int(units) * MICRO_USD > cap * 10**decimals
+
+
+def select_option(accepts, network: Optional[str]) -> Optional[dict]:
+    """The payment option to pay.
+
+    Without `network`: the first advertised option, as this script always
+    did. With it: the first option advertised on that CAIP-2 network, or
+    None when the challenge offers none there.
+    """
+    options = [option for option in accepts if isinstance(option, dict)]
+    if network is None:
+        return options[0] if options else None
+    for option in options:
+        if option.get("network") == network:
+            return option
+    return None
+
+
+def default_max_usd() -> str:
+    """The cap to apply unless --max-usd is given: X402_MAX_PAYMENT_USD when
+    it holds a value, otherwise DEFAULT_MAX_USD. A blank variable counts as
+    unset, matching the service's handling of its environment."""
+    return os.environ.get("X402_MAX_PAYMENT_USD", "").strip() or DEFAULT_MAX_USD
+
+
 def build_payment_header(
     private_key: str, payer_address: str, requirements: dict, *, resource: Optional[dict] = None
 ) -> str:
@@ -152,13 +246,29 @@ def pretty(obj) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--url", required=True, help="Full URL of the paid endpoint, e.g. http://localhost:8402/v1/forecast?...")
+    parser.add_argument("--url", required=True, help="Final URL of the paid endpoint, e.g. http://localhost:8402/v1/forecast?...")
     parser.add_argument("--method", default="GET", help="HTTP method (default: GET)")
     parser.add_argument("--body", default=None, help="JSON string request body, for POST/PUT")
     parser.add_argument(
         "--private-key",
         default=os.environ.get("X402_PRIVATE_KEY"),
         help="0x-prefixed testnet private key. Or set X402_PRIVATE_KEY instead.",
+    )
+    parser.add_argument(
+        "--network",
+        default=None,
+        help=(
+            "CAIP-2 network of the payment option to pay, e.g. eip155:2368 for Kite testnet. "
+            "Default: the first advertised option."
+        ),
+    )
+    parser.add_argument(
+        "--max-usd",
+        default=default_max_usd(),
+        help=(
+            "refuse any single payment above this USD amount (default: $1; 0 disables the cap). "
+            "Or set X402_MAX_PAYMENT_USD."
+        ),
     )
     args = parser.parse_args()
 
@@ -174,7 +284,9 @@ def main() -> int:
 
     print(f"\n--- 1) unauthenticated {args.method} {args.url}")
     try:
-        first = requests.request(args.method, args.url, json=body, headers=headers, timeout=30)
+        first = requests.request(
+            args.method, args.url, json=body, headers=headers, timeout=30, allow_redirects=False,
+        )
     except requests.RequestException as error:
         print(
             f"error: initial request failed ({type(error).__name__}); no payment was signed",
@@ -182,6 +294,14 @@ def main() -> int:
         )
         return 1
     print(f"HTTP {first.status_code}")
+
+    if 300 <= first.status_code < 400:
+        print(
+            "error: initial request returned a redirect status. "
+            "Use the final endpoint URL; no payment was signed",
+            file=sys.stderr,
+        )
+        return 1
 
     if first.status_code != 402:
         print("Expected 402 Payment Required. Response body:")
@@ -205,7 +325,37 @@ def main() -> int:
     if not accepts:
         print("error: 402 challenge has an empty `accepts` list", file=sys.stderr)
         return 1
-    requirements = accepts[0]
+    requirements = select_option(accepts, args.network)
+    if requirements is None:
+        advertised = sorted(
+            {str(option.get("network")) for option in accepts if isinstance(option, dict)}
+        )
+        print(
+            f"error: the challenge advertises no payment option on --network {args.network!r} "
+            f"(advertised: {', '.join(advertised) or 'none'}); no payment was signed",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        over_cap = exceeds_cap(
+            requirements.get("amount"), requirements.get("network"), args.max_usd
+        )
+    except ValueError as error:
+        print(f"error: {error}; no payment was signed", file=sys.stderr)
+        return 1
+    if over_cap:
+        print(
+            f"error: refusing to pay {requirements.get('amount')} units on "
+            f"{requirements.get('network')}: it exceeds the per-payment cap of "
+            f"${args.max_usd} USD (raise it with --max-usd); no payment was signed",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"\npayment option: network={requirements.get('network')} "
+        f"amount={requirements.get('amount')} (cap ${args.max_usd})"
+    )
     resource = challenge.get("resource")
     if resource is not None and (
         not isinstance(resource, dict)
@@ -240,6 +390,7 @@ def main() -> int:
             json=body,
             headers={**headers, "PAYMENT-SIGNATURE": payment_header},
             timeout=30,
+            allow_redirects=False,
         )
     except requests.RequestException:
         print(
@@ -248,6 +399,14 @@ def main() -> int:
         )
         return 1
     print(f"HTTP {second.status_code}")
+
+    if 300 <= second.status_code < 400:
+        print(
+            "error: signed request returned a redirect status. "
+            "Reconcile the original payment before retrying with the final endpoint URL",
+            file=sys.stderr,
+        )
+        return 1
 
     settlement = None
     settle_header = second.headers.get("PAYMENT-RESPONSE")

@@ -681,6 +681,120 @@ async fn full_pay_per_call_flow_over_real_http() {
     );
 }
 
+#[test]
+fn settlement_queries_refuse_invalid_listener_ports() {
+    for port in ["0", "65536", "invalid"] {
+        let (status, stderr) = run_expecting_failure(vec![
+            ("PAY_TO", PAY_TO),
+            ("UPSTREAM_URL", "http://127.0.0.1:1"),
+            ("SETTLEMENT_QUERY_PORT", port),
+        ]);
+        assert!(!status.success(), "accepted invalid port {port}");
+        assert!(
+            stderr.contains("SETTLEMENT_QUERY_PORT must be an integer"),
+            "{stderr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn settlement_queries_are_disabled_on_the_payment_port() {
+    let mocks = Mocks::start().await;
+    let svc = Service::start_with(&mocks).await;
+    assert_eq!(svc.get("/settlements").await.status(), 404);
+    assert!(mocks.timeline().is_empty());
+}
+
+#[tokio::test]
+async fn settlement_queries_show_recent_and_hash_indexed_attempts() {
+    let mocks = Mocks::start().await;
+    let query_port = free_port();
+    let mut public_port = free_port();
+    while public_port == query_port {
+        public_port = free_port();
+    }
+    let mut env = Service::base_env(&mocks, public_port);
+    env.extend([
+        ("SETTLEMENT_QUERY_PORT".into(), query_port.to_string()),
+        ("FACILITATOR_TIMEOUT_MS".into(), "500".into()),
+        (
+            "ROUTE_PRICES_USD".into(),
+            r#"[{"method":"GET","path":"/v1/forecast","price":"0.002"}]"#.into(),
+        ),
+    ]);
+    let svc = Service::start(env).await;
+    let recent_url = format!("http://127.0.0.1:{query_port}/settlements");
+    let tx_url = format!("{recent_url}/eip155:2368/{TX_HASH}");
+
+    assert_eq!(svc.get("/settlements").await.status(), 404);
+    let blocked = svc
+        .http
+        .get(&recent_url)
+        .header("host", "merchant.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), 403);
+    assert_eq!(blocked.headers()["cache-control"], "no-store");
+    let unpaid = svc.get("/v1/forecast").await;
+    assert_eq!(unpaid.status(), 402);
+    let recent = svc.http.get(&recent_url).send().await.unwrap();
+    assert_eq!(recent.status(), 200);
+    assert_eq!(recent.headers()["cache-control"], "no-store");
+    assert_eq!(recent.json::<Value>().await.unwrap(), json!([]));
+    assert_eq!(svc.http.get(&tx_url).send().await.unwrap().status(), 404);
+    assert!(mocks.timeline().is_empty());
+
+    assert_eq!(svc.pay_get("/v1/forecast").await.status(), 200);
+    let stored = svc.http.get(&tx_url).send().await.unwrap();
+    assert_eq!(stored.status(), 200);
+    let stored = stored.json::<Value>().await.unwrap();
+    assert_eq!(stored["status"], "reported_success");
+    assert_eq!(stored["network"], "eip155:2368");
+    assert_eq!(stored["transaction"], TX_HASH);
+    assert_eq!(stored["payer"], PAYER);
+    assert_eq!(stored["pay_to"], PAY_TO);
+    assert_eq!(stored["amount_atomic"], "2000000000000000");
+
+    mocks.facilitator.set_settle(Reply::Delayed(
+        Duration::from_secs(10),
+        json!({ "success": false }),
+    ));
+    assert_eq!(svc.pay_get("/v1/forecast").await.status(), 402);
+    let latest = svc
+        .http
+        .get(format!("{recent_url}?limit=1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(latest.status(), 200);
+    let latest = latest.json::<Vec<Value>>().await.unwrap();
+    assert_eq!(latest.len(), 1);
+    assert_eq!(latest[0]["status"], "unconfirmed");
+    assert_eq!(latest[0]["transaction"], Value::Null);
+    assert!(!latest[0].as_object().unwrap().contains_key("error_reason"));
+    assert_eq!(
+        mocks.timeline(),
+        ["verify", "upstream", "settle", "verify", "upstream", "settle"]
+    );
+
+    for url in [
+        format!("{recent_url}?limit=0"),
+        format!("{recent_url}?limit=101"),
+        format!("{recent_url}/eip155:2368/bad-hash"),
+    ] {
+        assert_eq!(svc.http.get(url).send().await.unwrap().status(), 400);
+    }
+    assert_eq!(mocks.facilitator.settle_count(), 2);
+
+    #[cfg(unix)]
+    {
+        let mut svc = svc;
+        assert!(svc.terminate().success());
+        assert!(svc.http.get(&recent_url).send().await.is_err());
+    }
+}
+
 #[tokio::test]
 async fn post_bodies_and_headers_travel_through_the_whole_stack() {
     let mocks = Mocks::start().await;
@@ -1329,6 +1443,10 @@ fn route_prices_reject_invalid_configuration_at_startup() {
         (
             with_extras(json!([{"network": "mainnet", "price": "0.0000001"}])),
             "extra_payment_options entry 1 has an invalid USD price",
+        ),
+        (
+            with_extras(json!([{"network": "mainnet", "price": "0.001"}])),
+            "rule 1 payment options option 2 duplicates an earlier payment option",
         ),
         (
             json!([&rule, &rule]).to_string(),
@@ -2841,5 +2959,28 @@ fn refuses_malformed_extra_payment_options() {
             stderr.contains("EXTRA_PAYMENT_OPTIONS"),
             "{value}: {stderr}"
         );
+    }
+}
+
+#[test]
+fn refuses_duplicate_extra_payment_options() {
+    for (value, expected_error) in [
+        (
+            "mainnet:0.001",
+            "default payment options option 2 duplicates an earlier payment option",
+        ),
+        (
+            "mainnet:0.05,mainnet:$0.05",
+            "default payment options option 3 duplicates an earlier payment option",
+        ),
+    ] {
+        let (status, stderr) = run_expecting_failure(vec![
+            ("PAY_TO", PAY_TO),
+            ("UPSTREAM_URL", "http://localhost:1"),
+            ("EXTRA_PAYMENT_OPTIONS", value),
+            ("RUST_LOG", "off"),
+        ]);
+        assert!(!status.success(), "{value} must fail startup");
+        assert!(stderr.contains(expected_error), "{value}: {stderr}");
     }
 }
