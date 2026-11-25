@@ -102,6 +102,16 @@ impl RoutePrices {
         if !value.trim().is_empty() {
             let rules: Vec<Rule> = serde_json::from_str(value).map_err(|err| err.to_string())?;
             for (index, rule) in rules.into_iter().enumerate() {
+                // HTTP methods are case-sensitive and this router only ever sees
+                // the canonical uppercase tokens, so a lowercase rule can never
+                // match a request: it would silently fall back to the default
+                // price. Reject it at parse time instead of mispricing traffic.
+                if rule.method != rule.method.to_ascii_uppercase() {
+                    return Err(format!(
+                        "rule {} method must be an uppercase HTTP method token",
+                        index + 1
+                    ));
+                }
                 let method = Method::from_bytes(rule.method.as_bytes())
                     .map_err(|_| format!("rule {} has an invalid HTTP method", index + 1))?;
                 let invalid_path = || {
@@ -359,4 +369,63 @@ pub(super) async fn route_payment(
         settlement_ledger: config.settlement_ledger.clone(),
     });
     x402_payment_multi(State(multi), req, next).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_config() -> Arc<PaymentConfig> {
+        Arc::new(PaymentConfig {
+            pay_to: "0x2222222222222222222222222222222222222222".into(),
+            chain: kite_chain_by_name("testnet").expect("testnet chain"),
+            price_usd: "0.01".into(),
+            description: "test".into(),
+            facilitator: kite_x402_axum::facilitator::FacilitatorClient::new("http://127.0.0.1:9"),
+            expiration_guard: None,
+            metrics: None,
+            nonce_guard: None,
+            settlement_ledger: None,
+        })
+    }
+
+    fn parse(rules: &str) -> Result<RoutePrices, String> {
+        RoutePrices::parse(rules, default_config(), Vec::new())
+    }
+
+    #[test]
+    fn uppercase_methods_keep_their_override() {
+        let prices = parse(r#"[{"method":"GET","path":"/v1/premium","price":"0.05"}]"#)
+            .expect("uppercase rule parses");
+        let matched = prices
+            .price_for(&Method::GET, "/v1/premium")
+            .expect("GET /v1/premium has a rule");
+        assert_eq!(matched.primary.price_usd, "0.05");
+    }
+
+    /// `Method::from_bytes` accepts any token, so `"get"` used to parse into a
+    /// method no real request can carry: the rule silently never matched and
+    /// the route was charged the default price. Fail at startup instead.
+    #[test]
+    fn lowercase_methods_are_rejected_instead_of_never_matching() {
+        for method in ["get", "Get", "pOsT", "delete"] {
+            let rules = format!(r#"[{{"method":"{method}","path":"/v1/premium","price":"0.05"}}]"#);
+            let error = parse(&rules).expect_err(method);
+            assert!(error.contains("uppercase HTTP method"), "{method}: {error}");
+        }
+    }
+
+    /// The uppercase check must not reject the tokens that are already valid.
+    #[test]
+    fn standard_and_extension_methods_still_parse() {
+        let rules = r#"[
+            {"method":"POST","path":"/v1/jobs","price":"0.05"},
+            {"method":"PURGE","path":"/v1/cache","price":"0.05"}
+        ]"#;
+        let prices = parse(rules).expect("uppercase methods parse");
+        assert!(prices.price_for(&Method::POST, "/v1/jobs").is_some());
+        assert!(prices
+            .price_for(&Method::from_bytes(b"PURGE").unwrap(), "/v1/cache")
+            .is_some());
+    }
 }
