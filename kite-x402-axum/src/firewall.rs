@@ -41,10 +41,16 @@ impl FirewallRule {
     }
 
     /// Checks if a client IP matches this rule.
+    ///
+    /// IPv6 peers that carry an IPv4-mapped address (`::ffff:a.b.c.d`, what a
+    /// dual-stack listener reports for IPv4 callers) are compared as their
+    /// IPv4 address, so an allow-list entry for `a.b.c.d` keeps working when
+    /// the process binds `[::]` instead of `0.0.0.0`.
     #[must_use]
     pub fn matches(&self, client_ip: &IpAddr) -> bool {
+        let client_ip = canonical_ip(*client_ip);
         match (self, client_ip) {
-            (Self::Exact(rule_ip), ip) => rule_ip == ip,
+            (Self::Exact(rule_ip), ip) => canonical_ip(*rule_ip) == ip,
             (Self::SubnetV4 { network, prefix }, IpAddr::V4(client_v4)) => {
                 if *prefix == 0 {
                     return true;
@@ -52,11 +58,19 @@ impl FirewallRule {
                 // The public variant can bypass subnet_v4; keep its clamping policy.
                 let mask = u32::MAX << (32 - (*prefix).min(32));
                 let net_u32 = u32::from(*network) & mask;
-                let client_u32 = u32::from(*client_v4) & mask;
+                let client_u32 = u32::from(client_v4) & mask;
                 net_u32 == client_u32
             }
             _ => false,
         }
+    }
+}
+
+/// Collapses an IPv4-mapped IPv6 address to the IPv4 address it carries.
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        IpAddr::V4(_) => ip,
     }
 }
 
