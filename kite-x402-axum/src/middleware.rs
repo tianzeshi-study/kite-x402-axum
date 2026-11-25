@@ -221,10 +221,14 @@ fn record_settlement(
         .filter(|payer| !payer.trim().is_empty())
         .or(verified_payer)
         .unwrap_or_default();
+    // Trim before storing: the emptiness check above already treats
+    // surrounding whitespace as insignificant, and `transaction_key` uses the
+    // network as half of the ledger's identity. Keeping raw padding here would
+    // make the same network hash to two different identities.
     let network = if settle.network.trim().is_empty() {
-        requirements.network.clone()
+        requirements.network.trim().to_owned()
     } else {
-        settle.network.clone()
+        settle.network.trim().to_owned()
     };
     let record = crate::settlement_ledger::SettlementRecord {
         tx_hash: settle.transaction.clone(),
@@ -983,6 +987,47 @@ mod tests {
         // back to the advertised requirement (by design).
         assert_eq!(atomic_amount(&req, &settle(Some(" 42 "))), 42);
         assert_eq!(atomic_amount(&req, &settle(Some("1.5"))), advertised);
+    }
+
+    #[test]
+    fn settle_network_is_trimmed_before_it_becomes_a_ledger_identity() {
+        use crate::settlement_ledger::SettlementLedger;
+        use std::sync::Arc;
+
+        let ledger = Arc::new(SettlementLedger::new(100));
+        let cfg = PaymentConfig {
+            pay_to: PAY_TO.to_owned(),
+            chain: KITE_TESTNET,
+            price_usd: "0.001".to_owned(),
+            description: "test".to_owned(),
+            facilitator: dead_facilitator(),
+            expiration_guard: None,
+            metrics: None,
+            nonce_guard: None,
+            settlement_ledger: Some(ledger.clone()),
+        };
+        let req = requirements();
+        let clean_network = req.network.clone();
+        let settle = SettleResponse {
+            success: false,
+            error_reason: Some("boom".to_owned()),
+            error_message: None,
+            payer: None,
+            transaction: "0xdead".to_owned(),
+            // A facilitator echoing the network with stray whitespace. The
+            // emptiness check trims, so the value is clearly intended to be
+            // whitespace-tolerant — but the raw value is what gets stored as
+            // half of the ledger's identity key.
+            network: format!("  {clean_network}  "),
+            amount: None,
+        };
+        record_settlement(&cfg, &req, Some("0xabc"), &settle);
+
+        assert!(
+            ledger.get_by_network_tx(&clean_network, "0xdead").is_some(),
+            "a settle network with surrounding whitespace must be stored trimmed, \
+             otherwise the same network produces two different ledger identities"
+        );
     }
 
     // ---- response builders -------------------------------------------------
