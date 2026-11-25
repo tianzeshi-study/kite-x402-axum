@@ -44,7 +44,10 @@ ROUTE_PRICES_USD='[{"method":"GET","path":"/v1/forecast","price":"0.001"},{"meth
 ```
 
 Each rule matches the exact HTTP method and the full, case-sensitive URL path
-under `/v1/`. A `{name}` placeholder matches one nonempty path segment, so
+under `/v1/`. Write methods in uppercase (`GET`, `POST`, …): HTTP methods are
+case-sensitive and lowercase rules are rejected at startup, because such a rule
+could never match a request and would silently leave the route at the default
+price. A `{name}` placeholder matches one nonempty path segment, so
 `GET /v1/reports/42` and `GET /v1/reports/43` both cost `$0.05` in this example.
 Use ASCII letters, digits and underscores in placeholder names, starting with a
 letter or underscore. Placeholders must fill the entire segment. Paths are
