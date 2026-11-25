@@ -529,6 +529,57 @@ async fn healthz_is_free_and_never_contacts_the_backends() {
 }
 
 #[tokio::test]
+async fn well_known_x402_publishes_the_payment_surface_without_contacting_the_backends() {
+    let mocks = Mocks::start().await;
+    let port = free_port();
+    let mut env = Service::base_env(&mocks, port);
+    env.push(("PRICE_USD".into(), "0.01".into()));
+    env.push(("EXTRA_PAYMENT_OPTIONS".into(), "mainnet:$0.002".into()));
+    let svc = Service::start(env).await;
+
+    let resp = svc.get("/.well-known/x402").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
+    // It sits on the same router as `/healthz`, so it gets the same headers.
+    assert_eq!(
+        resp.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({
+            "x402Version": 2,
+            "scheme": "exact",
+            "networks": ["eip155:2368", "eip155:2366"],
+            "assets": [
+                {
+                    "network": "eip155:2368",
+                    "address": "0x38129cf4CE5E183eFF248F42A7D345Bb1B47621A",
+                    "symbol": "pieUSD",
+                    "decimals": 18,
+                    "name": "pieUSD",
+                    "version": "1",
+                },
+                {
+                    "network": "eip155:2366",
+                    "address": "0x7aB6f3ed87C42eF0aDb67Ed95090f8bF5240149e",
+                    "symbol": "USDC.e",
+                    "decimals": 6,
+                    "name": "Bridged USDC (Kite AI)",
+                    "version": "2",
+                },
+            ],
+            "payTo": PAY_TO,
+            "price": "$0.01",
+            "description": "Paid API access via Kite x402",
+            "extraPaymentOptions": [{"network": "eip155:2366", "price": "$0.002"}],
+        })
+    );
+    // Unmetered and off the critical path: neither backend heard anything.
+    assert!(mocks.timeline().is_empty());
+}
+
+#[tokio::test]
 async fn livez_is_free_and_reports_uptime() {
     let mocks = Mocks::start().await;
     let svc = Service::start_with(&mocks).await;

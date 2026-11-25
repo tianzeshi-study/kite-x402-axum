@@ -240,6 +240,7 @@ payment only. It does not show whether the upstream service fulfilled the reques
 The service exposes endpoints outside `/v1/*` that are unmetered (free) and never invoke payment verification or settlement:
 
 - **`GET /healthz`**: Liveness check; returns `{"ok": true, "network", "asset", "price"}` when the HTTP listener is operational. `network` is the CAIP-2 id, `asset` is the stablecoin symbol, and `price` is the configured USD price with a leading `$`.
+- **`GET /.well-known/x402`**: Payment discovery for agents that should not have to request a paid route first; returns the protocol version, every network and asset the service accepts, the payee and the prices (see [Health and Readiness Probes](#health-and-readiness-probes)).
 - **`GET /livez`**: Liveness probe; returns `{"status": "ok", "uptime_seconds": ...}`.
 - **`GET /metrics`**: Operational diagnostics; returns a JSON snapshot of atomic counters:
   - `total_requests`: Lifetime total requests received.
@@ -357,6 +358,34 @@ The service exposes lightweight Kubernetes-compatible health endpoints outside t
 - **`GET /readyz`** checks x402 v2 `exact` support for every network advertised by the service. Each probe uses a single facilitator `/supported` request and checks the primary network plus all global and route-specific alternatives. The `networks` field lists the configured networks without duplicates. On success, `network` still identifies the primary network.
   - Returns `200` when all configured networks are supported, or `503` when the response is unsuccessful, malformed, or missing support for a configured network. This checks advertised capabilities only. Confirm funded settlements separately.
   - By default, each readiness request runs a live check. Set `FACILITATOR_HEALTH_INTERVAL_SECS` (1 to 86400) to probe in the background and return the cached result with its Unix `checked_at` timestamp. Until the first probe completes, `/readyz` returns `503` with `status` set to `not_ready` and `facilitator` set to `pending`. `/healthz` remains available during this wait.
+
+- **`GET /.well-known/x402`** (Payment discovery): Returns `200 OK` with the service's payment surface, so a client can learn what it accepts without requesting a paid route first. It is built from configuration only — no facilitator or upstream call — and is sent with `Cache-Control: no-store`:
+
+  ```json
+  {
+    "x402Version": 2,
+    "scheme": "exact",
+    "networks": ["eip155:2368", "eip155:2366"],
+    "assets": [
+      {
+        "network": "eip155:2368",
+        "address": "0x38129cf4CE5E183eFF248F42A7D345Bb1B47621A",
+        "symbol": "pieUSD",
+        "decimals": 18,
+        "name": "pieUSD",
+        "version": "1"
+      }
+    ],
+    "payTo": "0x…",
+    "price": "$0.01",
+    "description": "Paid API access via Kite x402",
+    "extraPaymentOptions": [{ "network": "eip155:2366", "price": "$0.002" }]
+  }
+  ```
+
+  - `networks` and `assets` list the primary `KITE_NETWORK` first and then every network named in `EXTRA_PAYMENT_OPTIONS`, each once. An `assets` entry carries the token contract, its symbol and decimals, and the EIP-712 domain name and version the facilitator checks.
+  - `price` is `PRICE_USD` and `extraPaymentOptions` mirrors `EXTRA_PAYMENT_OPTIONS`; the latter is absent when none is configured. Where the document and the 402 challenge both have a field, the key is the same.
+  - Per-route prices (`ROUTE_PRICES_USD`) and the facilitator URL are not published. The first would list the metered routes at an unmetered URL, and the second is server-side infrastructure that a buyer never contacts.
 
 ## Browser CORS support
 
