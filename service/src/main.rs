@@ -39,6 +39,7 @@ mod health;
 mod rate_limit;
 mod route_prices;
 mod settlement_query;
+mod webhook_delivery;
 use cors::{cors_middleware, CorsConfig};
 use health::ReadinessState;
 use rate_limit::{
@@ -235,6 +236,8 @@ async fn main() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let settlement_port = settlement_query::configured_port().unwrap_or_else(|err| panic!("{err}"));
     let settlement_ledger = settlement_port.map(|_| Arc::new(SettlementLedger::default()));
+    let webhook_runtime = webhook_delivery::WebhookRuntime::from_env()
+        .unwrap_or_else(|err| panic!("invalid webhook configuration: {err}"));
 
     let health = health_info(chain, &price_usd);
     let payment_cfg = Arc::new(PaymentConfig {
@@ -306,6 +309,14 @@ async fn main() {
             concurrency_semaphore,
             concurrency_limiter,
         ));
+    let paid = if let Some(webhook_runtime) = &webhook_runtime {
+        paid.layer(middleware::from_fn_with_state(
+            Arc::clone(webhook_runtime),
+            webhook_delivery::observe_payment_events,
+        ))
+    } else {
+        paid
+    };
 
     let readyz_state = Arc::new(ReadyzState {
         payment_cfg,
@@ -406,6 +417,7 @@ async fn main() {
 
     let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
     let (settlement_shutdown_tx, mut settlement_shutdown_rx) = tokio::sync::watch::channel(false);
+    let webhook_worker = webhook_runtime.map(|runtime| runtime.spawn_worker(shutdown_rx.clone()));
     let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -429,7 +441,23 @@ async fn main() {
     };
 
     tokio::select! {
-        res = async { tokio::try_join!(async { server.await }, settlement_server) } => {
+        res = async {
+            if let Some(worker) = webhook_worker {
+                tokio::try_join!(
+                    async { server.await },
+                    settlement_server,
+                    async {
+                        worker
+                            .await
+                            .map_err(|error| std::io::Error::other(error.to_string()))?;
+                        Ok::<(), std::io::Error>(())
+                    }
+                )?;
+            } else {
+                tokio::try_join!(async { server.await }, settlement_server)?;
+            }
+            Ok::<(), std::io::Error>(())
+        } => {
             res.expect("server error");
             tracing::info!("Server shut down gracefully");
         }
