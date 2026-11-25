@@ -67,6 +67,7 @@ pub mod circuit_breaker;
 pub mod cors_guard;
 pub mod expiration;
 pub mod facilitator;
+pub mod facilitator_pool;
 pub mod firewall;
 pub mod idempotency;
 pub mod kite;
@@ -90,6 +91,9 @@ pub use circuit_breaker::{
 pub use cors_guard::{CorsGuardConfig, CorsSecurityGuard};
 pub use expiration::{ExpirationError, ExpirationGuardConfig};
 pub use facilitator::{FacilitatorClient, FacilitatorError, RetryConfig};
+pub use facilitator_pool::{
+    FacilitatorPool, FacilitatorPoolConfig, NodeStats, NodeStatus,
+};
 pub use firewall::{FirewallRule, IpFilterAction, IpFirewall, IpFirewallConfig};
 pub use idempotency::{AcquireResult, CachedResponse, IdempotencyCache, IdempotencyConfig};
 pub use kite::{kite_chain_by_name, KiteChain, KiteError, KITE_MAINNET, KITE_TESTNET};
