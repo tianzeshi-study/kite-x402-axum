@@ -254,11 +254,18 @@ async fn main() {
         tracing::info!("Using shared PostgreSQL settlement journal");
         Some(Arc::new(store))
     };
+    // The library default (5,000) is fine for a laptop but is neither a bound a
+    // memory-constrained deployment can accept nor a history an operator may
+    // want to extend. This setting is read even when queries are off, so a typo
+    // fails startup instead of silently doing nothing.
+    let settlement_capacity =
+        parse_settlement_ledger_capacity(env::var("SETTLEMENT_LEDGER_CAPACITY").ok().as_deref())
+            .unwrap_or_else(|message| panic!("{message}"));
+    let build_ledger =
+        || settlement_capacity.map_or_else(SettlementLedger::default, SettlementLedger::new);
     let settlement_ledger = match &durable_store {
-        Some(store) => Some(Arc::new(
-            SettlementLedger::default().with_store(store.clone()),
-        )),
-        None => settlement_port.map(|_| Arc::new(SettlementLedger::default())),
+        Some(store) => Some(Arc::new(build_ledger().with_store(store.clone()))),
+        None => settlement_port.map(|_| Arc::new(build_ledger())),
     };
     let settlement_query_source = match &durable_store {
         Some(store) => Some(settlement_query::Source::Durable(store.clone())),
@@ -1106,6 +1113,26 @@ fn parse_clock_drift_secs(raw: Option<&str>) -> Result<Option<u64>, String> {
 /// These are advertised in the 402 challenge after the primary
 /// `KITE_NETWORK`/`PRICE_USD` pair. Unknown networks abort startup; prices
 /// are validated at request time like the primary price.
+/// Parses `SETTLEMENT_LEDGER_CAPACITY` from a raw environment value.
+///
+/// `None` and blank keep the library default (`Ok(None)`); otherwise the value
+/// must be an integer in `100..=1_000_000`. The lower bound mirrors the library,
+/// which floors a smaller capacity at 100 so a mistyped tiny number cannot turn
+/// reconciliation history off; rejecting it here keeps that floor from being a
+/// silent surprise. A present-but-invalid value is an error rather than a silent
+/// default, for the same reason.
+fn parse_settlement_ledger_capacity(raw: Option<&str>) -> Result<Option<usize>, String> {
+    const MESSAGE: &str = "SETTLEMENT_LEDGER_CAPACITY must be an integer between 100 and 1000000";
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let capacity: usize = raw.parse().map_err(|_| MESSAGE.to_owned())?;
+    if !(100..=1_000_000).contains(&capacity) {
+        return Err(MESSAGE.to_owned());
+    }
+    Ok(Some(capacity))
+}
+
 fn parse_extra_payment_options(spec: &str) -> Vec<PaymentOption> {
     let mut options = Vec::new();
     for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -1509,6 +1536,34 @@ mod tests {
             assert!(
                 parse_clock_drift_secs(Some(bad)).is_err(),
                 "{bad} must be rejected instead of disabling the guard"
+            );
+        }
+    }
+
+    #[test]
+    fn settlement_capacity_keeps_the_default_only_when_absent_or_blank() {
+        // Absent / blank keep the library default (5,000 entries).
+        assert_eq!(parse_settlement_ledger_capacity(None), Ok(None));
+        assert_eq!(parse_settlement_ledger_capacity(Some("")), Ok(None));
+        assert_eq!(parse_settlement_ledger_capacity(Some("  ")), Ok(None));
+
+        // A configured value replaces the default, whitespace trimmed.
+        assert_eq!(parse_settlement_ledger_capacity(Some("100")), Ok(Some(100)));
+        assert_eq!(
+            parse_settlement_ledger_capacity(Some(" 250 ")),
+            Ok(Some(250))
+        );
+        assert_eq!(
+            parse_settlement_ledger_capacity(Some("1000000")),
+            Ok(Some(1_000_000))
+        );
+
+        // The library floors anything below 100 at 100, so accepting `99` here
+        // would retain more than the operator asked for without saying so.
+        for bad in ["0", "99", "1000001", "abc", "-5", "1.5"] {
+            assert!(
+                parse_settlement_ledger_capacity(Some(bad)).is_err(),
+                "{bad} must be rejected instead of silently retaining a different amount"
             );
         }
     }

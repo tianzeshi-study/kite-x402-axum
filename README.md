@@ -304,12 +304,17 @@ The service exposes endpoints outside `/v1/*` that are unmetered (free) and neve
 | `FACILITATOR_VERIFY_BACKOFF_MS` | `150` | Backoff between verify retries in milliseconds. |
 | `FACILITATOR_SETTLE_RETRIES` | `0` | Must be 0 — settlement is never retried (indeterminate outcomes stay visible). |
 | `SETTLEMENT_QUERY_PORT` | Empty (off) | Enables [local settlement queries](#merchant-settlement-queries) on a separate IPv4 loopback port. |
+<<<<<<< HEAD
 | `SETTLEMENT_DATABASE_URL` | Empty (off) | PostgreSQL connection URL for the [shared settlement journal](#durable-settlement-and-automatic-reconciliation). |
 | `SETTLEMENT_MAINNET_RPC_URL` / `SETTLEMENT_TESTNET_RPC_URL` | Kite public RPCs | Optional trusted JSON-RPC endpoints for automatic reconciliation. |
 | `FACILITATOR_HEALTH_INTERVAL_SECS` | Empty (off) | Background facilitator probe interval; 1..=86400 enables, 0 or empty keeps live per-request probes. |
 | `WEBHOOK_URLS` | Empty (off) | Comma-separated `http(s)` endpoints (at most 16) that receive [payment webhooks](#payment-webhooks). |
 | `WEBHOOK_SECRET` | Empty (unsigned) | HMAC-SHA256 signing key, at least 16 characters. Requires `WEBHOOK_URLS`. |
 | `WEBHOOK_MAX_RETRIES` | `5` | Retries after the first attempt (0..=20). Requires `WEBHOOK_URLS`. |
+=======
+| `SETTLEMENT_LEDGER_CAPACITY` | Library default (5000) | Retained settlement attempts per process (100..=1000000); read even when queries are off, so an invalid value fails startup. |
+| `FACILITATOR_HEALTH_INTERVAL_SECS` | Empty (off) | Background facilitator probe interval; 60..=86400 enables. |
+>>>>>>> 4029b7c (feat(service): let SETTLEMENT_LEDGER_CAPACITY bound the settlement ledger)
 | `PAYMENT_CLOCK_DRIFT_SECS` | Empty (off) | Enables the expiration guard with this clock-drift tolerance. |
 | `PAYMENT_REPLAY_CACHE_SIZE` | Empty (off) | Enables nonce replay protection with this cache capacity (1..=1000000). |
 | `SECURITY_CSP` | `default-src 'none'; frame-ancestors 'none'` | Content-Security-Policy header value. |
@@ -631,9 +636,12 @@ python service/scripts/kite_x402_reconcile.py \
   --pay-to "$PAY_TO" --amount "$AMOUNT_ATOMIC" --nonce "$NONCE"
 ```
 
-The ledger retains up to 5,000 entries per process and clears on restart.
-Requests that never reach settlement create no record. To disable recording
-and querying, unset the port and restart the service.
+The ledger retains up to 5,000 entries per process by default and clears on
+restart; the oldest entries are evicted first. Set `SETTLEMENT_LEDGER_CAPACITY`
+(100 through 1,000,000 — the library keeps at least 100) to bound it to what your
+memory budget or reconciliation window needs. Requests that never reach
+settlement create no record. To disable recording and querying, unset the port
+and restart the service.
 
 `GET /settlements/summary` returns success and failure counts and exact
 settled volumes. Every `volumes` entry has `network`, `asset` and a decimal
