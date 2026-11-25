@@ -8,6 +8,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `kite-x402-axum`: `IdempotencyCache::acquire_lease` returns an
+  `IdempotencyLease` whose `complete`/`release` only act while the caller still
+  owns the key. The key-only `acquire`/`complete`/`release` cannot tell a holder
+  whose lease expired and was reclaimed from the holder that owns it now, so a
+  late call could cancel the live lease and let a third request execute the same
+  payment twice. The old methods stay for single-holder callers and now document
+  that limitation.
 - `service`: `FACILITATOR_HEALTH_INTERVAL_SECS` starts a background facilitator
   probe; `/readyz` then answers from the latest result and reports `checked_at`.
 - CI: `cargo-deny` (licenses, bans, sources) and a Docker build + smoke test.
