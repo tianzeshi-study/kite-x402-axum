@@ -292,9 +292,11 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
                 "Upstream API request failed (unreachable or timed out)"
             );
             // >= 400, so the payment middleware will not settle this call.
+            // The transport error stays in the log: reqwest messages include
+            // the upstream URL, which the buyer must not see.
             return (
                 StatusCode::BAD_GATEWAY,
-                axum::Json(json!({ "error": "upstream unreachable", "detail": e.to_string() })),
+                axum::Json(json!({ "error": "upstream unreachable" })),
             )
                 .into_response();
         }
@@ -533,7 +535,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refused_upstream_is_a_502_with_error_and_detail() {
+    async fn refused_upstream_is_a_502_without_the_transport_error() {
         let resp = app(cfg(""))
             .oneshot(
                 axum::http::Request::get("/v1/x")
@@ -546,7 +548,7 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
         assert_eq!(body["error"], "upstream unreachable");
-        assert!(body["detail"].is_string());
+        assert!(body.get("detail").is_none());
     }
 
     #[tokio::test]

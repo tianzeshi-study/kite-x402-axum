@@ -378,7 +378,7 @@ async fn unreachable_upstream_is_a_502_with_a_json_error() {
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     let body = body_json(resp).await;
     assert_eq!(body["error"], "upstream unreachable");
-    assert!(!body["detail"].as_str().unwrap().is_empty());
+    assert!(body.get("detail").is_none());
 }
 
 #[tokio::test]

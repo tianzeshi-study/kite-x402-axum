@@ -229,7 +229,7 @@ payment only. It does not show whether the upstream service fulfilled the reques
 
 The service exposes endpoints outside `/v1/*` that are unmetered (free) and never invoke payment verification or settlement:
 
-- **`GET /healthz`**: Standard readiness check; returns `{"status": "ok"}` when the HTTP listener is operational.
+- **`GET /healthz`**: Liveness check; returns `{"ok": true, "network", "asset", "price"}` when the HTTP listener is operational. `network` is the CAIP-2 id, `asset` is the stablecoin symbol, and `price` is the configured USD price with a leading `$`.
 - **`GET /livez`**: Liveness probe; returns `{"status": "ok", "uptime_seconds": ...}`.
 - **`GET /metrics`**: Operational diagnostics; returns a JSON snapshot of atomic counters:
   - `total_requests`: Lifetime total requests received.
@@ -243,7 +243,7 @@ The service exposes endpoints outside `/v1/*` that are unmetered (free) and neve
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `PAY_TO` | Required | Receiving wallet address on Kite. |
+| `PAY_TO` | Required | Receiving wallet address on Kite (`0x` plus 40 hex characters). |
 | `UPSTREAM_URL` | Required | Protected upstream origin URL. |
 | `KITE_NETWORK` | `mainnet` | `mainnet` or `testnet`. |
 | `PRICE_USD` | `0.001` | Default price per call in USD. |
@@ -331,7 +331,7 @@ The service emits structured JSON error bodies:
 
 - **`404 Not Found`**: Returns `{"error": "not_found", "message": "route not found"}` for unknown paths outside `/v1/*` and `/healthz`.
 - **`402 Payment Required`**: Issues standard x402 challenge with `PAYMENT-REQUIRED` headers.
-- **`502 Bad Gateway`**: Emitted when the upstream fails, with protected data withheld.
+- **`502 Bad Gateway`**: Emitted when the upstream fails, with protected data withheld. An unreachable upstream returns `{"error": "upstream unreachable"}`; the transport error stays in the service log.
 
 ## Health and Readiness Probes
 
@@ -343,7 +343,7 @@ completion; it cannot guarantee that a disconnected buyer receives every byte.
 
 The service exposes lightweight Kubernetes-compatible health endpoints outside the metered `/v1/*` namespace:
 
-- **`GET /healthz`** (Liveness probe): Returns `200 OK` (`"ok"`) immediately without contacting backends. Free and unmetered.
+- **`GET /healthz`** (Liveness probe): Returns `200 OK` with `{"ok": true, "network", "asset", "price"}` immediately without contacting backends. Free and unmetered.
 - **`GET /readyz`** checks x402 v2 `exact` support for every network advertised by the service. Each probe uses a single facilitator `/supported` request and checks the primary network plus all global and route-specific alternatives. The `networks` field lists the configured networks without duplicates. On success, `network` still identifies the primary network.
   - Returns `200` when all configured networks are supported, or `503` when the response is unsuccessful, malformed, or missing support for a configured network. This checks advertised capabilities only. Confirm funded settlements separately.
   - By default, each readiness request runs a live check. Set `FACILITATOR_HEALTH_INTERVAL_SECS` (1 to 86400) to probe in the background and return the cached result with its Unix `checked_at` timestamp. Until the first probe completes, `/readyz` returns `503` with `status` set to `not_ready` and `facilitator` set to `pending`. `/healthz` remains available during this wait.

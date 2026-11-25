@@ -171,6 +171,53 @@ fn settlement_failure_response(settle: &crate::types::SettleResponse) -> Respons
     response
 }
 
+/// Builds the absolute resource URL advertised in a 402 challenge.
+///
+/// A request URI that is already absolute is kept. Otherwise the `Host`
+/// header and, when it is `http` or `https`, the first `X-Forwarded-Proto`
+/// value are used. In-process calls that carry neither stay on the path, so
+/// a missing host never invents one.
+fn absolute_resource_url(req: &Request, path_and_query: &str) -> String {
+    if path_and_query.starts_with("http://") || path_and_query.starts_with("https://") {
+        return path_and_query.to_owned();
+    }
+    if !path_and_query.starts_with('/') {
+        return path_and_query.to_owned();
+    }
+    let Some(host) = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .filter(|host| is_resource_host(host))
+    else {
+        return path_and_query.to_owned();
+    };
+    let scheme = forwarded_scheme(req).unwrap_or("http");
+    format!("{scheme}://{host}{path_and_query}")
+}
+
+/// Accepts a host or host:port and rejects anything that could change the URL
+/// structure (spaces, slashes, userinfo).
+fn is_resource_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 262
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && b != b'/' && b != b'\\' && b != b'@')
+}
+
+fn forwarded_scheme(req: &Request) -> Option<&'static str> {
+    let value = req
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())?;
+    match value.split(',').next()?.trim() {
+        scheme if scheme.eq_ignore_ascii_case("https") => Some("https"),
+        scheme if scheme.eq_ignore_ascii_case("http") => Some("http"),
+        _ => None,
+    }
+}
+
 fn unix_now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -262,12 +309,15 @@ async fn payment_gate_inner(
 ) -> Response {
     // Prefer the pre-`nest()` URI (e.g. `/v1/forecast`) so the 402 challenge
     // describes the path the client actually requested, not the
-    // `/v1`-stripped path the proxy handler sees.
-    let resource_url = req
+    // `/v1`-stripped path the proxy handler sees. Attach scheme and host when
+    // the request has them, matching the absolute `resource.url` the official
+    // x402 SDKs put on the wire.
+    let path_and_query = req
         .extensions()
         .get::<OriginalUri>()
         .map(|OriginalUri(uri)| uri.to_string())
         .unwrap_or_else(|| req.uri().to_string());
+    let resource_url = absolute_resource_url(&req, &path_and_query);
     let method = req.method().clone();
 
     if let Some(metrics) = &cfg.metrics {
@@ -1151,6 +1201,37 @@ mod tests {
         assert_eq!(
             decode_header(&resp, "PAYMENT-REQUIRED")["resource"]["url"],
             "/v1/stripped?a=b"
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_url_is_absolute_when_the_request_has_a_host() {
+        let (svc, _) = gate(config(KITE_TESTNET, "0.001"));
+        let mut req = request(
+            "/v1/forecast?latitude=52.52",
+            &[("host", "pay.example:8402")],
+        );
+        req.headers_mut()
+            .insert("x-forwarded-proto", HeaderValue::from_static("https, http"));
+        req.extensions_mut()
+            .insert(OriginalUri("/v1/forecast?latitude=52.52".parse().unwrap()));
+        let resp = svc.oneshot(req).await.unwrap();
+        assert_eq!(
+            decode_header(&resp, "PAYMENT-REQUIRED")["resource"]["url"],
+            "https://pay.example:8402/v1/forecast?latitude=52.52"
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_url_ignores_a_host_that_could_rewrite_the_url() {
+        let (svc, _) = gate(config(KITE_TESTNET, "0.001"));
+        let resp = svc
+            .oneshot(request("/v1/x", &[("host", "evil.example/other")]))
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_header(&resp, "PAYMENT-REQUIRED")["resource"]["url"],
+            "/v1/x"
         );
     }
 

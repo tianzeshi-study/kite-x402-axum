@@ -26,7 +26,7 @@ use axum::{
 };
 use kite_x402_axum::{
     facilitator::{FacilitatorClient, RetryConfig},
-    kite::{kite_chain_by_name, FACILITATOR_URL},
+    kite::{kite_chain_by_name, KiteChain, FACILITATOR_URL},
     middleware::PaymentConfig,
     payment_options::PaymentOption,
     proxy::{proxy, same_origin_redirect_policy, UpstreamConfig},
@@ -64,7 +64,7 @@ async fn main() {
         .parse()
         .expect("PORT must be a number");
 
-    let pay_to = env::var("PAY_TO").expect("PAY_TO is required (the wallet that receives payment)");
+    let pay_to = require_pay_to(&env::var("PAY_TO").unwrap_or_default());
     let upstream_url = env::var("UPSTREAM_URL")
         .expect("UPSTREAM_URL is required (the API being wrapped)")
         .trim_end_matches('/')
@@ -236,6 +236,7 @@ async fn main() {
     let settlement_port = settlement_query::configured_port().unwrap_or_else(|err| panic!("{err}"));
     let settlement_ledger = settlement_port.map(|_| Arc::new(SettlementLedger::default()));
 
+    let health = health_info(chain, &price_usd);
     let payment_cfg = Arc::new(PaymentConfig {
         pay_to,
         chain,
@@ -361,7 +362,7 @@ async fn main() {
     );
 
     let mut app = Router::new()
-        .route("/healthz", axum::routing::get(healthz))
+        .route("/healthz", axum::routing::get(healthz).with_state(health))
         .route(
             "/readyz",
             axum::routing::get(readyz).with_state(readyz_state),
@@ -736,9 +737,57 @@ async fn concurrency_limiter(
     response
 }
 
-async fn healthz() -> Json<serde_json::Value> {
+/// Public identity reported by `/healthz`, matching the TypeScript and Go
+/// templates: CAIP-2 network, asset symbol, and the `$`-prefixed price.
+#[derive(Clone)]
+struct HealthInfo {
+    network: String,
+    asset: String,
+    price: String,
+}
+
+fn health_info(chain: KiteChain, price_usd: &str) -> HealthInfo {
+    HealthInfo {
+        network: chain.network.to_owned(),
+        asset: chain.asset_symbol.to_owned(),
+        price: display_price(price_usd),
+    }
+}
+
+/// Templates advertise the configured price with a leading `$`.
+fn display_price(price_usd: &str) -> String {
+    let trimmed = price_usd.trim();
+    if trimmed.starts_with('$') {
+        trimmed.to_owned()
+    } else {
+        format!("${trimmed}")
+    }
+}
+
+/// `PAY_TO` must be present and be the 20-byte address the facilitator will
+/// settle to. The catalog schema uses the same `0x` + 40 hex pattern.
+fn require_pay_to(raw: &str) -> String {
+    let pay_to = raw.trim().to_owned();
+    if pay_to.is_empty() {
+        panic!("PAY_TO is required (the wallet that receives payment)");
+    }
+    let Some(hex) = pay_to.strip_prefix("0x") else {
+        panic!("PAY_TO must be a 0x-prefixed 40-character hex address, got {pay_to:?}");
+    };
+    if hex.len() != 40 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        panic!("PAY_TO must be a 0x-prefixed 40-character hex address, got {pay_to:?}");
+    }
+    pay_to
+}
+
+async fn healthz(State(info): State<HealthInfo>) -> Json<serde_json::Value> {
     tracing::debug!("Handling /healthz request");
-    Json(json!({ "status": "ok" }))
+    Json(json!({
+        "ok": true,
+        "network": info.network,
+        "asset": info.asset,
+        "price": info.price,
+    }))
 }
 
 /// State behind `/readyz`: the payment config for a live probe, plus the
@@ -902,7 +951,10 @@ mod tests {
     async fn healthz_returns_ok() {
         let metrics = Arc::new(ServiceMetrics::new());
         let app = Router::new()
-            .route("/healthz", get(healthz))
+            .route(
+                "/healthz",
+                get(healthz).with_state(health_info(kite_x402_axum::kite::KITE_TESTNET, "0.001")),
+            )
             .layer(middleware::from_fn_with_state(metrics, http_request_logger));
 
         let res = app
@@ -922,7 +974,10 @@ mod tests {
     async fn logger_handles_404() {
         let metrics = Arc::new(ServiceMetrics::new());
         let app = Router::new()
-            .route("/healthz", get(healthz))
+            .route(
+                "/healthz",
+                get(healthz).with_state(health_info(kite_x402_axum::kite::KITE_TESTNET, "0.001")),
+            )
             .layer(middleware::from_fn_with_state(metrics, http_request_logger));
 
         let res = app
@@ -1004,9 +1059,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn healthz_body_is_status_ok_json() {
-        let Json(v) = healthz().await;
-        assert_eq!(v, json!({ "status": "ok" }));
+    async fn healthz_body_reports_network_asset_and_price() {
+        let Json(v) = healthz(State(health_info(
+            kite_x402_axum::kite::KITE_TESTNET,
+            "0.001",
+        )))
+        .await;
+        assert_eq!(
+            v,
+            json!({
+                "ok": true,
+                "network": "eip155:2368",
+                "asset": "pieUSD",
+                "price": "$0.001",
+            })
+        );
+    }
+
+    #[test]
+    fn display_price_adds_a_single_dollar_prefix() {
+        assert_eq!(display_price("0.001"), "$0.001");
+        assert_eq!(display_price("$0.001"), "$0.001");
+        assert_eq!(display_price("  0.05"), "$0.05");
+    }
+
+    #[test]
+    fn pay_to_must_be_a_20_byte_hex_address() {
+        assert_eq!(
+            require_pay_to("  0xE2E0000000000000000000000000000000000E2E  "),
+            "0xE2E0000000000000000000000000000000000E2E"
+        );
+        for bad in [
+            "",
+            "   ",
+            "0x123",
+            "not-an-address",
+            "0xZZZZ000000000000000000000000000000000000",
+        ] {
+            let result = std::panic::catch_unwind(|| require_pay_to(bad));
+            assert!(result.is_err(), "{bad} should be rejected");
+        }
     }
 
     #[tokio::test]
@@ -1021,9 +1113,14 @@ mod tests {
     async fn metrics_endpoint_tracks_and_reports_requests() {
         let metrics = Arc::new(ServiceMetrics::new());
         let app = Router::new()
-            .route("/healthz", get(healthz))
-            .route("/metrics", get(metrics_endpoint))
-            .with_state(metrics.clone())
+            .route(
+                "/healthz",
+                get(healthz).with_state(health_info(kite_x402_axum::kite::KITE_TESTNET, "0.001")),
+            )
+            .route(
+                "/metrics",
+                get(metrics_endpoint).with_state(metrics.clone()),
+            )
             .layer(middleware::from_fn_with_state(
                 metrics.clone(),
                 http_request_logger,

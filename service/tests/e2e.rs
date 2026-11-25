@@ -518,7 +518,12 @@ async fn healthz_is_free_and_never_contacts_the_backends() {
     assert_eq!(resp.status(), 200);
     assert_eq!(
         resp.json::<Value>().await.unwrap(),
-        json!({ "status": "ok" })
+        json!({
+            "ok": true,
+            "network": "eip155:2368",
+            "asset": "pieUSD",
+            "price": "$0.001",
+        })
     );
     assert!(mocks.timeline().is_empty());
 }
@@ -642,7 +647,7 @@ async fn full_pay_per_call_flow_over_real_http() {
     let challenge = header_json(&unpaid, "payment-required");
     assert_eq!(
         challenge["resource"]["url"],
-        "/v1/forecast?latitude=52.52&longitude=13.41"
+        svc.url("/v1/forecast?latitude=52.52&longitude=13.41")
     );
     assert_eq!(challenge["accepts"][0]["payTo"], PAY_TO);
     assert_eq!(challenge["accepts"][0]["network"], "eip155:2368");
@@ -1505,6 +1510,20 @@ fn refuses_to_start_without_pay_to() {
     ]);
     assert!(!status.success());
     assert!(stderr.contains("PAY_TO is required"), "{stderr}");
+}
+
+#[test]
+fn refuses_a_pay_to_that_is_not_an_address() {
+    let (status, stderr) = run_expecting_failure(vec![
+        ("PAY_TO", "0x123"),
+        ("UPSTREAM_URL", "http://localhost:1"),
+        ("RUST_LOG", "off"),
+    ]);
+    assert!(!status.success());
+    assert!(
+        stderr.contains("PAY_TO must be a 0x-prefixed 40-character hex address"),
+        "{stderr}"
+    );
 }
 
 #[test]
