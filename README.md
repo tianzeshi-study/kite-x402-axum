@@ -40,14 +40,21 @@ from the same proxy. The value is a JSON array of rules.
 
 ```dotenv
 PRICE_USD=0.01
-ROUTE_PRICES_USD='[{"method":"GET","path":"/v1/forecast","price":"0.001"},{"method":"POST","path":"/v1/report","price":"0.05"}]'
+ROUTE_PRICES_USD='[{"method":"GET","path":"/v1/forecast","price":"0.001"},{"method":"GET","path":"/v1/reports/{id}","price":"0.05"}]'
 ```
 
-Each rule matches the exact HTTP method and full, case-sensitive request path
-under `/v1/`. Use URL-encoded paths for rules and requests. The query string does
-not affect pricing. Unmatched metered requests use `PRICE_USD`. When the array is
-empty or unset, all metered requests use that default. Invalid or duplicate
-rules fail at startup.
+Each rule matches the exact HTTP method and the full, case-sensitive URL path
+under `/v1/`. A `{name}` placeholder matches one nonempty path segment, so
+`GET /v1/reports/42` and `GET /v1/reports/43` both cost `$0.05` in this example.
+Use ASCII letters, digits and underscores in placeholder names, starting with a
+letter or underscore. Placeholders must fill the entire segment. Paths are
+matched as URL-encoded strings, so a literal brace must be encoded as `%7B` or
+`%7D`. Query strings do not affect pricing.
+
+An exact path rule takes priority over a matching template for the same method.
+Invalid rules, duplicate exact rules, and overlapping templates for the same
+method fail at startup. Unmatched metered requests use `PRICE_USD`, as do all
+metered requests when the array is empty or unset.
 
 Use `extra_payment_options` in a rule to set the alternatives for that route.
 Omit the field to inherit `EXTRA_PAYMENT_OPTIONS`, use `[]` to offer only the

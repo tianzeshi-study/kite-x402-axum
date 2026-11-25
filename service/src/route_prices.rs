@@ -47,9 +47,41 @@ struct RoutePrice {
 }
 
 #[derive(Debug)]
+struct RoutePattern {
+    segments: Vec<Option<String>>,
+    price: RoutePrice,
+}
+
+impl RoutePattern {
+    fn matches(&self, path: &str) -> bool {
+        let mut segments = path.split('/');
+        self.segments.iter().all(|expected| {
+            segments.next().is_some_and(|actual| match expected {
+                Some(literal) => literal == actual,
+                None => !actual.is_empty(),
+            })
+        }) && segments.next().is_none()
+    }
+
+    fn overlaps(&self, segments: &[Option<String>]) -> bool {
+        self.segments.len() == segments.len()
+            && self
+                .segments
+                .iter()
+                .zip(segments)
+                .all(|(left, right)| match (left, right) {
+                    (Some(left), Some(right)) => left == right,
+                    (Some(literal), None) | (None, Some(literal)) => !literal.is_empty(),
+                    (None, None) => true,
+                })
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct RoutePrices {
     default: Arc<PaymentConfig>,
     overrides: HashMap<String, HashMap<Method, RoutePrice>>,
+    patterns: HashMap<Method, Vec<RoutePattern>>,
     /// Default extras for routes without an explicit list.
     extras: Vec<PaymentOption>,
 }
@@ -66,17 +98,29 @@ impl RoutePrices {
         }
 
         let mut overrides: HashMap<String, HashMap<Method, RoutePrice>> = HashMap::new();
+        let mut patterns: HashMap<Method, Vec<RoutePattern>> = HashMap::new();
         if !value.trim().is_empty() {
             let rules: Vec<Rule> = serde_json::from_str(value).map_err(|err| err.to_string())?;
             for (index, rule) in rules.into_iter().enumerate() {
                 let method = Method::from_bytes(rule.method.as_bytes())
                     .map_err(|_| format!("rule {} has an invalid HTTP method", index + 1))?;
-                if rule.method == "*" || !is_paid_path(&rule.path) {
-                    return Err(format!(
-                        "rule {} must specify an exact HTTP method and path under /v1/",
+                let invalid_path = || {
+                    format!(
+                        "rule {} must specify a concrete HTTP method and a valid path under /v1/",
                         index + 1
-                    ));
+                    )
+                };
+                if rule.method == "*" {
+                    return Err(invalid_path());
                 }
+                let segments = if rule.path.contains(['{', '}']) {
+                    Some(parse_path_pattern(&rule.path).ok_or_else(invalid_path)?)
+                } else {
+                    if !is_paid_path(&rule.path) {
+                        return Err(invalid_path());
+                    }
+                    None
+                };
                 default
                     .chain
                     .parse_price(&rule.price)
@@ -101,7 +145,19 @@ impl RoutePrices {
                     )?;
                 }
                 let price = RoutePrice { primary, extras };
-                if overrides
+                if let Some(segments) = segments {
+                    let method_patterns = patterns.entry(method).or_default();
+                    if method_patterns
+                        .iter()
+                        .any(|pattern| pattern.overlaps(&segments))
+                    {
+                        return Err(format!(
+                            "rule {} overlaps an earlier path template for the same HTTP method",
+                            index + 1
+                        ));
+                    }
+                    method_patterns.push(RoutePattern { segments, price });
+                } else if overrides
                     .entry(rule.path)
                     .or_default()
                     .insert(method, price)
@@ -114,6 +170,7 @@ impl RoutePrices {
         Ok(Self {
             default,
             overrides,
+            patterns,
             extras: default_extras,
         })
     }
@@ -124,6 +181,12 @@ impl RoutePrices {
             .overrides
             .values()
             .flat_map(HashMap::values)
+            .chain(
+                self.patterns
+                    .values()
+                    .flatten()
+                    .map(|pattern| &pattern.price),
+            )
             .filter_map(|route| route.extras.as_deref())
             .flatten();
         let networks: BTreeSet<_> = std::iter::once(self.default.chain.network)
@@ -138,7 +201,21 @@ impl RoutePrices {
     }
 
     pub(super) fn has_overrides(&self) -> bool {
-        !self.overrides.is_empty()
+        !self.overrides.is_empty() || !self.patterns.is_empty()
+    }
+
+    fn price_for(&self, method: &Method, path: &str) -> Option<&RoutePrice> {
+        self.overrides
+            .get(path)
+            .and_then(|methods| methods.get(method))
+            .or_else(|| {
+                let path = path.strip_prefix("/v1/")?;
+                self.patterns
+                    .get(method)?
+                    .iter()
+                    .find(|pattern| pattern.matches(path))
+                    .map(|pattern| &pattern.price)
+            })
     }
 }
 
@@ -203,6 +280,33 @@ fn is_paid_path(path: &str) -> bool {
         })
 }
 
+fn parse_path_pattern(path: &str) -> Option<Vec<Option<String>>> {
+    let mut validation_path = String::from("/v1");
+    let mut segments = Vec::new();
+    for segment in path.strip_prefix("/v1/")?.split('/') {
+        validation_path.push('/');
+        if let Some(name) = segment
+            .strip_prefix('{')
+            .and_then(|part| part.strip_suffix('}'))
+        {
+            let mut bytes = name.bytes();
+            if !bytes
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                return None;
+            }
+            validation_path.push('x');
+            segments.push(None);
+        } else {
+            validation_path.push_str(segment);
+            segments.push(Some(segment.to_owned()));
+        }
+    }
+    is_paid_path(&validation_path).then_some(segments)
+}
+
 fn is_encoded_path(path: &str) -> bool {
     // Reject characters that URL parsing would encode, strip, or treat as delimiters.
     path.bytes().all(|byte| {
@@ -233,10 +337,7 @@ pub(super) async fn route_payment(
             .into_response();
     }
     // Match the full public path before Axum strips the /v1 prefix.
-    let route = prices
-        .overrides
-        .get(uri.path())
-        .and_then(|methods| methods.get(req.method()));
+    let route = prices.price_for(req.method(), uri.path());
     let config = route.map_or(&prices.default, |route| &route.primary);
     let extras = route
         .and_then(|route| route.extras.as_deref())

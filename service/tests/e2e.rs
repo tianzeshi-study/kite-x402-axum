@@ -1326,6 +1326,93 @@ async fn route_prices_control_challenges_and_settlement() {
 }
 
 #[tokio::test]
+async fn route_prices_apply_path_templates_to_challenges_and_settlement() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.extend([
+        ("PRICE_USD".into(), "0.01".into()),
+        (
+            "ROUTE_PRICES_USD".into(),
+            json!([
+                {"method": "GET", "path": "/v1/reports/{id}/result", "price": "0.05"},
+                {"method": "GET", "path": "/v1/reports/sample/result", "price": "0.02"},
+                {"method": "GET", "path": "/v1/reports/{id}/summary", "price": "0.03"},
+                {"method": "POST", "path": "/v1/reports/{id}/result", "price": "0.06"}
+            ])
+            .to_string(),
+        ),
+    ]);
+    let svc = Service::start(env).await;
+
+    for path in [
+        "/v1/reports//result",
+        "/v1/reports/a/b/result",
+        "/v1/reports/a",
+    ] {
+        assert_eq!(svc.requirements(path).await.amount, "10000000000000000");
+    }
+    let sample = svc.requirements("/v1/reports/sample/result").await;
+    assert_eq!(sample.amount, "20000000000000000");
+    assert_eq!(
+        svc.requirements("/v1/reports/first/summary").await.amount,
+        "30000000000000000"
+    );
+    let post = svc
+        .http
+        .post(svc.url("/v1/reports/first/result"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(post.status(), 402);
+    assert_eq!(
+        header_json(&post, "payment-required")["accepts"][0]["amount"],
+        "60000000000000000"
+    );
+
+    let rejected = svc
+        .http
+        .get(svc.url("/v1/reports/first/result"))
+        .header("PAYMENT-SIGNATURE", payment_header(&sample))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 402);
+    assert!(mocks.timeline().is_empty());
+
+    let mut expected_requirements = Vec::new();
+    for path in [
+        "/reports/first/result?format=json",
+        "/reports/second%20id/result",
+    ] {
+        let public_path = format!("/v1{path}");
+        let requirements = svc.requirements(&public_path).await;
+        assert_eq!(requirements.amount, "50000000000000000");
+        let paid = svc
+            .http
+            .get(svc.url(&public_path))
+            .header("PAYMENT-SIGNATURE", payment_header(&requirements))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(paid.status(), 200);
+        assert_eq!(header_json(&paid, "payment-response")["success"], true);
+        assert_eq!(mocks.upstream.last().path_and_query, path);
+        expected_requirements.push(serde_json::to_value(requirements).unwrap());
+    }
+    assert_eq!(mocks.upstream.count(), 2);
+    for recorded in [
+        &mocks.facilitator.verify_requests,
+        &mocks.facilitator.settle_requests,
+    ] {
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(recorded.len(), expected_requirements.len());
+        for (request, expected) in recorded.iter().zip(&expected_requirements) {
+            assert_eq!(&request["paymentRequirements"], expected);
+        }
+    }
+}
+
+#[tokio::test]
 async fn route_prices_resolve_extra_payment_options_per_route() {
     let mocks = Mocks::start().await;
     let mut env = Service::base_env(&mocks, free_port());
@@ -1424,11 +1511,11 @@ async fn route_prices_reject_upstream_redirects_without_settling() {
     let mut env = Service::base_env(&mocks, free_port());
     env.push((
         "ROUTE_PRICES_USD".into(),
-        r#"[{"method":"GET","path":"/v1/report","price":"0.05"}]"#.into(),
+        r#"[{"method":"GET","path":"/v1/reports/{id}","price":"0.05"}]"#.into(),
     ));
     let svc = Service::start(env).await;
 
-    let paid = svc.pay_get("/v1/forecast").await;
+    let paid = svc.pay_get("/v1/reports/first").await;
     assert_eq!(paid.status(), 502);
     assert!(!paid.headers().contains_key("payment-response"));
     assert_eq!(mocks.upstream.count(), 1);
@@ -1500,19 +1587,43 @@ fn route_prices_reject_invalid_configuration_at_startup() {
         ),
         (
             json!([{"method":"GET","path":"/healthz","price":"0.001"}]).to_string(),
-            "exact HTTP method and path",
+            "a valid path under /v1/",
         ),
         (
             json!([{"method":"GET","path":"/v1/{*path}","price":"0.001"}]).to_string(),
-            "exact HTTP method and path",
+            "a valid path under /v1/",
+        ),
+        (
+            json!([{"method":"GET","path":"/v1/reports/item-{id}","price":"0.001"}]).to_string(),
+            "a valid path under /v1/",
+        ),
+        (
+            json!([{"method":"GET","path":"/v1/reports/{id}/%2e%2E","price":"0.001"}]).to_string(),
+            "a valid path under /v1/",
+        ),
+        (
+            json!([
+                {"method":"GET","path":"/v1/reports/{id}","price":"0.001"},
+                {"method":"GET","path":"/v1/reports/{name}","price":"0.002"}
+            ])
+            .to_string(),
+            "rule 2 overlaps an earlier path template",
+        ),
+        (
+            json!([
+                {"method":"GET","path":"/v1/reports/{id}/result","price":"0.001"},
+                {"method":"GET","path":"/v1/reports/latest/{view}","price":"0.002"}
+            ])
+            .to_string(),
+            "rule 2 overlaps an earlier path template",
         ),
         (
             json!([{"method":"GET","path":"/v1/forecast?city=Berlin","price":"0.001"}]).to_string(),
-            "exact HTTP method and path",
+            "a valid path under /v1/",
         ),
         (
             json!([{"method":"GET","path":"/v1/forecast%xyz","price":"0.001"}]).to_string(),
-            "exact HTTP method and path",
+            "a valid path under /v1/",
         ),
         (
             json!([{"method":"GET","path":"/v1/forecast","price":"cheap"}]).to_string(),
@@ -2867,7 +2978,7 @@ async fn background_probe_checks_route_specific_networks() {
     let env = env_with(
         env,
         "ROUTE_PRICES_USD",
-        r#"[{"method":"GET","path":"/v1/report","price":"0.05","extra_payment_options":[{"network":"mainnet","price":"0.06"}]}]"#,
+        r#"[{"method":"GET","path":"/v1/reports/{id}","price":"0.05","extra_payment_options":[{"network":"mainnet","price":"0.06"}]}]"#,
     );
     let svc = Service::start(env).await;
 
