@@ -52,3 +52,35 @@ fn valid_subnet_boundaries_keep_their_matching_behavior() {
         assert_eq!(rule.matches(&outside), prefix <= 1);
     }
 }
+
+/// A dual-stack listener reports IPv4 callers as `::ffff:a.b.c.d`. An
+/// allow-list written with plain IPv4 addresses must still match them, in both
+/// directions, or binding `[::]` silently denies every allowed client.
+#[test]
+fn ipv4_mapped_peers_match_ipv4_rules() {
+    let v4: IpAddr = Ipv4Addr::new(127, 0, 0, 1).into();
+    let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+
+    assert!(FirewallRule::Exact(v4).matches(&mapped));
+    assert!(FirewallRule::Exact(mapped).matches(&v4));
+    assert!(FirewallRule::subnet_v4(Ipv4Addr::new(127, 0, 0, 0), 8).matches(&mapped));
+
+    let firewall = IpFirewall::new(IpFirewallConfig {
+        allow_rules: vec![FirewallRule::Exact(v4)],
+        ..Default::default()
+    });
+    assert_eq!(firewall.evaluate(&mapped), IpFilterAction::Allow);
+}
+
+/// Mapping only collapses `::ffff:0:0/96`; native IPv6 addresses must stay
+/// distinct from IPv4, otherwise an IPv4 allow rule would admit `::1`.
+#[test]
+fn native_ipv6_is_not_treated_as_ipv4() {
+    let loopback_v6 = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+    let firewall = IpFirewall::new(IpFirewallConfig {
+        allow_rules: vec![FirewallRule::Exact(Ipv4Addr::LOCALHOST.into())],
+        ..Default::default()
+    });
+    assert_eq!(firewall.evaluate(&loopback_v6), IpFilterAction::Deny);
+    assert!(!FirewallRule::Exact(Ipv4Addr::LOCALHOST.into()).matches(&loopback_v6));
+}
