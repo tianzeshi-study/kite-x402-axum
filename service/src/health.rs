@@ -99,22 +99,21 @@ pub(crate) async fn run_probe_loop<F, Fut>(
 {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {
+    tokio::select! {
+        biased;
+        _ = shutdown.wait_for(|stopping| *stopping) => {
+            tracing::debug!("Background facilitator probe stopped");
+        }
+        _ = async {
+            loop {
+                ticker.tick().await;
                 let outcome = probe().await;
                 if let Err(error) = &outcome {
                     tracing::warn!(%error, "Background facilitator probe failed");
                 }
                 state.record(outcome);
             }
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    tracing::debug!("Background facilitator probe stopped");
-                    return;
-                }
-            }
-        }
+        } => {}
     }
 }
 
@@ -206,6 +205,34 @@ mod tests {
         task.await.unwrap();
         tokio::time::sleep(Duration::from_secs(60)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 3, "no probes after shutdown");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_an_in_flight_probe() {
+        let state = ReadinessState::new();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut started_tx = Some(started_tx);
+        let task = tokio::spawn(run_probe_loop(
+            state.clone(),
+            Duration::from_secs(30),
+            shutdown_rx,
+            move || {
+                started_tx.take().unwrap().send(()).unwrap();
+                std::future::pending()
+            },
+        ));
+
+        started_rx.await.unwrap();
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("probe loop must stop without waiting for the probe")
+            .unwrap();
+        assert!(
+            state.latest().is_none(),
+            "no outcome from a cancelled probe"
+        );
     }
 
     #[tokio::test(start_paused = true)]

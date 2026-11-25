@@ -411,6 +411,8 @@ async fn main() {
     )
     .with_graceful_shutdown(async move {
         shutdown_signal().await;
+        // Dependency probes are not needed while existing requests drain.
+        let _ = shutdown_tx.send(true);
         let _ = settlement_shutdown_tx.send(true);
         let _ = signal_tx.send(());
     });
@@ -443,8 +445,6 @@ async fn main() {
             );
         }
     }
-    // Stop background tasks (they also stop if the sender is dropped).
-    let _ = shutdown_tx.send(true);
     tracing::info!("Server shut down gracefully");
 }
 
