@@ -1189,7 +1189,18 @@ mod tests {
             network: format!("  {clean_network}  "),
             amount: None,
         };
-        record_settlement(&cfg, &req, Some("0xabc"), &settle);
+        // `record_settlement` now also takes the decoded payload so it can
+        // attach on-chain reconciliation details when a settlement comes back
+        // without a transaction hash. This case has a hash, so the payload is
+        // only a required argument.
+        let payload = PaymentPayload {
+            x402_version: 2,
+            resource: None,
+            accepted: req.clone(),
+            payload: serde_json::Value::Null,
+            extensions: None,
+        };
+        record_settlement(&cfg, &payload, &req, Some("0xabc"), &settle);
 
         assert!(
             ledger.get_by_network_tx(&clean_network, "0xdead").is_some(),
