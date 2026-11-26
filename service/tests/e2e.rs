@@ -1251,6 +1251,36 @@ async fn an_invalid_price_starts_fine_but_fails_every_metered_request_with_500()
 }
 
 #[tokio::test]
+async fn a_price_no_authorization_could_carry_is_a_500_not_a_challenge() {
+    // One unit above the uint256 an EIP-3009 `value` can hold, written as a
+    // USD price with mainnet's six decimals. Nothing is wrong with it as a
+    // decimal, so without the bound it went into every challenge: a price no
+    // buyer could sign.
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push(("KITE_NETWORK".into(), "mainnet".into()));
+    let max = kite_x402_axum::kite::MAX_UINT256_DECIMAL;
+    let fraction = max[max.len() - 6..].parse::<u32>().unwrap() + 1;
+    env.push((
+        "PRICE_USD".into(),
+        format!("{}.{fraction:06}", &max[..max.len() - 6]),
+    ));
+    let svc = Service::start(env).await;
+
+    assert_eq!(svc.get("/healthz").await.status(), 200);
+    let resp = svc.get("/v1/x").await;
+    assert_eq!(resp.status(), 500);
+    let error = resp.json::<Value>().await.unwrap()["error"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        error.contains("invalid PRICE_USD") && error.contains("more than a uint256 can hold"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn route_prices_control_challenges_and_settlement() {
     let mocks = Mocks::start().await;
     let mut env = Service::base_env(&mocks, free_port());

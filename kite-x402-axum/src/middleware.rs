@@ -254,8 +254,7 @@ fn reconciliation_details(
     payload: &PaymentPayload,
     requirements: &PaymentRequirements,
 ) -> Option<SettlementReconciliation> {
-    const MAX_UINT256: &str =
-        "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+    const MAX_UINT256: &str = crate::kite::MAX_UINT256_DECIMAL;
 
     fn fixed_hex(value: &str, bytes: usize) -> Option<String> {
         let digits = value
@@ -1066,6 +1065,22 @@ mod tests {
                 "{bad:?}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn a_price_no_authorization_could_carry_is_reported_not_advertised() {
+        // One unit above 2^256 - 1. It is a positive decimal with exactly
+        // mainnet's six fractional digits, so nothing else is wrong with it;
+        // an EIP-3009 `value` still cannot hold it.
+        let max = crate::kite::MAX_UINT256_DECIMAL;
+        let fraction = max[max.len() - 6..].parse::<u32>().unwrap() + 1;
+        let too_large = format!("{}.{fraction:06}", &max[..max.len() - 6]);
+        let err = config(KITE_MAINNET, &too_large).requirements().unwrap_err();
+        assert!(
+            err.starts_with("invalid PRICE_USD configured on the server: ")
+                && err.contains("more than a uint256 can hold"),
+            "{err}"
+        );
     }
 
     #[test]
