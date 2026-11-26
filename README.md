@@ -271,6 +271,15 @@ contains `event_id`, `event_type`, `timestamp_ms`, and optional `payer`,
 `network`, `amount_atomic`, `tx_hash`, and query-free `request_path`. It never
 contains the payment signature.
 
+The payment gate emits at most one event for a metered request:
+
+- `payment_prompted` when the gate issues a challenge to an unpaid request.
+- `payment_verified` when the facilitator verifies the authorization but the upstream returns an error and settlement is skipped.
+- `payment_settled` when the gate accepts a successful settlement receipt. Use this event to trigger fulfillment.
+- `payment_failed` when the gate rejects a payment or cannot confirm settlement. An unconfirmed settlement may still need reconciliation.
+
+Challenges and payment rejections that return a challenge report the first advertised payment option. Requests rejected before the payment gate, for example by the rate limiter, do not produce an event.
+
 Only 2xx responses count as delivered. The service retries failures up to three
 times with exponential backoff starting at 500 ms, disables redirects, and
 times out each attempt after five seconds. A bounded in-memory queue holds up

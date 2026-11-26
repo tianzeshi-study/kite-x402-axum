@@ -318,16 +318,20 @@ fn run_expecting_failure(env: Vec<(&str, &str)>) -> (ExitStatus, String) {
 // Payment webhooks
 // ===========================================================================
 
+fn webhook_env(mocks: &Mocks, url: String) -> Vec<(String, String)> {
+    let mut env = Service::base_env(mocks, free_port());
+    env.extend([
+        ("WEBHOOK_URLS".into(), url),
+        ("WEBHOOK_SIGNING_SECRET".into(), WEBHOOK_SECRET.into()),
+    ]);
+    env
+}
+
 #[tokio::test]
 async fn webhook_events_are_signed_retried_and_isolated_from_payment_responses() {
     let mocks = Mocks::start().await;
     let (webhook_url, receiver) = start_webhook_receiver(true).await;
-    let mut env = Service::base_env(&mocks, free_port());
-    env.extend([
-        ("WEBHOOK_URLS".into(), webhook_url),
-        ("WEBHOOK_SIGNING_SECRET".into(), WEBHOOK_SECRET.into()),
-    ]);
-    let svc = Service::start(env).await;
+    let svc = Service::start(webhook_env(&mocks, webhook_url)).await;
 
     let challenge = svc.get("/v1/forecast?private=do-not-forward").await;
     assert_eq!(challenge.status(), 402);
@@ -367,11 +371,78 @@ async fn webhook_events_are_signed_retried_and_isolated_from_payment_responses()
     assert_eq!(events[0]["request_path"], "/v1/forecast");
     assert_eq!(events[1]["event_type"], "payment_prompted");
     assert_eq!(events[2]["event_type"], "payment_settled");
+    assert_eq!(events[2]["tx_hash"], TX_HASH);
+    assert_eq!(events[2]["payer"], PAYER);
+    assert_eq!(events[2]["network"], events[1]["network"]);
+    assert_eq!(events[2]["amount_atomic"], events[1]["amount_atomic"]);
     assert_eq!(events[3]["event_id"], events[2]["event_id"]);
     assert_eq!(events[3]["request_path"], "/v1/forecast");
     assert!(events
         .iter()
         .all(|event| event.get("payment_signature").is_none()));
+}
+
+#[tokio::test]
+async fn webhook_skips_requests_rejected_before_the_payment_gate() {
+    let mocks = Mocks::start().await;
+    let (url, receiver) = start_webhook_receiver(false).await;
+    let mut env = webhook_env(&mocks, url);
+    env.extend([
+        ("RATE_LIMIT_RPS".into(), "0.001".into()),
+        ("RATE_LIMIT_BURST".into(), "1".into()),
+    ]);
+    let svc = Service::start(env).await;
+
+    let response = svc.pay_get("/v1/forecast").await;
+    assert_eq!(response.status(), 429);
+    assert!(mocks.timeline().is_empty());
+    wait_for_webhook_count(&receiver, 1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let requests = receiver.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let event: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(event["event_type"], "payment_prompted");
+}
+
+#[tokio::test]
+async fn webhook_reports_verification_when_the_upstream_returns_an_error() {
+    let mocks = Mocks::start().await;
+    mocks.upstream.set_status(402);
+    let (url, receiver) = start_webhook_receiver(false).await;
+    let svc = Service::start(webhook_env(&mocks, url)).await;
+
+    let response = svc.pay_get("/v1/forecast").await;
+    assert_eq!(response.status(), 402);
+    assert_eq!(mocks.facilitator.verify_count(), 1);
+    assert_eq!(mocks.facilitator.settle_count(), 0);
+    wait_for_webhook_count(&receiver, 2).await;
+    let requests = receiver.requests.lock().unwrap();
+    let event: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(event["event_type"], "payment_verified");
+    assert_eq!(event["payer"], PAYER);
+    assert!(event["tx_hash"].is_null());
+}
+
+#[tokio::test]
+async fn webhook_reports_a_failed_settlement_with_the_verified_payer() {
+    let mocks = Mocks::start().await;
+    mocks.facilitator.set_settle(settle_failed(
+        "settlement declined",
+        kite_x402_axum::KITE_TESTNET.network,
+    ));
+    let (url, receiver) = start_webhook_receiver(false).await;
+    let svc = Service::start(webhook_env(&mocks, url)).await;
+
+    let response = svc.pay_get("/v1/forecast").await;
+    assert_eq!(response.status(), 402);
+    assert_eq!(mocks.facilitator.settle_count(), 1);
+    wait_for_webhook_count(&receiver, 2).await;
+    let requests = receiver.requests.lock().unwrap();
+    let event: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(event["event_type"], "payment_failed");
+    assert_eq!(event["payer"], PAYER);
+    assert_eq!(event["network"], kite_x402_axum::KITE_TESTNET.network);
+    assert!(event["tx_hash"].is_null());
 }
 
 #[test]

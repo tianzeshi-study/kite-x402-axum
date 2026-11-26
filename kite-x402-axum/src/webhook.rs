@@ -17,6 +17,24 @@ pub enum WebhookEventType {
     PaymentFailed,
 }
 
+/// The x402 payment gate's outcome, attached as an in-process response extension.
+///
+/// The gate emits at most one event per request. Downstream middleware can
+/// consume this extension to notify a merchant without interpreting HTTP headers.
+#[derive(Debug, Clone)]
+pub struct PaymentEvent {
+    /// Kind of payment outcome.
+    pub event_type: WebhookEventType,
+    /// Address reported by the facilitator, if available.
+    pub payer: Option<String>,
+    /// Network identifier (CAIP-2), if known.
+    pub network: Option<String>,
+    /// Amount in atomic token units, if known.
+    pub amount_atomic: Option<String>,
+    /// Transaction hash on the selected network, if reported by the facilitator.
+    pub tx_hash: Option<String>,
+}
+
 /// A dispatched webhook event payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookPayload {

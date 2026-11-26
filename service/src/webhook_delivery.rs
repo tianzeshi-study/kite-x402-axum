@@ -9,13 +9,9 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use kite_x402_axum::{
-    sign_payload,
-    types::{PaymentPayload, PaymentRequired, SettleResponse},
-    wire::decode_payment_payload,
-    DeliveryStatus, WebhookConfig, WebhookDispatcher, WebhookEventType, SIGNATURE_HEADER,
-    TIMESTAMP_HEADER,
+    sign_payload, webhook::PaymentEvent, DeliveryStatus, WebhookConfig, WebhookDispatcher,
+    SIGNATURE_HEADER, TIMESTAMP_HEADER,
 };
 use tokio::{
     sync::{watch, Notify},
@@ -177,73 +173,19 @@ pub(crate) async fn observe_payment_events(
     next: Next,
 ) -> Response {
     let path = uri.path().to_owned();
-    let signature = request
-        .headers()
-        .get("PAYMENT-SIGNATURE")
-        .or_else(|| request.headers().get("X-PAYMENT"))
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let payload = signature
-        .as_deref()
-        .and_then(|value| decode_payment_payload(value).ok());
-    let response = next.run(request).await;
-    let payment_response = response
-        .headers()
-        .get("PAYMENT-RESPONSE")
-        .and_then(|value| value.to_str().ok())
-        .and_then(decode_settle_response);
-    let challenge = response
-        .headers()
-        .get("PAYMENT-REQUIRED")
-        .and_then(|value| value.to_str().ok())
-        .and_then(decode_payment_required);
-
-    let (event_type, payer, network, amount, tx_hash) = if let Some(settle) = payment_response {
-        (
-            if settle.success {
-                WebhookEventType::PaymentSettled
-            } else {
-                WebhookEventType::PaymentFailed
-            },
-            settle
-                .payer
-                .or_else(|| authorization_payer(payload.as_ref())),
-            nonempty(settle.network),
-            settle
-                .amount
-                .or_else(|| payload.as_ref().map(|value| value.accepted.amount.clone())),
-            nonempty(settle.transaction),
-        )
-    } else if let Some(challenge) = challenge {
-        (
-            if signature.is_some() {
-                WebhookEventType::PaymentFailed
-            } else {
-                WebhookEventType::PaymentPrompted
-            },
-            authorization_payer(payload.as_ref()),
-            challenge.accepts.first().map(|item| item.network.clone()),
-            challenge.accepts.first().map(|item| item.amount.clone()),
-            None,
-        )
-    } else if signature.is_some() && response.status().as_u16() != 402 {
-        (
-            WebhookEventType::PaymentVerified,
-            authorization_payer(payload.as_ref()),
-            payload.as_ref().map(|value| value.accepted.network.clone()),
-            payload.as_ref().map(|value| value.accepted.amount.clone()),
-            None,
-        )
-    } else {
-        return response;
-    };
-
-    let delivery_ids =
-        runtime
-            .dispatcher
-            .enqueue_event(event_type, payer, network, amount, tx_hash, Some(path));
-    if !delivery_ids.is_empty() {
-        runtime.notify.notify_one();
+    let mut response = next.run(request).await;
+    if let Some(event) = response.extensions_mut().remove::<PaymentEvent>() {
+        let delivery_ids = runtime.dispatcher.enqueue_event(
+            event.event_type,
+            event.payer,
+            event.network,
+            event.amount_atomic,
+            event.tx_hash,
+            Some(path),
+        );
+        if !delivery_ids.is_empty() {
+            runtime.notify.notify_one();
+        }
     }
     response
 }
@@ -262,29 +204,6 @@ fn validate_target(target: &str) -> Result<String, String> {
         ));
     }
     Ok(target.to_owned())
-}
-
-fn decode_settle_response(value: &str) -> Option<SettleResponse> {
-    let bytes = STANDARD.decode(value.trim()).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-fn decode_payment_required(value: &str) -> Option<PaymentRequired> {
-    let bytes = STANDARD.decode(value.trim()).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-fn authorization_payer(payload: Option<&PaymentPayload>) -> Option<String> {
-    payload?
-        .payload
-        .get("authorization")?
-        .get("from")?
-        .as_str()
-        .map(str::to_owned)
-}
-
-fn nonempty(value: String) -> Option<String> {
-    (!value.trim().is_empty()).then_some(value)
 }
 
 fn unix_time_secs() -> u64 {
