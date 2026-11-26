@@ -276,10 +276,15 @@ def main() -> int:
         print("error: missing --private-key (or set X402_PRIVATE_KEY)", file=sys.stderr)
         return 2
 
+    try:
+        body = json.loads(args.body) if args.body is not None else None
+    except (ValueError, RecursionError):
+        print("error: --body must be valid JSON", file=sys.stderr)
+        return 2
+
     account = Account.from_key(args.private_key)
     print(f"payer address: {account.address}")
 
-    body = json.loads(args.body) if args.body else None
     headers = {}
 
     print(f"\n--- 1) unauthenticated {args.method} {args.url}")

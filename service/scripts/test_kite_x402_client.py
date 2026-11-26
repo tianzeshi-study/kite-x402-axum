@@ -79,6 +79,28 @@ class ClientSettlementTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(send.call_count, 1)
 
+    def test_invalid_json_body_stops_before_any_request(self):
+        for body in ('{"message":}', ""):
+            with self.subTest(body=body):
+                with patch.object(client.Account, "from_key") as load_key:
+                    status, errors, send = self.run_client(argv=["--method", "POST", "--body", body])
+                self.assertEqual(status, 2)
+                self.assertIn("--body must be valid JSON", errors)
+                load_key.assert_not_called()
+                send.assert_not_called()
+
+    def test_valid_json_body_is_sent_on_both_requests(self):
+        body = {"message": "hello"}
+        settled = response(200, **{"Payment-Response": encode_header(self.receipt)})
+        status, _, send = self.run_client(
+            self.challenge, settled, argv=["--method", "POST", "--body", json.dumps(body)]
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(send.call_count, 2)
+        for request in send.call_args_list:
+            self.assertEqual(request.args[0], "POST")
+            self.assertEqual(request.kwargs["json"], body)
+
     def test_initial_request_failure_stops_before_signing(self):
         for failure in (requests.ConnectionError, requests.Timeout):
             with self.subTest(failure=failure.__name__):
