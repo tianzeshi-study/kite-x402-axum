@@ -14,6 +14,57 @@ fn test_cors_origin_allowlist() {
     assert!(headers.is_some());
 }
 
+/// The gate accepts `X-PAYMENT` as the legacy spelling of the payment header
+/// (`middleware.rs` falls back to it), so a browser still using that name must
+/// survive the preflight. Before this, `Allow-Headers` listed only the v2
+/// header: the server would pay-protect the request but the browser would block
+/// it before it was ever sent.
+#[test]
+fn preflight_allows_the_legacy_payment_header() {
+    let guard = CorsSecurityGuard::new(vec!["https://app.gokite.ai"]);
+    let headers = guard.get_cors_headers("https://app.gokite.ai").unwrap();
+
+    let allowed = headers
+        .iter()
+        .find(|(name, _)| *name == "Access-Control-Allow-Headers")
+        .map(|(_, value)| value.to_ascii_lowercase())
+        .unwrap();
+    let names: Vec<&str> = allowed.split(',').map(str::trim).collect();
+
+    assert!(names.contains(&"payment-signature"), "{allowed}");
+    assert!(
+        names.contains(&"x-payment"),
+        "the legacy header the gate accepts must pass the preflight: {allowed}"
+    );
+}
+
+/// An allow-list echoes the caller's origin, so one URL answers differently per
+/// `Origin`. A cache that keys only on the URL can then serve one origin's
+/// response to another; `Vary: Origin` is what keeps that from happening.
+#[test]
+fn allow_list_responses_vary_on_origin() {
+    let guard = CorsSecurityGuard::new(vec!["https://app.gokite.ai"]);
+    let headers = guard.get_cors_headers("https://app.gokite.ai").unwrap();
+
+    let vary = headers
+        .iter()
+        .find(|(name, _)| *name == "Vary")
+        .map(|(_, value)| value.as_str());
+    assert_eq!(vary, Some("Origin"));
+}
+
+/// The wildcard answers `*` for every caller, so there is nothing to vary on.
+#[test]
+fn wildcard_responses_do_not_vary_on_origin() {
+    let guard = CorsSecurityGuard::new(vec!["*"]);
+    let headers = guard.get_cors_headers("https://app.gokite.ai").unwrap();
+
+    assert!(
+        headers.iter().all(|(name, _)| *name != "Vary"),
+        "a `*` response identical for every origin needs no Vary"
+    );
+}
+
 /// The default config advertises `allow_credentials: true`. A browser sends
 /// `Authorization` (the default x402 payment header) as a credentialed request,
 /// and discards the response unless this header is present. Without it the

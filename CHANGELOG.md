@@ -23,6 +23,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - `service` now declares the workspace license.
+- `kite-x402-axum`: `CorsSecurityGuard` now advertises the legacy `X-PAYMENT`
+  header in `Access-Control-Allow-Headers`, and sends `Vary: Origin` whenever it
+  echoes the caller's origin.
 
 ### Removed
 

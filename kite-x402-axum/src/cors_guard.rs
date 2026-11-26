@@ -97,8 +97,13 @@ impl CorsSecurityGuard {
                 "GET, POST, OPTIONS".to_owned(),
             ),
             (
+                // The gate accepts the legacy `X-PAYMENT` header
+                // (`middleware.rs` falls back to it when `PAYMENT-SIGNATURE`
+                // is absent). A browser that still sends it gets a preflight
+                // rejection unless it is advertised here, so a working server
+                // would look broken to exactly those clients.
                 "Access-Control-Allow-Headers",
-                "Content-Type, Authorization, PAYMENT-SIGNATURE".to_owned(),
+                "Content-Type, Authorization, PAYMENT-SIGNATURE, X-PAYMENT".to_owned(),
             ),
             (
                 "Access-Control-Expose-Headers",
@@ -119,6 +124,14 @@ impl CorsSecurityGuard {
         // the wildcard into "any origin may read authenticated responses".
         if self.config.allow_credentials && !wildcard {
             headers.push(("Access-Control-Allow-Credentials", "true".to_owned()));
+        }
+        // With an allow-list the origin is echoed, so the same URL answers
+        // differently per `Origin`. Without `Vary` a shared cache can hand one
+        // caller's response to another origin, which the browser then rejects
+        // (or, before the credentials fix, accepted). The wildcard answers `*`
+        // for every origin and needs no variation.
+        if !wildcard {
+            headers.push(("Vary", "Origin".to_owned()));
         }
         Some(headers)
     }
