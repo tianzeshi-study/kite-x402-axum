@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,6 +15,24 @@ pub enum WebhookEventType {
     PaymentSettled,
     /// A payment failed verification or settlement.
     PaymentFailed,
+}
+
+/// The x402 payment gate's outcome, attached as an in-process response extension.
+///
+/// The gate emits at most one event per request. Downstream middleware can
+/// consume this extension to notify a merchant without interpreting HTTP headers.
+#[derive(Debug, Clone)]
+pub struct PaymentEvent {
+    /// Kind of payment outcome.
+    pub event_type: WebhookEventType,
+    /// Address reported by the facilitator, if available.
+    pub payer: Option<String>,
+    /// Network identifier (CAIP-2), if known.
+    pub network: Option<String>,
+    /// Amount in atomic token units, if known.
+    pub amount_atomic: Option<String>,
+    /// Transaction hash on the selected network, if reported by the facilitator.
+    pub tx_hash: Option<String>,
 }
 
 /// A dispatched webhook event payload.
@@ -113,6 +131,7 @@ pub struct WebhookDispatcher {
 struct WebhookState {
     next_delivery_id: u64,
     queue: VecDeque<WebhookDeliveryRecord>,
+    in_flight: HashMap<u64, WebhookDeliveryRecord>,
     history: VecDeque<WebhookDeliveryRecord>,
 }
 
@@ -125,6 +144,7 @@ impl WebhookDispatcher {
             state: Arc::new(RwLock::new(WebhookState {
                 next_delivery_id: 1,
                 queue: VecDeque::new(),
+                in_flight: HashMap::new(),
                 history: VecDeque::new(),
             })),
         }
@@ -173,7 +193,7 @@ impl WebhookDispatcher {
             let delivery_id = state.next_delivery_id;
             state.next_delivery_id += 1;
 
-            let record = WebhookDeliveryRecord {
+            let mut record = WebhookDeliveryRecord {
                 delivery_id,
                 target_url: target.clone(),
                 payload: payload.clone(),
@@ -185,21 +205,27 @@ impl WebhookDispatcher {
                 last_attempt_ms: None,
             };
 
-            if state.queue.len() >= self.config.max_queue_size {
-                if let Some(evicted) = state.queue.pop_front() {
-                    // The caller was handed this delivery_id by an earlier
-                    // enqueue_event call and will never receive a result for
-                    // it: dropping it without a trace loses the notification
-                    // entirely. Park it in history as abandoned so the loss is
-                    // observable. Reuse `Abandoned` rather than adding an enum
-                    // variant, which would break downstream exhaustive matches.
-                    let mut evicted = evicted;
+            if state.queue.len() + state.in_flight.len() >= self.config.max_queue_size {
+                if let Some(mut evicted) = state.queue.pop_front() {
+                    // Keep dropped deliveries visible to callers that already
+                    // received their delivery id.
                     evicted.status = DeliveryStatus::Abandoned;
                     evicted.last_error = Some("evicted: webhook queue full".into());
                     if state.history.len() >= self.config.max_queue_size {
                         state.history.pop_front();
                     }
                     state.history.push_back(evicted);
+                } else {
+                    // In-flight work cannot be evicted safely. Record the new
+                    // delivery as abandoned rather than exceeding the bound.
+                    record.status = DeliveryStatus::Abandoned;
+                    record.last_error = Some("dropped: webhook queue full".into());
+                    if state.history.len() >= self.config.max_queue_size {
+                        state.history.pop_front();
+                    }
+                    state.history.push_back(record);
+                    delivery_ids.push(delivery_id);
+                    continue;
                 }
             }
             state.queue.push_back(record);
@@ -207,6 +233,45 @@ impl WebhookDispatcher {
         }
 
         delivery_ids
+    }
+
+    /// Atomically claims a pending delivery that is ready, preventing duplicate sends across workers.
+    #[must_use]
+    pub fn claim_next_pending(&self) -> Option<WebhookDeliveryRecord> {
+        let now = unix_time_ms();
+        let mut state = self.state.write().expect("lock poisoned");
+        let position = state.queue.iter().position(|record| match &record.status {
+            DeliveryStatus::Pending => true,
+            DeliveryStatus::Failed => retry_delay(&self.config, record)
+                .is_some_and(|delay| retry_is_due(record, now, delay)),
+            DeliveryStatus::Delivered | DeliveryStatus::Abandoned => false,
+        })?;
+        let mut record = state.queue.remove(position)?;
+        record.status = DeliveryStatus::Pending;
+        state.in_flight.insert(record.delivery_id, record.clone());
+        Some(record)
+    }
+
+    /// Returns the delay until the next delivery can be claimed, or `None` when no deliveries are queued.
+    #[must_use]
+    pub fn next_retry_delay(&self) -> Option<Duration> {
+        let now = unix_time_ms();
+        let state = self.state.read().expect("lock poisoned");
+        state
+            .queue
+            .iter()
+            .filter_map(|record| match &record.status {
+                DeliveryStatus::Pending => Some(Duration::ZERO),
+                DeliveryStatus::Failed => {
+                    let last_attempt_ms = record.last_attempt_ms.unwrap_or_default();
+                    retry_delay(&self.config, record).map(|delay| {
+                        let elapsed = Duration::from_millis(now.saturating_sub(last_attempt_ms));
+                        delay.saturating_sub(elapsed)
+                    })
+                }
+                DeliveryStatus::Delivered | DeliveryStatus::Abandoned => None,
+            })
+            .min()
     }
 
     /// Records the result of a delivery attempt.
@@ -224,12 +289,16 @@ impl WebhookDispatcher {
             .as_millis() as u64;
 
         let mut state = self.state.write().expect("lock poisoned");
-        if let Some(pos) = state
+        let record = if let Some(pos) = state
             .queue
             .iter()
             .position(|r| r.delivery_id == delivery_id)
         {
-            let mut record = state.queue.remove(pos).unwrap();
+            state.queue.remove(pos)
+        } else {
+            state.in_flight.remove(&delivery_id)
+        };
+        if let Some(mut record) = record {
             record.attempts += 1;
             record.last_attempt_ms = Some(now);
             record.last_status_code = status_code;
@@ -263,7 +332,7 @@ impl WebhookDispatcher {
     #[must_use]
     pub fn pending_count(&self) -> usize {
         let state = self.state.read().expect("lock poisoned");
-        state.queue.len()
+        state.queue.len() + state.in_flight.len()
     }
 
     /// Number of completed deliveries in history.
@@ -282,6 +351,32 @@ impl WebhookDispatcher {
         let state = self.state.read().expect("lock poisoned");
         state.history.iter().cloned().collect()
     }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn retry_delay(config: &WebhookConfig, record: &WebhookDeliveryRecord) -> Option<Duration> {
+    let exponent = record.attempts.saturating_sub(1).min(31);
+    let multiplier = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
+    Some(
+        config
+            .initial_backoff
+            .checked_mul(multiplier)
+            .unwrap_or(Duration::MAX),
+    )
+}
+
+fn retry_is_due(record: &WebhookDeliveryRecord, now_ms: u64, delay: Duration) -> bool {
+    let retry_at = record
+        .last_attempt_ms
+        .unwrap_or_default()
+        .saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+    now_ms >= retry_at
 }
 
 fn fastrand_hex(len: usize) -> String {
@@ -572,6 +667,27 @@ mod tests {
     }
 
     #[test]
+    fn in_flight_deliveries_count_toward_queue_capacity() {
+        let dispatcher = dispatcher(&["https://a.example/hook"], 3, 1);
+        let first = enqueue(&dispatcher)[0];
+        assert_eq!(dispatcher.claim_next_pending().unwrap().delivery_id, first);
+
+        let second = enqueue(&dispatcher)[0];
+        assert_eq!(dispatcher.pending_count(), 1);
+        assert!(dispatcher.claim_next_pending().is_none());
+        let dropped = dispatcher
+            .history()
+            .into_iter()
+            .find(|record| record.delivery_id == second)
+            .expect("capacity overflow must remain visible in history");
+        assert_eq!(dropped.status, DeliveryStatus::Abandoned);
+        assert_eq!(
+            dropped.last_error.as_deref(),
+            Some("dropped: webhook queue full")
+        );
+    }
+
+    #[test]
     fn history_is_bounded_and_keeps_the_newest_records() {
         let dispatcher = dispatcher(&["https://a.example/hook"], 0, 2);
         let mut delivered_ids = Vec::new();
@@ -587,5 +703,58 @@ mod tests {
         let history = dispatcher.history();
         assert_eq!(history[0].delivery_id, delivered_ids[3]);
         assert_eq!(history[1].delivery_id, delivered_ids[4]);
+    }
+
+    #[test]
+    fn claimed_deliveries_are_exclusive_and_retry_after_backoff() {
+        let dispatcher = WebhookDispatcher::new(WebhookConfig {
+            target_urls: vec!["https://a.example/hook".into()],
+            max_retries: 1,
+            initial_backoff: Duration::ZERO,
+            max_queue_size: 10,
+            signing_secret: None,
+        });
+        let id = enqueue(&dispatcher)[0];
+
+        let first = dispatcher.claim_next_pending().unwrap();
+        assert_eq!(first.delivery_id, id);
+        assert!(dispatcher.claim_next_pending().is_none());
+        assert_eq!(dispatcher.pending_count(), 1);
+
+        let failed = dispatcher
+            .record_attempt_result(id, false, Some(503), Some("unavailable".into()))
+            .unwrap();
+        assert_eq!(failed.status, DeliveryStatus::Failed);
+        assert_eq!(failed.attempts, 1);
+
+        let retry = dispatcher.claim_next_pending().unwrap();
+        assert_eq!(retry.delivery_id, id);
+        assert_eq!(retry.attempts, 1);
+        assert_eq!(
+            dispatcher
+                .record_attempt_result(id, true, Some(204), None)
+                .unwrap()
+                .status,
+            DeliveryStatus::Delivered
+        );
+    }
+
+    #[test]
+    fn failed_claims_wait_for_the_configured_backoff() {
+        let dispatcher = WebhookDispatcher::new(WebhookConfig {
+            target_urls: vec!["https://a.example/hook".into()],
+            max_retries: 1,
+            initial_backoff: Duration::from_secs(60),
+            max_queue_size: 10,
+            signing_secret: None,
+        });
+        let id = enqueue(&dispatcher)[0];
+        assert!(dispatcher.claim_next_pending().is_some());
+        dispatcher
+            .record_attempt_result(id, false, Some(503), None)
+            .unwrap();
+
+        assert!(dispatcher.claim_next_pending().is_none());
+        assert!(dispatcher.next_retry_delay().unwrap() > Duration::ZERO);
     }
 }

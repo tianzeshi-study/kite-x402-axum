@@ -14,6 +14,7 @@ use axum::{
     http::{header, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Json, Response},
+    Extension,
 };
 use serde_json::json;
 
@@ -21,7 +22,8 @@ use crate::{
     facilitator::FacilitatorClient,
     kite::{KiteChain, KITE_MAINNET, KITE_TESTNET},
     settlement_ledger::SettlementReconciliation,
-    types::{PaymentPayload, PaymentRequired, PaymentRequirements, ResourceInfo},
+    types::{PaymentPayload, PaymentRequired, PaymentRequirements, ResourceInfo, SettleResponse},
+    webhook::{PaymentEvent, WebhookEventType},
     wire::{decode_payment_payload, encode_payment_required, encode_settle_response},
 };
 
@@ -149,7 +151,23 @@ fn payment_required_response(
         accepts: requirements.to_vec(),
     };
 
-    let mut response = (StatusCode::PAYMENT_REQUIRED, Json(json!({}))).into_response();
+    let event = PaymentEvent {
+        event_type: if body.error.is_some() {
+            WebhookEventType::PaymentFailed
+        } else {
+            WebhookEventType::PaymentPrompted
+        },
+        payer: None,
+        network: requirements.first().map(|item| item.network.clone()),
+        amount_atomic: requirements.first().map(|item| item.amount.clone()),
+        tx_hash: None,
+    };
+    let mut response = (
+        StatusCode::PAYMENT_REQUIRED,
+        Extension(event),
+        Json(json!({})),
+    )
+        .into_response();
     let headers = response.headers_mut();
     headers.insert(
         "PAYMENT-REQUIRED",
@@ -160,7 +178,7 @@ fn payment_required_response(
     response
 }
 
-fn settlement_failure_response(settle: &crate::types::SettleResponse) -> Response {
+fn settlement_failure_response(settle: &SettleResponse) -> Response {
     let mut response = (StatusCode::PAYMENT_REQUIRED, Json(json!({}))).into_response();
     let headers = response.headers_mut();
     headers.insert(
@@ -170,6 +188,30 @@ fn settlement_failure_response(settle: &crate::types::SettleResponse) -> Respons
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+fn settlement_event(
+    settle: &SettleResponse,
+    requirements: &PaymentRequirements,
+    verified_payer: Option<String>,
+) -> PaymentEvent {
+    PaymentEvent {
+        event_type: if settle.success {
+            WebhookEventType::PaymentSettled
+        } else {
+            WebhookEventType::PaymentFailed
+        },
+        payer: settle.payer.clone().or(verified_payer),
+        network: Some(requirements.network.clone()),
+        amount_atomic: Some(
+            settle
+                .amount
+                .clone()
+                .unwrap_or_else(|| requirements.amount.clone()),
+        ),
+        tx_hash: (settle.network == requirements.network && !settle.transaction.trim().is_empty())
+            .then(|| settle.transaction.clone()),
+    }
 }
 
 /// Builds the absolute resource URL advertised in a 402 challenge.
@@ -630,7 +672,14 @@ async fn payment_gate_inner(
             status = status.as_u16(),
             "Upstream returned HTTP status >= 400; skipping settlement"
         );
-        return response;
+        let event = PaymentEvent {
+            event_type: WebhookEventType::PaymentVerified,
+            payer: verify.payer,
+            network: Some(requirements.network.clone()),
+            amount_atomic: Some(requirements.amount.clone()),
+            tx_hash: None,
+        };
+        return (Extension(event), response).into_response();
     }
 
     tracing::info!(
@@ -654,7 +703,7 @@ async fn payment_gate_inner(
                 error = %e,
                 "Facilitator settle unavailable"
             );
-            let failure = crate::types::SettleResponse {
+            let failure = SettleResponse {
                 success: false,
                 error_reason: Some(format!("facilitator settle unavailable: {e}")),
                 error_message: None,
@@ -674,7 +723,8 @@ async fn payment_gate_inner(
                 verify.payer.as_deref(),
                 &failure,
             );
-            return settlement_failure_response(&failure);
+            let event = settlement_event(&failure, requirements, verify.payer);
+            return (Extension(event), settlement_failure_response(&failure)).into_response();
         }
     };
 
@@ -719,7 +769,8 @@ async fn payment_gate_inner(
             verify.payer.as_deref(),
             &settle,
         );
-        return settlement_failure_response(&settle);
+        let event = settlement_event(&settle, requirements, verify.payer);
+        return (Extension(event), settlement_failure_response(&settle)).into_response();
     }
 
     tracing::info!(
@@ -753,6 +804,9 @@ async fn payment_gate_inner(
     );
 
     let (mut parts, body) = response.into_parts();
+    parts
+        .extensions
+        .insert(settlement_event(&settle, requirements, verify.payer));
     parts.headers.insert(
         "PAYMENT-RESPONSE",
         HeaderValue::from_str(&encode_settle_response(&settle))
@@ -1254,6 +1308,9 @@ mod tests {
             Some("because".into()),
         );
         assert_eq!(decode_header(&resp, "PAYMENT-REQUIRED")["error"], "because");
+        let event = resp.extensions().get::<PaymentEvent>().unwrap();
+        assert_eq!(event.event_type, WebhookEventType::PaymentFailed);
+        assert!(event.payer.is_none());
     }
 
     #[test]

@@ -249,6 +249,45 @@ The service exposes endpoints outside `/v1/*` that are unmetered (free) and neve
   - `server_errors`: Requests returning status >= 500.
   - `uptime_seconds`: Seconds elapsed since service startup.
 
+## Payment webhooks
+
+The example service can asynchronously notify configured merchant endpoints of
+payment challenges, verified authorizations, successful settlements, and
+failed verification or settlement. Webhooks are disabled unless
+`WEBHOOK_URLS` is set. Configure comma-separated absolute HTTP(S) endpoints and
+a shared signing secret of at least 32 bytes:
+
+```dotenv
+WEBHOOK_URLS=https://merchant.example.com/kite-events
+WEBHOOK_SIGNING_SECRET=replace-with-at-least-32-random-bytes
+```
+
+Generate a secret with `openssl rand -hex 32`. Each POST body is the serialized
+JSON event. `X-Kite-Timestamp` contains its Unix timestamp in seconds, and
+`X-Kite-Signature` is `v1=<hex HMAC-SHA256>` over the exact bytes
+`<timestamp>.<body>`. Receivers should verify the signature and reject
+timestamps outside a short tolerance using the shared secret. The event payload
+contains `event_id`, `event_type`, `timestamp_ms`, and optional `payer`,
+`network`, `amount_atomic`, `tx_hash`, and query-free `request_path`. It never
+contains the payment signature.
+
+The payment gate emits at most one event for a metered request:
+
+- `payment_prompted` when the gate issues a challenge to an unpaid request.
+- `payment_verified` when the facilitator verifies the authorization but the upstream returns an error and settlement is skipped.
+- `payment_settled` when the gate accepts a successful settlement receipt. Use this event to trigger fulfillment.
+- `payment_failed` when the gate rejects a payment or cannot confirm settlement. An unconfirmed settlement may still need reconciliation.
+
+Challenges and payment rejections that return a challenge report the first advertised payment option. Requests rejected before the payment gate, for example by the rate limiter, do not produce an event.
+
+Only 2xx responses count as delivered. The service retries failures up to three
+times with exponential backoff starting at 500 ms, disables redirects, and
+times out each attempt after five seconds. A bounded in-memory queue holds up
+to 1,000 deliveries; if it fills, the oldest pending delivery is marked
+abandoned. Queue contents are process-local and are lost on restart, so webhooks
+provide best-effort notification rather than durable delivery. A webhook
+failure never changes the buyer's payment response.
+
 ## Timeouts & Configuration
 
 | Variable | Default | Description |
@@ -278,6 +317,8 @@ The service exposes endpoints outside `/v1/*` that are unmetered (free) and neve
 | `FACILITATOR_VERIFY_BACKOFF_MS` | `150` | Backoff between verify retries in milliseconds. |
 | `FACILITATOR_SETTLE_RETRIES` | `0` | Must be 0 — settlement is never retried (indeterminate outcomes stay visible). |
 | `SETTLEMENT_QUERY_PORT` | Empty (off) | Enables [local settlement queries](#merchant-settlement-queries) on a separate IPv4 loopback port. |
+| `WEBHOOK_URLS` | Empty (off) | Comma-separated HTTP(S) payment event endpoints; requires `WEBHOOK_SIGNING_SECRET`. |
+| `WEBHOOK_SIGNING_SECRET` | Required when webhooks are enabled | At least 32 bytes shared with receivers to verify HMAC signatures. |
 | `FACILITATOR_HEALTH_INTERVAL_SECS` | Empty (off) | Background facilitator probe interval; 60..=86400 enables. |
 | `PAYMENT_CLOCK_DRIFT_SECS` | Empty (off) | Enables the expiration guard with this clock-drift tolerance. |
 | `PAYMENT_REPLAY_CACHE_SIZE` | Empty (off) | Enables nonce replay protection with this cache capacity (1..=1000000). |
