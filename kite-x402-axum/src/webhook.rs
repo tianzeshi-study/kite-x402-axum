@@ -120,6 +120,25 @@ impl Default for WebhookConfig {
     }
 }
 
+/// Upper bound on the delay between two delivery attempts of one webhook.
+pub const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(3600);
+
+impl WebhookConfig {
+    /// Delay to wait after `failed_attempts` consecutive failures before the
+    /// next attempt: `initial_backoff` after the first failure, doubling each
+    /// time, capped at [`MAX_RETRY_BACKOFF`]. Zero failures means no delay.
+    #[must_use]
+    pub fn backoff_for(&self, failed_attempts: u32) -> Duration {
+        if failed_attempts == 0 {
+            return Duration::ZERO;
+        }
+        let factor = 2u32.saturating_pow(failed_attempts - 1);
+        self.initial_backoff
+            .saturating_mul(factor)
+            .min(MAX_RETRY_BACKOFF)
+    }
+}
+
 /// Thread-safe webhook queue and dispatcher.
 #[derive(Debug, Clone)]
 pub struct WebhookDispatcher {
@@ -756,5 +775,39 @@ mod tests {
 
         assert!(dispatcher.claim_next_pending().is_none());
         assert!(dispatcher.next_retry_delay().unwrap() > Duration::ZERO);
+    }
+
+    #[test]
+    fn backoff_doubles_from_the_initial_delay_and_is_capped() {
+        let config = WebhookConfig {
+            initial_backoff: Duration::from_millis(500),
+            ..Default::default()
+        };
+        assert_eq!(config.backoff_for(0), Duration::ZERO);
+        assert_eq!(config.backoff_for(1), Duration::from_millis(500));
+        assert_eq!(config.backoff_for(2), Duration::from_secs(1));
+        assert_eq!(config.backoff_for(3), Duration::from_secs(2));
+        assert_eq!(config.backoff_for(4), Duration::from_secs(4));
+        assert_eq!(config.backoff_for(40), MAX_RETRY_BACKOFF);
+        assert_eq!(config.backoff_for(u32::MAX), MAX_RETRY_BACKOFF);
+    }
+
+    #[test]
+    fn backoff_never_exceeds_the_cap_even_for_huge_initial_delays() {
+        let config = WebhookConfig {
+            initial_backoff: Duration::MAX,
+            ..Default::default()
+        };
+        assert_eq!(config.backoff_for(1), MAX_RETRY_BACKOFF);
+        assert_eq!(config.backoff_for(30), MAX_RETRY_BACKOFF);
+    }
+
+    #[test]
+    fn a_zero_initial_backoff_retries_immediately() {
+        let config = WebhookConfig {
+            initial_backoff: Duration::ZERO,
+            ..Default::default()
+        };
+        assert_eq!(config.backoff_for(5), Duration::ZERO);
     }
 }
