@@ -120,6 +120,35 @@ impl Default for WebhookConfig {
     }
 }
 
+/// Header carrying the delivery id (unique per target).
+pub const DELIVERY_ID_HEADER: &str = "X-Kite-Delivery-Id";
+/// Header carrying the event id (shared by all targets of one event).
+pub const EVENT_ID_HEADER: &str = "X-Kite-Event-Id";
+
+use crate::webhook_signing::{SIGNATURE_HEADER, TIMESTAMP_HEADER};
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Builds the HTTP client webhooks should be delivered with: a 10 second
+/// timeout and **no redirect following**, so a configured target cannot
+/// bounce the service's POST to an unintended host.
+///
+/// # Errors
+///
+/// Returns an error if the TLS backend cannot be initialised.
+pub fn delivery_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .user_agent(concat!("kite-x402-axum/", env!("CARGO_PKG_VERSION")))
+        .build()
+}
+
 /// Upper bound on the delay between two delivery attempts of one webhook.
 pub const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(3600);
 
@@ -302,11 +331,17 @@ impl WebhookDispatcher {
         status_code: Option<u16>,
         error_msg: Option<String>,
     ) -> Option<WebhookDeliveryRecord> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        self.record_attempt_result_at(delivery_id, success, status_code, error_msg, now_ms())
+    }
 
+    fn record_attempt_result_at(
+        &self,
+        delivery_id: u64,
+        success: bool,
+        status_code: Option<u16>,
+        error_msg: Option<String>,
+        now: u64,
+    ) -> Option<WebhookDeliveryRecord> {
         let mut state = self.state.write().expect("lock poisoned");
         let record = if let Some(pos) = state
             .queue
@@ -344,6 +379,99 @@ impl WebhookDispatcher {
             }
         } else {
             None
+        }
+    }
+
+    /// Returns a copy of the oldest queued delivery that is due at `now_ms`
+    /// (Unix milliseconds), or `None` if nothing is due.
+    ///
+    /// A delivery is due if it has never been attempted, or if
+    /// [`WebhookConfig::backoff_for`] has elapsed since its last attempt.
+    #[must_use]
+    pub fn next_due(&self, now_ms: u64) -> Option<WebhookDeliveryRecord> {
+        let state = self.state.read().expect("lock poisoned");
+        state
+            .queue
+            .iter()
+            .find(|record| match record.last_attempt_ms {
+                None => true,
+                Some(last) => {
+                    let wait = u64::try_from(self.config.backoff_for(record.attempts).as_millis())
+                        .unwrap_or(u64::MAX);
+                    now_ms >= last.saturating_add(wait)
+                }
+            })
+            .cloned()
+    }
+
+    /// Delivers the next due webhook over HTTP and records the outcome.
+    ///
+    /// Returns the updated record, or `None` if nothing was due. The delivery
+    /// is a `POST` of the JSON [`WebhookPayload`] with `X-Kite-Timestamp`,
+    /// `X-Kite-Delivery-Id`, `X-Kite-Event-Id` and, when a signing secret is
+    /// configured, `X-Kite-Signature` (see [`crate::webhook_signing`]). Any
+    /// 2xx status counts as delivered; everything else, including transport
+    /// errors, is a failed attempt that is retried per [`WebhookConfig`].
+    ///
+    /// Use [`delivery_client`] to build `client`. Run at most one caller at a
+    /// time per dispatcher (a single background worker); concurrent
+    /// callers could deliver the same record twice.
+    pub async fn deliver_next(&self, client: &reqwest::Client) -> Option<WebhookDeliveryRecord> {
+        self.deliver_next_at(client, now_ms()).await
+    }
+
+    /// Like [`Self::deliver_next`], with the current time supplied by the
+    /// caller so scheduling can be tested without sleeping.
+    pub async fn deliver_next_at(
+        &self,
+        client: &reqwest::Client,
+        now_ms: u64,
+    ) -> Option<WebhookDeliveryRecord> {
+        let record = self.next_due(now_ms)?;
+        let timestamp_secs = now_ms / 1000;
+
+        let outcome = match serde_json::to_vec(&record.payload) {
+            Err(error) => Err((None, format!("could not serialize payload: {error}"))),
+            Ok(body) => {
+                let mut request = client
+                    .post(&record.target_url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .header(TIMESTAMP_HEADER, timestamp_secs.to_string())
+                    .header(DELIVERY_ID_HEADER, record.delivery_id.to_string())
+                    .header(EVENT_ID_HEADER, record.payload.event_id.as_str());
+                if let Some(secret) = &self.config.signing_secret {
+                    request = request.header(
+                        SIGNATURE_HEADER,
+                        crate::webhook_signing::sign_payload(secret, timestamp_secs, &body),
+                    );
+                }
+                match request.body(body).send().await {
+                    Ok(response) if response.status().is_success() => {
+                        Ok(response.status().as_u16())
+                    }
+                    Ok(response) => Err((
+                        Some(response.status().as_u16()),
+                        format!("HTTP {}", response.status()),
+                    )),
+                    // Drop the URL from the message: webhook URLs often carry
+                    // secrets in their path or query, and this text is stored
+                    // and may be logged.
+                    Err(error) => Err((None, error.without_url().to_string())),
+                }
+            }
+        };
+
+        match outcome {
+            Ok(status) => {
+                self.record_attempt_result_at(record.delivery_id, true, Some(status), None, now_ms)
+            }
+            Err((status, message)) => self.record_attempt_result_at(
+                record.delivery_id,
+                false,
+                status,
+                Some(message),
+                now_ms,
+            ),
         }
     }
 
