@@ -296,7 +296,7 @@ failure never changes the buyer's payment response.
 | `PAY_TO` | Required | Receiving wallet address on Kite (`0x` plus 40 hex characters). |
 | `UPSTREAM_URL` | Required | Protected upstream origin URL. |
 | `KITE_NETWORK` | `mainnet` | `mainnet` or `testnet`. |
-| `PRICE_USD` | `0.001` | Default price per call in USD. |
+| `PRICE_USD` | `0.001` | Default price per call in USD, e.g. `0.001` or `$0.001`. It may use at most the asset's decimals and must be an amount a uint256 can hold. |
 | `ROUTE_PRICES_USD` | Empty | Optional JSON array of [route price overrides](#pricing-by-route). |
 | `EXTRA_PAYMENT_OPTIONS` | *(unset)* | Comma-separated default alternatives, e.g. `testnet:0.002,mainnet:$0.05`. A route rule can replace or disable them. |
 | `PORT` | `8402` | Port for the reverse proxy service. |

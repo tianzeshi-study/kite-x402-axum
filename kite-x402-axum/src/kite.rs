@@ -38,6 +38,17 @@ pub enum KiteError {
         /// Symbol of the asset.
         symbol: &'static str,
     },
+    /// The price needs more units of the asset than an EIP-3009 authorization
+    /// can carry: its `value` is a uint256.
+    #[error("price {price} needs {amount} units of {symbol}, more than a uint256 can hold")]
+    AboveUint256 {
+        /// The offending price string.
+        price: String,
+        /// The number of smallest units it asks for.
+        amount: String,
+        /// Symbol of the asset.
+        symbol: &'static str,
+    },
 }
 
 /// One Kite network the wrapper can charge on.
@@ -87,6 +98,13 @@ pub const KITE_TESTNET: KiteChain = KiteChain {
 /// the `/v2` prefix must stay in the base URL.
 pub const FACILITATOR_URL: &str = "https://facilitator.pieverse.io/v2";
 
+/// The largest number an EIP-3009 `value` can hold — a uint256 — as a
+/// decimal string without leading zeros. [`KiteChain::parse_price`] refuses
+/// a price that needs more units than this, and settlement reconciliation
+/// refuses an authorization above it.
+pub const MAX_UINT256_DECIMAL: &str =
+    "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+
 /// Resolves the `KITE_NETWORK` environment value (`""`/`"mainnet"` or
 /// `"testnet"`) to a [`KiteChain`].
 pub fn kite_chain_by_name(name: &str) -> Result<KiteChain, KiteError> {
@@ -115,11 +133,12 @@ impl KiteChain {
     /// units for this chain's stablecoin, pinning the EIP-712 domain the
     /// facilitator expects.
     ///
-    /// Does integer string math (no floats) to avoid rounding, exactly like
-    /// `kite.ts`'s `kiteMoneyParser` and `kite.go`'s `MoneyParser`: at most
-    /// [`KiteChain::asset_decimals`] fractional digits, no scientific
-    /// notation, no sign, and the result must be at least one smallest unit
-    /// of the asset.
+    /// Does integer string math (no floats) to avoid rounding, like
+    /// `kite.ts`'s `kiteMoneyParser`: at most [`KiteChain::asset_decimals`]
+    /// fractional digits, no scientific notation, no sign, and the result
+    /// at least one smallest unit of the asset and at most
+    /// [`MAX_UINT256_DECIMAL`] of them. An EIP-3009 `value` cannot carry
+    /// more, so a larger price could be advertised but never paid.
     pub fn parse_price(&self, price_usd: &str) -> Result<AssetAmount, KiteError> {
         let trimmed = price_usd.trim();
         let text = trimmed.strip_prefix('$').unwrap_or(trimmed);
@@ -153,6 +172,18 @@ impl KiteChain {
         if units == "0" {
             return Err(KiteError::BelowOneUnit {
                 price: price_usd.to_owned(),
+                symbol: self.asset_symbol,
+            });
+        }
+
+        // `units` has no leading zeros, so the longer string is the larger
+        // number, and two of the same length compare digit by digit.
+        if units.len() > MAX_UINT256_DECIMAL.len()
+            || (units.len() == MAX_UINT256_DECIMAL.len() && units > MAX_UINT256_DECIMAL)
+        {
+            return Err(KiteError::AboveUint256 {
+                price: price_usd.to_owned(),
+                amount: units.to_owned(),
                 symbol: self.asset_symbol,
             });
         }
@@ -516,5 +547,60 @@ mod tests {
         for bad in ["", ".", "1.", ".1", "1.1.1", "a", "1a", "-1", " 1", "1 "] {
             assert!(!is_plain_positive_decimal(bad), "{bad:?}");
         }
+    }
+
+    /// `units` with its decimal point `decimals` digits from the right.
+    fn price_of(units: &str, decimals: usize) -> String {
+        format!(
+            "{}.{}",
+            &units[..units.len() - decimals],
+            &units[units.len() - decimals..]
+        )
+    }
+
+    /// `digits` plus one, as a decimal string.
+    fn plus_one(digits: &str) -> String {
+        let mut bytes = digits.as_bytes().to_vec();
+        for byte in bytes.iter_mut().rev() {
+            if *byte == b'9' {
+                *byte = b'0';
+            } else {
+                *byte += 1;
+                return String::from_utf8(bytes).expect("digits");
+            }
+        }
+        unreachable!("the caller passes a number below its maximum")
+    }
+
+    #[test]
+    fn accepts_a_price_up_to_the_uint256_maximum_and_no_more() {
+        // EIP-3009's `value` is a uint256: a price that needs more units than
+        // it can hold could be advertised, but never paid.
+        let max = MAX_UINT256_DECIMAL;
+        for chain in [KITE_MAINNET, KITE_TESTNET] {
+            let decimals = chain.asset_decimals as usize;
+            let at_most = chain
+                .parse_price(&price_of(max, decimals))
+                .expect("the maximum itself is payable");
+            assert_eq!(at_most.amount, max, "{}", chain.asset_symbol);
+
+            let err = chain
+                .parse_price(&price_of(&plus_one(max), decimals))
+                .unwrap_err();
+            assert!(
+                matches!(err, KiteError::AboveUint256 { ref amount, symbol, .. }
+                    if *amount == plus_one(max) && symbol == chain.asset_symbol),
+                "{}: one unit above the maximum, got {err}",
+                chain.asset_symbol
+            );
+        }
+
+        let absurd = format!("1{}", "0".repeat(78));
+        let err = KITE_MAINNET.parse_price(&absurd).unwrap_err();
+        assert!(matches!(err, KiteError::AboveUint256 { .. }), "{err}");
+        assert!(
+            err.to_string().contains("more than a uint256 can hold"),
+            "{err}"
+        );
     }
 }
