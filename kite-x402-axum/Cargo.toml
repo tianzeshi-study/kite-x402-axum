@@ -15,6 +15,8 @@ workspace = true
 
 
 [dependencies]
+async-trait = "0.1"
+num-bigint = "0.4"
 # Kept minimal: this is a middleware/proxy library, not a server. Consumers
 # that call `axum::serve` (see `service/`) pull in "http1"/"tokio" themselves.
 axum = { version = "0.8", default-features = false, features = ["json", "original-uri"] }

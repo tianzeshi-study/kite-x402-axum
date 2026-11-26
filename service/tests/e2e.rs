@@ -838,6 +838,224 @@ async fn settlement_queries_show_recent_and_hash_indexed_attempts() {
 }
 
 #[tokio::test]
+#[ignore = "requires an isolated PostgreSQL server; see SETTLEMENT_TEST_DATABASE_URL"]
+async fn durable_settlement_survives_timeout_and_crash_across_replicas() {
+    use axum::{extract::State, routing::post, Json, Router};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    const SIGNER: &str = "0x1111111111111111111111111111111111111111";
+    const USED: &str = "0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5";
+    const TRANSFER: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+    const AMOUNT: &str = "20000000000000000000";
+    let mut db_url =
+        reqwest::Url::parse(&std::env::var("SETTLEMENT_TEST_DATABASE_URL").unwrap()).unwrap();
+    let admin = sqlx::PgPool::connect(db_url.as_str()).await.unwrap();
+    let schema = format!(
+        "kite_test_{}_{:x}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    db_url
+        .query_pairs_mut()
+        .append_pair("options[search_path]", &schema);
+
+    let rpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rpc_url = format!("http://{}", rpc_listener.local_addr().unwrap());
+    let chain_has_payment = Arc::new(AtomicBool::new(false));
+    let rpc = Router::new().route("/", post(|State(has_payment): State<Arc<AtomicBool>>, Json(req): Json<Value>| async move {
+        let signer_topic = format!("0x{:0>64}", &SIGNER[2..]);
+        let pay_to = PAY_TO.to_ascii_lowercase();
+        let pay_to_topic = format!("0x{:0>64}", &pay_to[2..]);
+        let asset = kite_x402_axum::kite::KITE_TESTNET.asset_address.to_ascii_lowercase();
+        let block_hash = format!("0x{:064x}", 9001);
+        let method = req["method"].as_str().unwrap();
+        let params = &req["params"];
+        let visible = has_payment.load(Ordering::SeqCst);
+        let first_nonce = format!("0x{:064x}", 17);
+        let second_nonce = format!("0x{:064x}", 18);
+        let second_tx = format!("0x{:064x}", 18);
+        let (nonce, tx) = if params[0]["topics"][2] == second_nonce || params[0] == second_tx {
+            (second_nonce, second_tx)
+        } else {
+            (first_nonce, TX_HASH.to_owned())
+        };
+        let event = json!({"address": asset, "topics": [USED, signer_topic, nonce],
+            "removed": false, "transactionHash": tx, "blockHash": block_hash,
+            "blockNumber": "0x111", "logIndex": "0x1"});
+        let result = match method {
+            "eth_chainId" => json!("0x940"),
+            "eth_blockNumber" if visible => json!("0x130"),
+            "eth_blockNumber" => json!("0x110"),
+            "eth_getLogs" if visible => {
+                assert_eq!(params[0]["address"], asset);
+                assert_eq!(params[0]["topics"][1], signer_topic);
+                let start = params[0]["fromBlock"].as_str().unwrap();
+                let start = i64::from_str_radix(&start[2..], 16).unwrap();
+                assert!(start <= 0x111, "journal must preserve the pre-submit range");
+                json!([event])
+            }
+            "eth_getLogs" => json!([]),
+            "eth_getTransactionReceipt" if visible => json!({"transactionHash": tx,
+                "blockHash": block_hash, "blockNumber": "0x111", "status": "0x1", "logs": [
+                    event, {"address": asset, "topics": [TRANSFER, signer_topic, pay_to_topic],
+                    "data": format!("0x{:064x}", AMOUNT.parse::<u128>().unwrap())}
+                ]}),
+            _ => panic!("unexpected RPC method: {method}"),
+        };
+        Json(json!({"jsonrpc": "2.0", "id": req["id"], "result": result}))
+    })).with_state(Arc::clone(&chain_has_payment));
+    let rpc_task = tokio::spawn(async move { axum::serve(rpc_listener, rpc).await.unwrap() });
+
+    let mocks = Mocks::start().await;
+    mocks
+        .facilitator
+        .set_verify(Reply::Json(json!({"isValid": true, "payer": SIGNER})));
+    mocks
+        .facilitator
+        .set_settle(Reply::Delayed(Duration::from_secs(3), json!({})));
+    let settings = |port, query, timeout: &str| {
+        let mut env = Service::base_env(&mocks, port);
+        env.extend([
+            ("SETTLEMENT_DATABASE_URL".into(), db_url.to_string()),
+            ("SETTLEMENT_TESTNET_RPC_URL".into(), rpc_url.clone()),
+            ("SETTLEMENT_QUERY_PORT".into(), u16::to_string(&query)),
+            ("FACILITATOR_TIMEOUT_MS".into(), timeout.into()),
+            ("PRICE_USD".into(), "20".into()),
+        ]);
+        env
+    };
+    let port_a = free_port();
+    let port_b = free_port();
+    let query_a = free_port();
+    let query_b = free_port();
+    let a = Service::start(settings(port_a, query_a, "500")).await;
+    let b = Service::start(settings(port_b, query_b, "5000")).await;
+    let path = "/v1/durable";
+    let req = a.requirements(path).await;
+    assert_eq!(req.amount, AMOUNT);
+    let signed = |nonce: u8| {
+        let mut payload = payload_for(&req);
+        payload.payload = json!({"signature": "fixture", "authorization": {
+            "from": SIGNER, "to": PAY_TO, "value": AMOUNT, "nonce": format!("0x{nonce:064x}")
+        }});
+        encode_payload(&payload)
+    };
+    let first = signed(17);
+    let second = signed(18);
+    let first_request = a.http.get(a.url(path)).header("PAYMENT-SIGNATURE", &first);
+    let replay_request = b.http.get(b.url(path)).header("PAYMENT-SIGNATURE", &first);
+    let winner_task = tokio::spawn(first_request.send());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while mocks.facilitator.verify_count() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let rejected = replay_request.send().await;
+    let winner = winner_task.await.unwrap();
+    let mut statuses = [
+        winner.unwrap().status().as_u16(),
+        rejected.unwrap().status().as_u16(),
+    ];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [402, 409]);
+    assert_eq!(mocks.timeline(), ["verify", "upstream", "settle"]);
+
+    let in_flight = b.http.get(b.url(path)).header("PAYMENT-SIGNATURE", &second);
+    let paid_task = tokio::spawn(in_flight.send());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while mocks.facilitator.settle_count() < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(b); // SIGKILL after the mock receives /settle and before it sends a receipt.
+    assert!(paid_task.await.unwrap().is_err());
+    drop(a);
+    chain_has_payment.store(true, Ordering::SeqCst);
+    // Simulate the passage of a worker retry lease, with both service processes down.
+    let journal = sqlx::PgPool::connect(db_url.as_str()).await.unwrap();
+    let scheduled = sqlx::query(
+        "UPDATE kite_x402_settlement_v1 SET next_check_at = NOW() WHERE state = 'settling'",
+    )
+    .execute(&journal)
+    .await
+    .unwrap();
+    assert_eq!(scheduled.rows_affected(), 2);
+    let restarted = Service::start(settings(port_a, query_a, "500")).await;
+    let recent_url = format!("http://127.0.0.1:{query_a}/settlements");
+    let entries = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let entries = restarted
+                .http
+                .get(&recent_url)
+                .send()
+                .await
+                .unwrap()
+                .json::<Vec<Value>>()
+                .await
+                .unwrap();
+            if entries.len() == 2 && entries.iter().all(|e| e["status"] == "confirmed") {
+                break entries;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(entries.iter().any(|entry| entry["transaction"] == TX_HASH));
+    assert!(entries.iter().all(|entry| entry["amount_atomic"] == AMOUNT));
+    for payment in [first, second] {
+        let response = restarted
+            .http
+            .get(restarted.url(path))
+            .header("PAYMENT-SIGNATURE", payment)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 409);
+    }
+    let summary = restarted
+        .http
+        .get(format!("{recent_url}/summary"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(summary["successful_count"], 2);
+    assert_eq!(
+        summary["volumes"][0]["amount_atomic"],
+        "40000000000000000000"
+    );
+    assert_eq!(summary["volumes"][0]["network"], "eip155:2368");
+    assert_eq!(
+        mocks.timeline(),
+        ["verify", "upstream", "settle", "verify", "upstream", "settle"]
+    );
+    drop(restarted);
+    journal.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    rpc_task.abort();
+}
+
+#[tokio::test]
 async fn post_bodies_and_headers_travel_through_the_whole_stack() {
     let mocks = Mocks::start().await;
     let svc = Service::start_with(&mocks).await;

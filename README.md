@@ -278,6 +278,8 @@ The service exposes endpoints outside `/v1/*` that are unmetered (free) and neve
 | `FACILITATOR_VERIFY_BACKOFF_MS` | `150` | Backoff between verify retries in milliseconds. |
 | `FACILITATOR_SETTLE_RETRIES` | `0` | Must be 0 — settlement is never retried (indeterminate outcomes stay visible). |
 | `SETTLEMENT_QUERY_PORT` | Empty (off) | Enables [local settlement queries](#merchant-settlement-queries) on a separate IPv4 loopback port. |
+| `SETTLEMENT_DATABASE_URL` | Empty (off) | PostgreSQL connection URL for the [shared settlement journal](#durable-settlement-and-automatic-reconciliation). |
+| `SETTLEMENT_MAINNET_RPC_URL` / `SETTLEMENT_TESTNET_RPC_URL` | Kite public RPCs | Optional trusted JSON-RPC endpoints for automatic reconciliation. |
 | `FACILITATOR_HEALTH_INTERVAL_SECS` | Empty (off) | Background facilitator probe interval; 60..=86400 enables. |
 | `PAYMENT_CLOCK_DRIFT_SECS` | Empty (off) | Enables the expiration guard with this clock-drift tolerance. |
 | `PAYMENT_REPLAY_CACHE_SIZE` | Empty (off) | Enables nonce replay protection with this cache capacity (1..=1000000). |
@@ -480,8 +482,9 @@ SDK-disagreement decision that may need revisiting, a live testnet run, etc.).
 
 ### Merchant settlement queries
 
-Set `SETTLEMENT_QUERY_PORT=8412` to record settlement attempts and enable the
-query listener on `127.0.0.1:8412`. Use the numeric address in requests. The
+Set `SETTLEMENT_QUERY_PORT=8412` to enable the query listener on
+`127.0.0.1:8412`. This also enables in-memory recording when the database
+URL is unset. Use the numeric address in requests. The
 listener only accepts the configured loopback address and port as the HTTP
 host. In a container, run the query from within its network namespace. Local
 processes that can reach the listener can read the records. Enable this port
@@ -501,7 +504,7 @@ record returns `404`. Responses use `Cache-Control: no-store`.
 Each record contains `network`, `transaction`, `payer`, `pay_to`,
 `amount_atomic`, `timestamp_secs`, and `status`. `transaction` is `null` if
 the facilitator supplied no hash. Amounts are decimal strings, or `null` if
-the amount is unknown or reached the ledger's `u64` limit. `reported_success`
+the amount is unknown. `asset` identifies the token contract. `reported_success`
 means the service accepted a successful receipt. `unconfirmed` covers
 rejections, incomplete receipts, and unknown outcomes such as timeouts.
 
@@ -527,6 +530,59 @@ python service/scripts/kite_x402_reconcile.py \
 The ledger retains up to 5,000 entries per process and clears on restart.
 Requests that never reach settlement create no record. To disable recording
 and querying, unset the port and restart the service.
+
+`GET /settlements/summary` returns success and failure counts and exact
+settled volumes. Every `volumes` entry has `network`, `asset` and a decimal
+`amount_atomic` string. A volume is reported in its own token's atomic units.
+
+### Durable settlement and automatic reconciliation
+
+Set `SETTLEMENT_DATABASE_URL` to a PostgreSQL connection URL. Point all
+replicas of the same service at the same database and schema. The service
+initializes its tables and indexes at startup, so the database role needs
+schema creation privileges on the selected schema. Use `sslmode=verify-full`
+for production connections with a trusted certificate. The query port is
+optional and remains on loopback when enabled.
+
+A unique database constraint reserves each `(network, asset, payer, nonce)`
+across replicas. The verification lease expires after five minutes. Once the
+upstream handler starts, the authorization stays reserved, including after
+an upstream failure or interrupted request. A duplicate returns `409` with
+`payment_authorization_already_reserved`. If the database or the selected
+chain RPC is unavailable before upstream execution, the service returns `503`
+with `settlement_store_unavailable`. A database failure while saving the
+facilitator response returns `402` with `settlement_outcome_unconfirmed`.
+
+The service stores a chain scan starting block and commits the settlement
+intent before calling `/settle`. Each replica can run the read-only worker.
+It resumes from the saved block, checks the authorization event and its
+matching transfer in the receipt, and waits for 12 more blocks before
+resolving an attempt. Newly visible events can take longer to appear in the
+query while a worker lease expires or RPC calls recover. Use a trusted RPC
+endpoint with historical log access if the default endpoints do not cover
+an outage. Missing or inconsistent proof leaves the attempt pending. The
+worker never resubmits payment.
+
+The durable query adds an `id` and these statuses:
+
+| Status | Meaning |
+|---|---|
+| `executing` | The handler started. Check the upstream outcome if this stays unchanged after restart. |
+| `upstream_failed` | The handler returned an error and the service skipped settlement. |
+| `settling` | The attempt awaits a valid receipt or chain proof. Query results include the reconciliation fields. |
+| `reported_success` | The service accepted the facilitator's success receipt. |
+| `confirmed` | The worker verified the authorization and matching on-chain transfer. |
+| `canceled` / `transfer_mismatch` | The authorization was canceled or used without the expected transfer. |
+
+The database retains execution fences and settlement history across restarts.
+Back it up and monitor pending attempts and storage growth. Existing
+in-memory records do not migrate. The PostgreSQL end-to-end test uses a
+separate schema and mock upstream, facilitator, and RPC endpoints:
+
+```sh
+SETTLEMENT_TEST_DATABASE_URL=postgres://kite:password@127.0.0.1:5432/kite \
+  cargo test -p kite-x402-service --locked --test e2e durable_settlement -- --ignored
+```
 
 ### Paying the service end to end, no Passport agent needed
 

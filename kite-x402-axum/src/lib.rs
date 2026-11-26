@@ -77,6 +77,8 @@ pub mod payment_options;
 pub mod proxy;
 pub mod security_headers;
 pub mod settlement_ledger;
+/// Durable authorization fencing and settlement journaling.
+pub mod settlement_store;
 pub mod sliding_limiter;
 pub mod types;
 /// Webhook event types and a retrying dispatcher for payment notifications.
@@ -101,8 +103,9 @@ pub use payment_options::{find_matching_requirements, requirements_all, PaymentO
 pub use proxy::{proxy, UpstreamConfig};
 pub use security_headers::SecurityHeadersConfig;
 pub use settlement_ledger::{
-    LedgerSummary, SettlementLedger, SettlementReconciliation, SettlementRecord,
+    LedgerSummary, SettlementLedger, SettlementReconciliation, SettlementRecord, SettlementVolume,
 };
+pub use settlement_store::{SettlementStorageError, SettlementStore};
 pub use sliding_limiter::{SlidingWindowConfig, SlidingWindowLimiter};
 pub use webhook::{
     DeliveryStatus, WebhookConfig, WebhookDeliveryRecord, WebhookDispatcher, WebhookEventType,

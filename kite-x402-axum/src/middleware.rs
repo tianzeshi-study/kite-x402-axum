@@ -20,7 +20,10 @@ use serde_json::json;
 use crate::{
     facilitator::FacilitatorClient,
     kite::{KiteChain, KITE_MAINNET, KITE_TESTNET},
-    settlement_ledger::SettlementReconciliation,
+    settlement_ledger::{
+        decimal_uint256, SettlementLedger, SettlementReconciliation, SettlementRecord,
+    },
+    settlement_store::SettlementStore,
     types::{PaymentPayload, PaymentRequired, PaymentRequirements, ResourceInfo},
     wire::{decode_payment_payload, encode_payment_required, encode_settle_response},
 };
@@ -47,8 +50,8 @@ pub struct PaymentConfig {
     /// Optional nonce replay guard to reject duplicate payment signatures before calling facilitator.
     pub nonce_guard: Option<Arc<crate::nonce_guard::PaymentNonceReplayGuard>>,
     /// Optional settlement ledger that retains settle outcomes for
-    /// reconciliation. Recording is local to the process, exactly like the
-    /// other in-memory guards.
+    /// reconciliation. A ledger configured with a shared store also fences
+    /// authorizations and journals them before submitting settlement.
     pub settlement_ledger: Option<Arc<crate::settlement_ledger::SettlementLedger>>,
 }
 
@@ -226,37 +229,22 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// The settled amount in atomic units, preferring the facilitator's receipt and
-/// falling back to the advertised requirement. An unparsable or overflowing
-/// value becomes `0` rather than failing the request: ledger volume is a
-/// diagnostic, not a money decision.
-fn atomic_amount(requirements: &PaymentRequirements, settle: &crate::types::SettleResponse) -> u64 {
-    fn parse(value: &str) -> Option<u64> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        trimmed
-            .parse::<u128>()
-            .ok()
-            .and_then(|value| u64::try_from(value).ok())
-    }
-
+/// Prefer a canonical receipt amount and fall back to the advertised amount.
+fn atomic_amount(
+    requirements: &PaymentRequirements,
+    settle: &crate::types::SettleResponse,
+) -> Option<String> {
     settle
         .amount
         .as_deref()
-        .and_then(parse)
-        .or_else(|| parse(&requirements.amount))
-        .unwrap_or(0)
+        .and_then(|amount| decimal_uint256(amount.trim()))
+        .or_else(|| decimal_uint256(&requirements.amount))
 }
 
 fn reconciliation_details(
     payload: &PaymentPayload,
     requirements: &PaymentRequirements,
 ) -> Option<SettlementReconciliation> {
-    const MAX_UINT256: &str =
-        "115792089237316195423570985008687907853269984665640564039457584007913129639935";
-
     fn fixed_hex(value: &str, bytes: usize) -> Option<String> {
         let digits = value
             .strip_prefix("0x")
@@ -281,37 +269,23 @@ fn reconciliation_details(
         return None;
     }
     let nonce = fixed_hex(authorization.get("nonce")?.as_str()?, 32)?;
-    let value = authorization.get("value")?.as_str()?;
-    let amount = value.trim_start_matches('0');
-    if amount.is_empty()
-        || amount.len() > MAX_UINT256.len()
-        || !amount.bytes().all(|b| b.is_ascii_digit())
-        || (amount.len() == MAX_UINT256.len() && amount > MAX_UINT256)
-    {
-        return None;
-    }
+    let amount = decimal_uint256(authorization.get("value")?.as_str()?)?;
 
     Some(SettlementReconciliation {
         network: chain.network.to_owned(),
         asset: chain.asset_address.to_ascii_lowercase(),
         payer,
         pay_to,
-        amount_atomic: amount.to_owned(),
+        amount_atomic: amount,
         nonce,
     })
 }
 
-/// 使用买家匹配的付款选项记录结算结果。只有未获得交易哈希时才附上链上对账参数。
-fn record_settlement(
-    cfg: &PaymentConfig,
-    payload: &PaymentPayload,
+fn settlement_record(
     requirements: &PaymentRequirements,
     verified_payer: Option<&str>,
     settle: &crate::types::SettleResponse,
-) {
-    let Some(ledger) = cfg.settlement_ledger.as_ref() else {
-        return;
-    };
+) -> SettlementRecord {
     let payer = settle
         .payer
         .as_deref()
@@ -327,28 +301,65 @@ fn record_settlement(
     } else {
         settle.network.trim().to_owned()
     };
-    let record = crate::settlement_ledger::SettlementRecord {
+    SettlementRecord {
         tx_hash: settle.transaction.clone(),
         payer: payer.to_owned(),
         pay_to: requirements.pay_to.clone(),
         amount: atomic_amount(requirements, settle),
+        asset: requirements.asset.to_ascii_lowercase(),
         network,
         timestamp_secs: unix_now_secs(),
         success: settle.success,
         error_reason: settle.error_reason.clone(),
-    };
-    tracing::debug!(
-        tx = %record.tx_hash,
-        success = record.success,
-        network = %record.network,
-        "Recording settlement outcome in ledger"
-    );
+    }
+}
+
+fn record_local_settlement(
+    ledger: &SettlementLedger,
+    payload: &PaymentPayload,
+    requirements: &PaymentRequirements,
+    record: SettlementRecord,
+) {
     let reconciliation = if !record.success && record.tx_hash.trim().is_empty() {
         reconciliation_details(payload, requirements)
     } else {
         None
     };
     ledger.record_with_reconciliation(record, reconciliation);
+}
+
+struct DurablePayment<'a> {
+    store: &'a dyn SettlementStore,
+    id: i64,
+    details: SettlementReconciliation,
+}
+
+impl DurablePayment<'_> {
+    async fn release(&self) {
+        if let Err(error) = self.store.release(self.id).await {
+            tracing::error!(%error, "Unable to release settlement verification lease");
+        }
+    }
+}
+
+fn settlement_store_unavailable(
+    error: &crate::settlement_store::SettlementStorageError,
+) -> Response {
+    tracing::error!(%error, "Durable payment operation failed before settlement");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [("cache-control", "no-store"), ("retry-after", "1")],
+        Json(json!({ "error": "settlement_store_unavailable" })),
+    )
+        .into_response()
+}
+
+fn durable_duplicate() -> Response {
+    (
+        StatusCode::CONFLICT,
+        [("cache-control", "no-store")],
+        Json(json!({ "error": "payment_authorization_already_reserved", "message": "Reconcile the original authorization before issuing a new one." })),
+    ).into_response()
 }
 
 /// Shared gate engine.
@@ -504,37 +515,62 @@ async fn payment_gate_inner(
         }
     }
 
-    let mut reservation = if let Some(guard) = &cfg.nonce_guard {
-        match guard.reserve(&payload) {
-            Ok(reservation) => Some(reservation),
-            Err(crate::nonce_guard::NonceReplayError::CapacityExceeded) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    [("cache-control", "no-store"), ("retry-after", "1")],
-                    Json(json!({ "error": "payment_replay_capacity_exceeded" })),
-                )
-                    .into_response();
-            }
-            Err(error) => {
-                tracing::warn!(
-                    uri = %resource_url,
-                    error = %error,
-                    "Payment authorization rejected by nonce replay guard; returning 402"
-                );
-                if let Some(metrics) = &cfg.metrics {
-                    metrics.record_challenge();
-                }
-                return payment_required_response(
-                    options,
-                    resource_url,
-                    cfg.description.clone(),
-                    Some(error.to_string()),
-                );
-            }
+    let durable = if let Some(store) = cfg
+        .settlement_ledger
+        .as_deref()
+        .and_then(SettlementLedger::store)
+    {
+        let details = reconciliation_details(&payload, requirements)
+            .filter(|details| details.amount_atomic == requirements.amount);
+        let Some(details) = details else {
+            return payment_required_response(
+                options,
+                resource_url,
+                cfg.description.clone(),
+                Some("A matching Kite EIP-3009 authorization is required".to_owned()),
+            );
+        };
+        match store.reserve(&details).await {
+            Ok(Some(id)) => Some(DurablePayment { store, id, details }),
+            Ok(None) => return durable_duplicate(),
+            Err(error) => return settlement_store_unavailable(&error),
         }
     } else {
         None
     };
+
+    let mut reservation =
+        if let Some(guard) = cfg.nonce_guard.as_ref().filter(|_| durable.is_none()) {
+            match guard.reserve(&payload) {
+                Ok(reservation) => Some(reservation),
+                Err(crate::nonce_guard::NonceReplayError::CapacityExceeded) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [("cache-control", "no-store"), ("retry-after", "1")],
+                        Json(json!({ "error": "payment_replay_capacity_exceeded" })),
+                    )
+                        .into_response();
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        uri = %resource_url,
+                        error = %error,
+                        "Payment authorization rejected by nonce replay guard; returning 402"
+                    );
+                    if let Some(metrics) = &cfg.metrics {
+                        metrics.record_challenge();
+                    }
+                    return payment_required_response(
+                        options,
+                        resource_url,
+                        cfg.description.clone(),
+                        Some(error.to_string()),
+                    );
+                }
+            }
+        } else {
+            None
+        };
 
     tracing::debug!(
         uri = %resource_url,
@@ -549,6 +585,9 @@ async fn payment_gate_inner(
     let verify = match verify_outcome {
         Ok(v) => v,
         Err(e) => {
+            if let Some(payment) = &durable {
+                payment.release().await;
+            }
             // Facilitator unreachable / bad response: 402, not 500/502.
             // See the crate-level docs for why.
             tracing::error!(
@@ -570,6 +609,9 @@ async fn payment_gate_inner(
     };
 
     if !verify.is_valid {
+        if let Some(payment) = &durable {
+            payment.release().await;
+        }
         let reason = verify
             .invalid_reason
             .unwrap_or_else(|| "Payment invalid".to_owned());
@@ -614,11 +656,30 @@ async fn payment_gate_inner(
     if let Some(reservation) = reservation.as_mut() {
         reservation.retain_on_drop();
     }
+    if let Some(payment) = &durable {
+        match payment
+            .store
+            .begin_execution(payment.id, &payment.details)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return durable_duplicate(),
+            Err(error) => {
+                payment.release().await;
+                return settlement_store_unavailable(&error);
+            }
+        }
+    }
     let response = next.run(req).await;
 
     let status = response.status();
     if status.as_u16() >= 400 {
-        // This branch never calls settle, so the authorization is safe to retry.
+        if let Some(payment) = &durable {
+            if let Err(error) = payment.store.upstream_failed(payment.id).await {
+                tracing::error!(%error, "Could not record upstream failure; execution fence retained");
+            }
+        }
+        // Preserve the retry semantics of the optional in-memory guard.
         if let Some(reservation) = reservation.take() {
             reservation.release();
         }
@@ -637,47 +698,42 @@ async fn payment_gate_inner(
         "Upstream succeeded; settling payment with facilitator"
     );
 
+    if let Some(payment) = &durable {
+        if let Err(error) = payment.store.begin_settlement(payment.id).await {
+            return settlement_store_unavailable(&error);
+        }
+    }
     let settle_start = std::time::Instant::now();
     let settle_outcome = cfg.facilitator.settle(&payload, requirements).await;
     let settle_duration = settle_start.elapsed();
-    let mut settle = match settle_outcome {
-        Ok(settle) => settle,
-        Err(e) => {
-            if let Some(metrics) = &cfg.metrics {
-                metrics.record_settlement(false, settle_duration);
-            }
-            tracing::error!(
-                uri = %resource_url,
-                error = %e,
-                "Facilitator settle unavailable"
-            );
-            let failure = crate::types::SettleResponse {
-                success: false,
-                error_reason: Some(format!("facilitator settle unavailable: {e}")),
-                error_message: None,
-                payer: None,
-                transaction: String::new(),
-                network: requirements.network.clone(),
-                amount: None,
-            };
-            // The settle transport failed, so the on-chain outcome is unknown
-            // rather than known-failed. Record it (no transaction hash) so an
-            // operator can find and reconcile this attempt instead of only
-            // having it in a log line.
-            record_settlement(
-                cfg,
-                &payload,
-                requirements,
-                verify.payer.as_deref(),
-                &failure,
-            );
-            return settlement_failure_response(&failure);
+    let mut settle = settle_outcome.unwrap_or_else(|error| {
+        tracing::error!(%error, uri = %resource_url, "Facilitator settle unavailable");
+        crate::types::SettleResponse {
+            success: false,
+            error_reason: Some(format!("facilitator settle unavailable: {error}")),
+            error_message: None,
+            payer: None,
+            transaction: String::new(),
+            network: requirements.network.clone(),
+            amount: None,
         }
-    };
+    });
 
     if settle.success {
         let receipt_error = if settle.network != requirements.network {
             Some("Settlement receipt network does not match the selected payment option")
+        } else if durable.as_ref().is_some_and(|payment| {
+            let tx = settle.transaction.strip_prefix("0x");
+            !tx.is_some_and(|digits| {
+                digits.len() == 64 && digits.bytes().all(|b| b.is_ascii_hexdigit())
+            }) || settle.amount.as_deref().is_some_and(|amount| {
+                decimal_uint256(amount).as_deref() != Some(&payment.details.amount_atomic)
+            }) || settle
+                .payer
+                .as_deref()
+                .is_some_and(|payer| !payer.eq_ignore_ascii_case(&payment.details.payer))
+        }) {
+            Some("Settlement receipt does not match the journaled authorization")
         } else if settle.transaction.trim().is_empty() {
             Some("Settlement receipt is missing a transaction ID")
         } else {
@@ -695,6 +751,31 @@ async fn payment_gate_inner(
         metrics.record_settlement(settle.success, settle_duration);
     }
 
+    if let Some(ledger) = &cfg.settlement_ledger {
+        let record = settlement_record(requirements, verify.payer.as_deref(), &settle);
+        if let Some(payment) = &durable {
+            match payment.store.finish_settlement(payment.id, &record).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    settle.success = false;
+                    settle.error_reason = Some("invalid_settlement_receipt".into());
+                    settle.error_message = Some("The journal does not agree with the receipt. Reconcile the original payment.".into());
+                    return settlement_failure_response(&settle);
+                }
+                Err(error) => {
+                    tracing::error!(%error, "Could not persist facilitator settlement response");
+                    settle.success = false;
+                    settle.error_reason = Some("settlement_outcome_unconfirmed".into());
+                    settle.error_message =
+                        Some("Reconcile the original payment before retrying.".into());
+                    return settlement_failure_response(&settle);
+                }
+            }
+        } else {
+            record_local_settlement(ledger, &payload, requirements, record);
+        }
+    }
+
     if !settle.success {
         tracing::error!(
             uri = %resource_url,
@@ -708,13 +789,6 @@ async fn payment_gate_inner(
             uri = %resource_url,
             error_reason = ?settle.error_reason,
             "Payment settlement audit: failed"
-        );
-        record_settlement(
-            cfg,
-            &payload,
-            requirements,
-            verify.payer.as_deref(),
-            &settle,
         );
         return settlement_failure_response(&settle);
     }
@@ -740,13 +814,6 @@ async fn payment_gate_inner(
     tracing::debug!(
         settle = ?settle,
         "Full settlement response details"
-    );
-    record_settlement(
-        cfg,
-        &payload,
-        requirements,
-        verify.payer.as_deref(),
-        &settle,
     );
 
     let (mut parts, body) = response.into_parts();
@@ -775,11 +842,18 @@ async fn payment_gate_inner(
 /// The x402 payment middleware. Apply with
 /// [`axum::middleware::from_fn_with_state`] to the `/v1/*` route group:
 ///
-/// ```ignore
-/// let cfg = Arc::new(PaymentConfig { .. });
-/// let paid = Router::new()
-///     .route("/{*path}", any(proxy))
-///     .with_state(upstream_cfg)
+/// ```
+/// use std::sync::Arc;
+/// use axum::{middleware, routing::get, Router};
+/// use kite_x402_axum::{facilitator::FacilitatorClient, kite::KITE_TESTNET,
+///     middleware::{x402_payment, PaymentConfig}};
+///
+/// let cfg = Arc::new(PaymentConfig::new(
+///     "0x0000000000000000000000000000000000000001", KITE_TESTNET, "0.001",
+///     "Paid data", FacilitatorClient::new("http://localhost:8000/v2"),
+/// ));
+/// let paid: Router = Router::new()
+///     .route("/v1/data", get(|| async { "paid data" }))
 ///     .layer(middleware::from_fn_with_state(cfg, x402_payment));
 /// ```
 ///
@@ -796,7 +870,9 @@ async fn payment_gate_inner(
 ///    crate-level docs for why facilitator-unreachable is also a `402`).
 /// 4. Verified → the inner handler runs. If it answers `>= 400`, that
 ///    response is returned unchanged and **no settlement is attempted**.
-/// 5. If it answers `< 400`, `/settle` is called. A successful receipt must
+/// 5. If it answers `< 400`, `/settle` is called. With a durable store, the
+///    EIP-3009 identity is reserved across replicas, and the settlement intent
+///    is journaled before the facilitator request. A successful receipt must
 ///    identify the selected network and carry a nonblank transaction ID. It
 ///    is attached as `PAYMENT-RESPONSE` and `Cache-Control` gets `private`
 ///    merged in. On failure, a `402` with `PAYMENT-RESPONSE` (`success: false`)
@@ -1122,39 +1198,40 @@ mod tests {
     }
 
     #[test]
-    fn atomic_amount_rejects_overflow_instead_of_saturating() {
-        // The doc contract says an unparsable OR overflowing value becomes 0,
-        // because ledger volume is only a diagnostic. A `u64` overflow that is
-        // nevertheless a valid `u128` must not be recorded as u64::MAX — that
-        // would inject a fake, astronomically large settlement into the ledger
-        // and into summary().total_settled_volume.
-        let req = requirements();
+    fn atomic_amount_preserves_uint256_and_falls_back_without_a_sentinel() {
+        let mut req = requirements();
+        let advertised = req.amount.clone();
+        let network = req.network.clone();
         let settle = |amount: Option<&str>| SettleResponse {
             success: true,
             error_reason: None,
             error_message: None,
             payer: None,
             transaction: "0xdead".into(),
-            network: req.network.clone(),
+            network: network.clone(),
             amount: amount.map(str::to_owned),
         };
-
-        // A valid u128 that does not fit u64 must NOT become u64::MAX — that
-        // would inject a fake, astronomically huge settlement into the ledger.
-        // It is unrepresentable, so it falls back to the advertised requirement.
-        let overflow = "18446744073709551616"; // 2^64
-        let advertised = req.amount.parse::<u64>().unwrap();
-        assert_eq!(atomic_amount(&req, &settle(Some(overflow))), advertised);
-        assert_ne!(atomic_amount(&req, &settle(Some(overflow))), u64::MAX);
-        // When the advertised requirement also overflows, the documented zero
-        // is the final fallback — not u64::MAX.
-        let mut big_req = req.clone();
-        big_req.amount = overflow.into();
-        assert_eq!(atomic_amount(&big_req, &settle(None)), 0);
-        // Normal values still parse. An unparsable receipt amount also falls
-        // back to the advertised requirement (by design).
-        assert_eq!(atomic_amount(&req, &settle(Some(" 42 "))), 42);
-        assert_eq!(atomic_amount(&req, &settle(Some("1.5"))), advertised);
+        let max = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+        let overflow =
+            "115792089237316195423570985008687907853269984665640564039457584007913129639936";
+        assert_eq!(
+            atomic_amount(&req, &settle(Some("20000000000000000000"))).as_deref(),
+            Some("20000000000000000000")
+        );
+        assert_eq!(
+            atomic_amount(&req, &settle(Some(max))).as_deref(),
+            Some(max)
+        );
+        assert_eq!(
+            atomic_amount(&req, &settle(Some(overflow))).as_deref(),
+            Some(advertised.as_str())
+        );
+        assert_eq!(
+            atomic_amount(&req, &settle(Some(" 00042 "))).as_deref(),
+            Some("42")
+        );
+        req.amount = overflow.to_owned();
+        assert_eq!(atomic_amount(&req, &settle(None)), None);
     }
 
     #[test]
@@ -1189,7 +1266,7 @@ mod tests {
             network: format!("  {clean_network}  "),
             amount: None,
         };
-        // `record_settlement` now also takes the decoded payload so it can
+        // The local journal also takes the decoded payload so it can
         // attach on-chain reconciliation details when a settlement comes back
         // without a transaction hash. This case has a hash, so the payload is
         // only a required argument.
@@ -1200,7 +1277,13 @@ mod tests {
             payload: serde_json::Value::Null,
             extensions: None,
         };
-        record_settlement(&cfg, &payload, &req, Some("0xabc"), &settle);
+        let record = settlement_record(&req, Some("0xabc"), &settle);
+        record_local_settlement(
+            cfg.settlement_ledger.as_deref().unwrap(),
+            &payload,
+            &req,
+            record,
+        );
 
         assert!(
             ledger.get_by_network_tx(&clean_network, "0xdead").is_some(),

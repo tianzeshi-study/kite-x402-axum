@@ -11,6 +11,9 @@ workspace = true
 
 
 [dependencies]
+async-trait = "0.1"
+num-bigint = "0.4"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki"] }
 kite-x402-axum = { path = "../kite-x402-axum" }
 axum = { version = "0.8", features = ["http1", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }

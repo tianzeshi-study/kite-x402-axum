@@ -16,6 +16,7 @@ RUN mkdir -p kite-x402-axum/src service/src \
 # Copy real sources and build the service binary
 COPY kite-x402-axum/src kite-x402-axum/src
 COPY service/src service/src
+COPY service/sql service/sql
 RUN touch kite-x402-axum/src/lib.rs service/src/main.rs \
     && cargo build --release --bin kite-x402-service --locked
 

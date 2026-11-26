@@ -3,8 +3,10 @@
 //! Records confirmed on-chain settlements, transaction hashes, amounts, and
 //! payer metadata for post-settlement reconciliation and auditing.
 
+use crate::settlement_store::SettlementStore;
+use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -17,8 +19,10 @@ pub struct SettlementRecord {
     pub payer: String,
     /// Address that received the payment.
     pub pay_to: String,
-    /// Amount in atomic token units.
-    pub amount: u64,
+    /// Amount in atomic token units as a base-10 uint256, when known.
+    pub amount: Option<String>,
+    /// Token contract address.
+    pub asset: String,
     /// Network identifier (CAIP-2).
     pub network: String,
     /// Unix timestamp in seconds.
@@ -30,7 +34,7 @@ pub struct SettlementRecord {
 }
 
 /// 无交易哈希时用于查询 Kite 链上付款的 EIP-3009 授权参数。
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettlementReconciliation {
     /// 匹配的付款网络（CAIP-2）。
     pub network: String,
@@ -53,15 +57,36 @@ impl fmt::Debug for SettlementReconciliation {
     }
 }
 
+/// Total confirmed volume for one network and token contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettlementVolume {
+    /// Network identifier (CAIP-2).
+    pub network: String,
+    /// Token contract address.
+    pub asset: String,
+    /// Exact sum of atomic token units as a base-10 string.
+    pub amount_atomic: String,
+}
+
 /// Aggregate statistics for the records currently retained in the ledger.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerSummary {
-    /// Sum of the amounts of all successful settlements.
-    pub total_settled_volume: u64,
+    /// Known successful volume grouped separately by network and asset.
+    pub volumes: Vec<SettlementVolume>,
     /// Number of successful settlements.
     pub successful_count: u64,
-    /// Number of failed settlements.
+    /// Number of failed or unconfirmed settlements.
     pub failed_count: u64,
+}
+
+/// Parses a positive EVM amount and returns its canonical decimal form.
+pub(crate) fn decimal_uint256(value: &str) -> Option<String> {
+    let digits = value.trim_start_matches('0');
+    if digits.is_empty() || digits.len() > 78 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let amount = digits.parse::<BigUint>().ok()?;
+    (amount.bits() <= 256).then(|| digits.to_owned())
 }
 
 #[derive(Debug)]
@@ -102,6 +127,7 @@ impl Inner {
 #[derive(Debug, Clone)]
 pub struct SettlementLedger {
     inner: Arc<Mutex<Inner>>,
+    store: Option<Arc<dyn SettlementStore>>,
 }
 
 impl SettlementLedger {
@@ -115,7 +141,20 @@ impl SettlementLedger {
                 by_payer: HashMap::new(),
                 max_records: max_records.max(100),
             })),
+            store: None,
         }
+    }
+
+    /// Enables the durable payment path. The synchronous ledger readers keep
+    /// their in-memory semantics; durable readers use the selected backend.
+    #[must_use]
+    pub fn with_store(mut self, store: Arc<dyn SettlementStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    pub(crate) fn store(&self) -> Option<&dyn SettlementStore> {
+        self.store.as_deref()
     }
 
     /// Records a settlement attempt or confirmed transaction.
@@ -201,23 +240,33 @@ impl SettlementLedger {
     #[must_use]
     pub fn summary(&self) -> LedgerSummary {
         let inner = self.inner.lock().expect("settlement ledger mutex poisoned");
-        inner.records.iter().fold(
-            LedgerSummary {
-                total_settled_volume: 0,
-                successful_count: 0,
-                failed_count: 0,
-            },
-            |mut summary, (record, _)| {
-                if record.success {
-                    summary.successful_count += 1;
-                    summary.total_settled_volume =
-                        summary.total_settled_volume.saturating_add(record.amount);
-                } else {
-                    summary.failed_count += 1;
+        let mut totals = BTreeMap::<(String, String), BigUint>::new();
+        let mut successful_count = 0;
+        let mut failed_count = 0;
+        for (record, _) in &inner.records {
+            if record.success {
+                successful_count += 1;
+                if let Some(amount) = record.amount.as_deref().and_then(decimal_uint256) {
+                    *totals
+                        .entry((record.network.clone(), record.asset.to_ascii_lowercase()))
+                        .or_default() += amount.parse::<BigUint>().expect("validated amount");
                 }
-                summary
-            },
-        )
+            } else {
+                failed_count += 1;
+            }
+        }
+        LedgerSummary {
+            volumes: totals
+                .into_iter()
+                .map(|((network, asset), amount)| SettlementVolume {
+                    network,
+                    asset,
+                    amount_atomic: amount.to_string(),
+                })
+                .collect(),
+            successful_count,
+            failed_count,
+        }
     }
 
     /// Returns up to `limit` of the most recently recorded entries, newest
@@ -275,7 +324,8 @@ mod tests {
             tx_hash: tx.into(),
             payer: "0xAbCd".into(),
             pay_to: "recipient".into(),
-            amount: 7,
+            amount: Some("7".into()),
+            asset: "token".into(),
             network: network.into(),
             timestamp_secs: 1,
             success,
@@ -289,7 +339,7 @@ mod tests {
         ledger.record(record("0xAB", "eip155:2368", true));
         ledger.record(record("0xab", "eip155:2368", true));
         assert_eq!(ledger.len(), 1);
-        assert_eq!(ledger.summary().total_settled_volume, 7);
+        assert_eq!(ledger.summary().volumes[0].amount_atomic, "7");
     }
 
     #[test]
@@ -315,7 +365,38 @@ mod tests {
         assert_eq!(ledger.len(), 100);
         assert_eq!(ledger.find_by_payer("0xABCD").len(), 100);
         assert!(ledger.get_by_tx("tx-0").is_none());
-        assert_eq!(ledger.summary().total_settled_volume, 700);
+        assert_eq!(ledger.summary().volumes[0].amount_atomic, "700");
+    }
+
+    #[test]
+    fn volumes_are_exact_and_partitioned_by_network_and_asset() {
+        let ledger = SettlementLedger::default();
+        let max = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+        for tx in ["first", "second"] {
+            ledger.record(SettlementRecord {
+                amount: Some(max.into()),
+                asset: "TOKEN".into(),
+                ..record(tx, "a", true)
+            });
+        }
+        ledger.record(SettlementRecord {
+            asset: "other".into(),
+            ..record("third", "a", true)
+        });
+        ledger.record(record("fourth", "b", true));
+        ledger.record(record("failed", "b", false));
+        let summary = ledger.summary();
+        assert_eq!(summary.successful_count, 4);
+        assert_eq!(summary.failed_count, 1);
+        assert_eq!(summary.volumes.len(), 3);
+        assert_eq!(summary.volumes[0].asset, "other");
+        assert_eq!(summary.volumes[1].asset, "token");
+        assert_eq!(
+            summary.volumes[1].amount_atomic,
+            "231584178474632390847141970017375815706539969331281128078915168015826259279870"
+        );
+        assert_eq!(summary.volumes[2].network, "b");
+        assert_eq!(summary.volumes[2].amount_atomic, "7");
     }
 
     #[test]
