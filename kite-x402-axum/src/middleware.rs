@@ -1298,7 +1298,8 @@ mod tests {
                 "Unit test service",
                 dead_facilitator(),
             )
-            .with_expiration_guard(guard),
+            .with_expiration_guard(guard)
+            .with_settlement_ledger(Arc::clone(&ledger)),
         );
         let req = requirements();
         let clean_network = req.network.clone();
