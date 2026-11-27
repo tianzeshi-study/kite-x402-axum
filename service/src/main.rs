@@ -254,6 +254,7 @@ async fn main() {
         metrics: Some(Arc::clone(&metrics)),
         nonce_guard,
         settlement_ledger: settlement_ledger.clone(),
+        webhooks: None,
     });
     let discovery = DiscoveryInfo {
         primary: chain,
