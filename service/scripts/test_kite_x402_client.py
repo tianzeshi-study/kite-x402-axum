@@ -117,6 +117,17 @@ class ClientSettlementTests(unittest.TestCase):
                 load_key.assert_not_called()
                 send.assert_not_called()
 
+    def test_non_finite_json_body_stops_before_any_request(self):
+        for number in ("NaN", "Infinity", "-Infinity", "1e400"):
+            with self.subTest(number=number):
+                body = '{"values": [' + number + ']}'
+                with patch.object(client.Account, "from_key") as load_key:
+                    status, errors, send = self.run_client(argv=["--method", "POST", "--body", body])
+                self.assertEqual(status, 2)
+                self.assertIn("--body must be valid JSON", errors)
+                load_key.assert_not_called()
+                send.assert_not_called()
+
     def test_valid_json_body_is_sent_on_both_requests(self):
         body = {"message": "hello"}
         settled = response(200, **{"Payment-Response": encode_header(self.receipt)})

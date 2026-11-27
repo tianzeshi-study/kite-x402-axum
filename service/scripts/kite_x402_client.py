@@ -279,6 +279,9 @@ def main() -> int:
 
     try:
         body = json.loads(args.body) if args.body is not None else None
+        if args.body is not None:
+            # Match requests' strict JSON encoding before loading the payer key.
+            json.dumps(body, allow_nan=False)
     except (ValueError, RecursionError):
         print("error: --body must be valid JSON", file=sys.stderr)
         return 2
