@@ -387,17 +387,13 @@ mod tests {
     use super::*;
 
     fn default_config() -> Arc<PaymentConfig> {
-        Arc::new(PaymentConfig {
-            pay_to: "0x2222222222222222222222222222222222222222".into(),
-            chain: kite_chain_by_name("testnet").expect("testnet chain"),
-            price_usd: "0.01".into(),
-            description: "test".into(),
-            facilitator: kite_x402_axum::facilitator::FacilitatorClient::new("http://127.0.0.1:9"),
-            expiration_guard: None,
-            metrics: None,
-            nonce_guard: None,
-            settlement_ledger: None,
-        })
+        Arc::new(PaymentConfig::new(
+            "0x2222222222222222222222222222222222222222".into(),
+            kite_chain_by_name("testnet").expect("testnet chain"),
+            "0.01",
+            "test",
+            kite_x402_axum::facilitator::FacilitatorClient::new("http://127.0.0.1:9"),
+        ))
     }
 
     fn parse(rules: &str) -> Result<RoutePrices, String> {
