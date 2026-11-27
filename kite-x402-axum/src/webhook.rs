@@ -313,8 +313,9 @@ impl WebhookDispatcher {
             (!idle_targets_only || state.target_is_idle(&record.target_url))
                 && match &record.status {
                     DeliveryStatus::Pending => true,
-                    DeliveryStatus::Failed => retry_delay(&self.config, record)
-                        .is_some_and(|delay| retry_is_due(record, now, delay)),
+                    DeliveryStatus::Failed => {
+                        retry_is_due(record, now, retry_delay(&self.config, record))
+                    }
                     DeliveryStatus::Delivered | DeliveryStatus::Abandoned => false,
                 }
         })?;
@@ -349,10 +350,9 @@ impl WebhookDispatcher {
                 DeliveryStatus::Pending => Some(Duration::ZERO),
                 DeliveryStatus::Failed => {
                     let last_attempt_ms = record.last_attempt_ms.unwrap_or_default();
-                    retry_delay(&self.config, record).map(|delay| {
-                        let elapsed = Duration::from_millis(now.saturating_sub(last_attempt_ms));
-                        delay.saturating_sub(elapsed)
-                    })
+                    let delay = retry_delay(&self.config, record);
+                    let elapsed = Duration::from_millis(now.saturating_sub(last_attempt_ms));
+                    Some(delay.saturating_sub(elapsed))
                 }
                 DeliveryStatus::Delivered | DeliveryStatus::Abandoned => None,
             })
@@ -433,7 +433,7 @@ impl WebhookDispatcher {
             .find(|record| match record.last_attempt_ms {
                 None => true,
                 Some(last) => {
-                    let wait = u64::try_from(self.config.backoff_for(record.attempts).as_millis())
+                    let wait = u64::try_from(retry_delay(&self.config, record).as_millis())
                         .unwrap_or(u64::MAX);
                     now_ms >= last.saturating_add(wait)
                 }
@@ -544,15 +544,14 @@ fn unix_time_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn retry_delay(config: &WebhookConfig, record: &WebhookDeliveryRecord) -> Option<Duration> {
-    let exponent = record.attempts.saturating_sub(1).min(31);
-    let multiplier = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
-    Some(
-        config
-            .initial_backoff
-            .checked_mul(multiplier)
-            .unwrap_or(Duration::MAX),
-    )
+fn retry_delay(config: &WebhookConfig, record: &WebhookDeliveryRecord) -> Duration {
+    // One schedule, defined once: `backoff_for` is the documented curve and the
+    // only place that applies `MAX_RETRY_BACKOFF`. Recomputing the exponential
+    // here (as this function used to) let the two paths disagree: past 12 failed
+    // attempts the queue would wait minutes to hours longer than the cap, and
+    // `Duration::MAX` from an overflow made a retry wait effectively forever,
+    // while `next_due` still considered the same record due after one hour.
+    config.backoff_for(record.attempts)
 }
 
 fn retry_is_due(record: &WebhookDeliveryRecord, now_ms: u64, delay: Duration) -> bool {
@@ -1030,5 +1029,97 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.backoff_for(5), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_queue_retry_delay_is_the_documented_capped_curve() {
+        // The queue path (`claim_next_pending`, `next_retry_delay`) used to
+        // recompute `initial_backoff * 2^(attempts-1)` on its own, without the
+        // cap. At 14 failed attempts that is 4096 s and past 32 it overflowed to
+        // `Duration::MAX`, while `next_due` treated the same record as due after
+        // `MAX_RETRY_BACKOFF`. Both paths must answer with one curve.
+        let config = WebhookConfig {
+            initial_backoff: Duration::from_millis(500),
+            ..Default::default()
+        };
+        let record = WebhookDeliveryRecord {
+            delivery_id: 1,
+            target_url: "https://a.example/hook".into(),
+            payload: WebhookPayload {
+                event_id: "evt_1".into(),
+                event_type: WebhookEventType::PaymentSettled,
+                timestamp_ms: 0,
+                payer: None,
+                network: None,
+                amount_atomic: None,
+                tx_hash: None,
+                request_path: None,
+            },
+            attempts: 14,
+            max_retries: 20,
+            status: DeliveryStatus::Failed,
+            last_status_code: Some(500),
+            last_error: None,
+            last_attempt_ms: Some(0),
+        };
+
+        assert_eq!(retry_delay(&config, &record), MAX_RETRY_BACKOFF);
+        let huge = WebhookDeliveryRecord {
+            attempts: u32::MAX,
+            ..record
+        };
+        assert_eq!(retry_delay(&config, &huge), MAX_RETRY_BACKOFF);
+    }
+
+    #[test]
+    fn next_retry_delay_never_exceeds_the_cap() {
+        // A record that has failed 14 times and was tried just now must sleep
+        // no longer than the documented bound, or the worker parks for hours
+        // while `next_due` says the same delivery is overdue.
+        let dispatcher = dispatcher(&["https://a.example/hook"], 20, 10);
+        let id = enqueue(&dispatcher)[0];
+        for _ in 0..14 {
+            dispatcher
+                .record_attempt_result(id, false, Some(503), None)
+                .expect("the delivery stays retryable while under max_retries");
+        }
+
+        let delay = dispatcher.next_retry_delay().expect("a retry is pending");
+        assert!(
+            delay <= MAX_RETRY_BACKOFF,
+            "retry delay {delay:?} exceeded the documented cap"
+        );
+        assert!(
+            delay > Duration::from_secs(600),
+            "the curve must still back off past the initial delay: {delay:?}"
+        );
+    }
+
+    #[test]
+    fn idle_target_claims_follow_the_same_capped_curve() {
+        // The per-target claim path added in #178 reads the same queue delay, so
+        // it has to inherit the cap too: otherwise a receiver held busy by one
+        // attempt would wait 4096 s after 14 failures while a plain claim on the
+        // same record releases it after an hour.
+        let dispatcher = dispatcher(&["https://a.example/hook"], 20, 10);
+        let id = enqueue(&dispatcher)[0];
+        for _ in 0..14 {
+            dispatcher
+                .record_attempt_result(id, false, Some(503), None)
+                .expect("the delivery stays retryable while under max_retries");
+        }
+
+        let delay = dispatcher
+            .next_retry_delay_for_idle_targets()
+            .expect("a retry is pending");
+        assert!(
+            delay <= MAX_RETRY_BACKOFF,
+            "idle-target delay {delay:?} exceeded the documented cap"
+        );
+        assert!(
+            delay > Duration::from_secs(600),
+            "the cap must not collapse the curve to no wait: {delay:?}"
+        );
+        assert!(dispatcher.claim_next_for_idle_target().is_none());
     }
 }
