@@ -132,6 +132,7 @@ fn build_app(facilitator_base: &str, upstream_base: &str) -> Router {
         metrics: None,
         nonce_guard: None,
         settlement_ledger: None,
+        webhooks: None,
     });
     let upstream_cfg = Arc::new(UpstreamConfig {
         http: reqwest::Client::new(),

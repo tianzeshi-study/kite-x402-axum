@@ -52,6 +52,11 @@ pub struct PaymentConfig {
     /// reconciliation. Recording is local to the process, exactly like the
     /// other in-memory guards.
     pub settlement_ledger: Option<Arc<crate::settlement_ledger::SettlementLedger>>,
+    /// Optional webhook dispatcher. Every settle attempt enqueues one
+    /// `payment_settled` or `payment_failed` event for its configured
+    /// targets; delivery itself is done by a worker (see
+    /// [`crate::webhook::run_delivery_worker`]).
+    pub webhooks: Option<Arc<crate::webhook::WebhookDispatcher>>,
 }
 
 impl PaymentConfig {
@@ -73,6 +78,7 @@ impl PaymentConfig {
             metrics: None,
             nonce_guard: None,
             settlement_ledger: None,
+            webhooks: None,
         }
     }
 
@@ -114,6 +120,16 @@ impl PaymentConfig {
         ledger: Arc<crate::settlement_ledger::SettlementLedger>,
     ) -> Self {
         self.settlement_ledger = Some(ledger);
+        self
+    }
+
+    /// Enqueues a webhook event for every settle attempt: `payment_settled`
+    /// on success, `payment_failed` otherwise (including attempts whose
+    /// on-chain outcome is unknown). Enqueueing never delays or fails the
+    /// request.
+    #[must_use]
+    pub fn with_webhooks(mut self, webhooks: Arc<crate::webhook::WebhookDispatcher>) -> Self {
+        self.webhooks = Some(webhooks);
         self
     }
 
@@ -345,7 +361,11 @@ fn reconciliation_details(
     })
 }
 
-/// 使用买家匹配的付款选项记录结算结果。只有未获得交易哈希时才附上链上对账参数。
+/// Reports one settle outcome to the configured ledger and webhook
+/// dispatcher, if any. Called only after a settle attempt (including one whose
+/// outcome is unknown), and only with the requirements the buyer actually
+/// matched, so the amount, asset and `payTo` describe the payment that was
+/// attempted.
 fn record_settlement(
     cfg: &PaymentConfig,
     payload: &PaymentPayload,
@@ -353,9 +373,9 @@ fn record_settlement(
     verified_payer: Option<&str>,
     settle: &crate::types::SettleResponse,
 ) {
-    let Some(ledger) = cfg.settlement_ledger.as_ref() else {
+    if cfg.settlement_ledger.is_none() && cfg.webhooks.is_none() {
         return;
-    };
+    }
     let payer = settle
         .payer
         .as_deref()
@@ -371,11 +391,32 @@ fn record_settlement(
     } else {
         settle.network.trim().to_owned()
     };
+    let amount = atomic_amount(requirements, settle);
+
+    if let Some(webhooks) = cfg.webhooks.as_ref() {
+        let event = if settle.success {
+            crate::webhook::WebhookEventType::PaymentSettled
+        } else {
+            crate::webhook::WebhookEventType::PaymentFailed
+        };
+        let _ = webhooks.enqueue_event(
+            event,
+            Some(payer.to_owned()),
+            Some(network.clone()),
+            Some(amount.to_string()),
+            Some(settle.transaction.clone()).filter(|tx| !tx.is_empty()),
+            None,
+        );
+    }
+
+    let Some(ledger) = cfg.settlement_ledger.as_ref() else {
+        return;
+    };
     let record = crate::settlement_ledger::SettlementRecord {
         tx_hash: settle.transaction.clone(),
         payer: payer.to_owned(),
         pay_to: requirements.pay_to.clone(),
-        amount: atomic_amount(requirements, settle),
+        amount,
         network,
         timestamp_secs: unix_now_secs(),
         success: settle.success,
@@ -903,6 +944,8 @@ pub struct MultiPaymentConfig {
     pub nonce_guard: Option<Arc<crate::nonce_guard::PaymentNonceReplayGuard>>,
     /// Optional settlement ledger shared with the single-option gate.
     pub settlement_ledger: Option<Arc<crate::settlement_ledger::SettlementLedger>>,
+    /// Optional webhook dispatcher, like [`PaymentConfig::webhooks`].
+    pub webhooks: Option<Arc<crate::webhook::WebhookDispatcher>>,
 }
 
 impl MultiPaymentConfig {
@@ -922,7 +965,16 @@ impl MultiPaymentConfig {
             metrics: None,
             nonce_guard: None,
             settlement_ledger: None,
+            webhooks: None,
         }
+    }
+
+    /// Enqueues webhook events for settle attempts, like
+    /// [`PaymentConfig::with_webhooks`].
+    #[must_use]
+    pub fn with_webhooks(mut self, webhooks: Arc<crate::webhook::WebhookDispatcher>) -> Self {
+        self.webhooks = Some(webhooks);
+        self
     }
 
     /// Retains settle outcomes in the given ledger, like the single-option
@@ -955,6 +1007,7 @@ impl MultiPaymentConfig {
             metrics: self.metrics.clone(),
             nonce_guard: self.nonce_guard.clone(),
             settlement_ledger: self.settlement_ledger.clone(),
+            webhooks: self.webhooks.clone(),
         }
     }
 }
@@ -1033,6 +1086,7 @@ mod tests {
             metrics: None,
             nonce_guard: None,
             settlement_ledger: None,
+            webhooks: None,
         })
     }
 

@@ -377,6 +377,7 @@ pub(super) async fn route_payment(
         metrics: config.metrics.clone(),
         nonce_guard: config.nonce_guard.clone(),
         settlement_ledger: config.settlement_ledger.clone(),
+        webhooks: config.webhooks.clone(),
     });
     x402_payment_multi(State(multi), req, next).await
 }

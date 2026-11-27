@@ -372,6 +372,8 @@ pub(crate) struct AppOptions {
     pub upstream_client: Option<reqwest::Client>,
     /// Optional settlement ledger the gate should record into.
     pub settlement_ledger: Option<Arc<kite_x402_axum::SettlementLedger>>,
+    /// Optional webhook dispatcher the gate should enqueue events into.
+    pub webhooks: Option<Arc<kite_x402_axum::WebhookDispatcher>>,
 }
 
 impl Default for AppOptions {
@@ -384,6 +386,7 @@ impl Default for AppOptions {
             facilitator_timeout: None,
             upstream_client: None,
             settlement_ledger: None,
+            webhooks: None,
         }
     }
 }
@@ -405,6 +408,7 @@ pub(crate) fn build_app(facilitator_url: &str, upstream_url: &str, o: &AppOption
         metrics: None,
         nonce_guard: None,
         settlement_ledger: o.settlement_ledger.clone(),
+        webhooks: o.webhooks.clone(),
     });
     let upstream_cfg = Arc::new(UpstreamConfig {
         http: o.upstream_client.clone().unwrap_or_else(upstream_client),
