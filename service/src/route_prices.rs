@@ -193,7 +193,7 @@ impl RoutePrices {
     }
 
     pub(super) fn advertised_networks(&self) -> Vec<&'static str> {
-        // 路由可继承默认支付选项，因此仍需检查默认网络。
+        // Routes can inherit default payment options, so include their networks.
         let route_extras = self
             .overrides
             .values()
