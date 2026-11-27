@@ -388,7 +388,7 @@ mod tests {
 
     fn default_config() -> Arc<PaymentConfig> {
         Arc::new(PaymentConfig::new(
-            "0x2222222222222222222222222222222222222222".into(),
+            "0x2222222222222222222222222222222222222222",
             kite_chain_by_name("testnet").expect("testnet chain"),
             "0.01",
             "test",
