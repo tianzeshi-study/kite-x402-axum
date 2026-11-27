@@ -40,6 +40,7 @@ use kite_x402_axum::{
     types::PaymentRequirements, verify_signature_at, SIGNATURE_HEADER, TIMESTAMP_HEADER,
 };
 use serde_json::{json, Value};
+use tokio::sync::Semaphore;
 
 const BIN: &str = env!("CARGO_BIN_EXE_kite-x402-service");
 const PAY_TO: &str = "0xE2E0000000000000000000000000000000000E2E";
@@ -55,6 +56,7 @@ struct CapturedWebhook {
 struct WebhookReceiver {
     requests: Mutex<Vec<CapturedWebhook>>,
     fail_first_settlement: AtomicBool,
+    first_response_gate: Option<Arc<Semaphore>>,
 }
 
 async fn capture_webhook(
@@ -68,10 +70,22 @@ async fn capture_webhook(
             .fail_first_settlement
             .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok();
-    receiver.requests.lock().unwrap().push(CapturedWebhook {
-        headers,
-        body: body.to_vec(),
-    });
+    let first_request = {
+        let mut requests = receiver.requests.lock().unwrap();
+        let first_request = requests.is_empty();
+        requests.push(CapturedWebhook {
+            headers,
+            body: body.to_vec(),
+        });
+        first_request
+    };
+    if let Some(gate) = receiver
+        .first_response_gate
+        .as_ref()
+        .filter(|_| first_request)
+    {
+        let _permit = gate.acquire().await.unwrap();
+    }
     if fail {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
@@ -80,10 +94,15 @@ async fn capture_webhook(
 }
 
 async fn start_webhook_receiver(fail_first_settlement: bool) -> (String, Arc<WebhookReceiver>) {
-    let receiver = Arc::new(WebhookReceiver {
-        requests: Mutex::new(Vec::new()),
+    start_webhook_receiver_with(WebhookReceiver {
         fail_first_settlement: AtomicBool::new(fail_first_settlement),
-    });
+        ..Default::default()
+    })
+    .await
+}
+
+async fn start_webhook_receiver_with(receiver: WebhookReceiver) -> (String, Arc<WebhookReceiver>) {
+    let receiver = Arc::new(receiver);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let app = Router::new()
@@ -380,6 +399,46 @@ async fn webhook_events_are_signed_retried_and_isolated_from_payment_responses()
     assert!(events
         .iter()
         .all(|event| event.get("payment_signature").is_none()));
+}
+
+#[tokio::test]
+async fn webhook_delivers_to_healthy_receivers_while_a_slow_receiver_is_busy() {
+    let mocks = Mocks::start().await;
+    let gate = Arc::new(Semaphore::new(0));
+    let (slow_url, slow) = start_webhook_receiver_with(WebhookReceiver {
+        first_response_gate: Some(Arc::clone(&gate)),
+        ..Default::default()
+    })
+    .await;
+    let (healthy_url, healthy) = start_webhook_receiver(false).await;
+    let svc = Service::start(webhook_env(&mocks, format!("{slow_url},{healthy_url}"))).await;
+
+    let requirements = svc.requirements("/v1/forecast").await;
+    wait_for_webhook_count(&slow, 1).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let paid = svc
+            .http
+            .get(svc.url("/v1/forecast"))
+            .header("PAYMENT-SIGNATURE", payment_header(&requirements))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(paid.status(), 200);
+        wait_for_webhook_count(&healthy, 2).await;
+    })
+    .await
+    .expect("the healthy receiver should get the settlement before the slow receiver times out");
+
+    let healthy_event: Value =
+        serde_json::from_slice(&healthy.requests.lock().unwrap()[1].body).unwrap();
+    assert_eq!(healthy_event["event_type"], "payment_settled");
+    assert_eq!(healthy_event["tx_hash"], TX_HASH);
+    assert_eq!(slow.requests.lock().unwrap().len(), 1);
+
+    gate.add_permits(1);
+    wait_for_webhook_count(&slow, 2).await;
+    let slow_event: Value = serde_json::from_slice(&slow.requests.lock().unwrap()[1].body).unwrap();
+    assert_eq!(slow_event["event_id"], healthy_event["event_id"]);
 }
 
 #[tokio::test]

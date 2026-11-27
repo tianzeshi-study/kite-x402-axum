@@ -15,7 +15,7 @@ use kite_x402_axum::{
 };
 use tokio::{
     sync::{watch, Notify},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
     time::sleep,
 };
 
@@ -84,19 +84,21 @@ impl WebhookRuntime {
         mut shutdown: watch::Receiver<bool>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
+            let mut attempts = JoinSet::new();
             loop {
                 if *shutdown.borrow() {
                     break;
                 }
-                if let Some(delivery) = self.dispatcher.claim_next_pending() {
-                    self.deliver(delivery).await;
+                while let Some(result) = attempts.try_join_next() {
+                    result.expect("webhook delivery task failed");
+                }
+                if let Some(delivery) = self.dispatcher.claim_next_for_idle_target() {
+                    let runtime = Arc::clone(&self);
+                    attempts.spawn(async move { runtime.deliver(delivery).await });
                     continue;
                 }
 
-                let delay = self
-                    .dispatcher
-                    .next_retry_delay()
-                    .unwrap_or(Duration::from_secs(3600));
+                let delay = self.dispatcher.next_retry_delay_for_idle_targets();
                 tokio::select! {
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() {
@@ -104,8 +106,14 @@ impl WebhookRuntime {
                         }
                     }
                     _ = self.notify.notified() => {}
-                    _ = sleep(delay) => {}
+                    Some(result) = attempts.join_next() => {
+                        result.expect("webhook delivery task failed");
+                    }
+                    _ = wait_for_retry(delay) => {}
                 }
+            }
+            while let Some(result) = attempts.join_next().await {
+                result.expect("webhook delivery task failed");
             }
         })
     }
@@ -203,7 +211,14 @@ fn validate_target(target: &str) -> Result<String, String> {
             "{TARGETS_ENV} endpoints must be absolute HTTP(S) URLs without credentials or fragments"
         ));
     }
-    Ok(target.to_owned())
+    Ok(url.into())
+}
+
+async fn wait_for_retry(delay: Option<Duration>) {
+    match delay {
+        Some(delay) => sleep(delay).await,
+        None => std::future::pending().await,
+    }
 }
 
 fn unix_time_secs() -> u64 {

@@ -299,11 +299,14 @@ Challenges and payment rejections that return a challenge report the first adver
 
 Only 2xx responses count as delivered. The service retries failures up to three
 times with exponential backoff starting at 500 ms, disables redirects, and
-times out each attempt after five seconds. A bounded in-memory queue holds up
-to 1,000 deliveries; if it fills, the oldest pending delivery is marked
-abandoned. Queue contents are process-local and are lost on restart, so webhooks
-provide best-effort notification rather than durable delivery. A webhook
-failure never changes the buyer's payment response.
+times out each attempt after five seconds. Deliveries to different endpoint URLs
+can run concurrently, with at most one in-flight attempt per URL, so a slow
+receiver does not block attempts to other receivers. All receivers share a
+bounded in-memory queue holding up to 1,000 pending and in-flight deliveries.
+If it fills, the oldest queued delivery is marked abandoned. Queue contents
+are process-local and are lost on restart, so webhooks provide best-effort
+notification rather than durable delivery. A webhook failure never changes
+the buyer's payment response.
 
 ## Timeouts & Configuration
 

@@ -28,6 +28,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `service`: payment webhooks now deliver concurrently across endpoint URLs,
+  with at most one in-flight attempt per URL. Receivers share the existing
+  bounded queue and retry policy.
+
 - `kite-x402-axum`: `cors_guard`, `cache_store` and `sliding_limiter` types are
   re-exported by name instead of through glob re-exports. The set of exported
   names is unchanged.
