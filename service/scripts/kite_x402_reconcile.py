@@ -145,6 +145,15 @@ def reconcile(http, args):
         raise QueryError("RPC returned an invalid transaction receipt")
 
     logs = receipt["logs"]
+    # 日志可省略旧接口未提供的成员字段，但已提供的交易/区块元数据必须与所属回执一致。
+    for log in logs:
+        if not isinstance(log, dict):
+            raise QueryError("transaction receipt contains an invalid log")
+        for field, size, expected in (("transactionHash", 32, transaction), ("blockHash", 32, receipt_hash)):
+            if field in log and hex_field(log[field], size) != expected:
+                raise QueryError("receipt log metadata disagrees with its containing receipt")
+        if "blockNumber" in log and quantity(log["blockNumber"], "receipt log") != receipt_block:
+            raise QueryError("receipt log block number disagrees with its containing receipt")
     transfer = [TRANSFER, payer, padded_address(args.pay_to)]
     amount = f"0x{args.amount:064x}"
     matches = [
