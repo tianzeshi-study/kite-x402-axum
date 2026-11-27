@@ -250,3 +250,114 @@ async fn deliveries_go_out_oldest_first_and_only_due_ones() {
     assert_eq!(rx.seen.lock().unwrap().len(), 2);
     assert_eq!(d.next_due(T0 + 10_000).unwrap().delivery_id, a);
 }
+
+// ---------------------------------------------------------------------------
+// background worker
+// ---------------------------------------------------------------------------
+
+async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !condition() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn fast_dispatcher(url: &str, max_retries: u32) -> WebhookDispatcher {
+    WebhookDispatcher::new(WebhookConfig {
+        target_urls: vec![url.to_owned()],
+        max_retries,
+        initial_backoff: Duration::from_millis(30),
+        max_queue_size: 100,
+        signing_secret: Some("whsec".into()),
+    })
+}
+
+#[tokio::test]
+async fn worker_delivers_events_enqueued_while_it_is_running_and_retries_failures() {
+    let (url, rx) = receiver(&[500]).await;
+    let d = fast_dispatcher(&url, 3);
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(kite_x402_axum::run_delivery_worker(
+        d.clone(),
+        client(),
+        Duration::from_millis(10),
+        stopped,
+    ));
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    enqueue(&d);
+    wait_until("delivery after one retry", || d.history_count() == 1).await;
+
+    assert_eq!(d.pending_count(), 0);
+    assert_eq!(
+        rx.seen.lock().unwrap().len(),
+        2,
+        "one failure then one success"
+    );
+    assert_eq!(d.history()[0].status, DeliveryStatus::Delivered);
+
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .expect("worker stops on shutdown")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn worker_stops_promptly_even_with_a_long_poll_interval() {
+    let (url, _rx) = receiver(&[]).await;
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(kite_x402_axum::run_delivery_worker(
+        fast_dispatcher(&url, 1),
+        client(),
+        Duration::from_secs(3600),
+        stopped,
+    ));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .expect("worker must not sleep through shutdown")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn worker_stops_when_the_shutdown_sender_is_dropped() {
+    let (url, _rx) = receiver(&[]).await;
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(kite_x402_axum::run_delivery_worker(
+        fast_dispatcher(&url, 1),
+        client(),
+        Duration::from_secs(3600),
+        stopped,
+    ));
+    drop(stop);
+    tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .expect("worker stops when the sender goes away")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn worker_does_not_send_after_shutdown() {
+    let (url, rx) = receiver(&[]).await;
+    let d = fast_dispatcher(&url, 1);
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(kite_x402_axum::run_delivery_worker(
+        d.clone(),
+        client(),
+        Duration::from_millis(10),
+        stopped,
+    ));
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+
+    enqueue(&d);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(rx.seen.lock().unwrap().len(), 0);
+    assert_eq!(d.pending_count(), 1);
+}
