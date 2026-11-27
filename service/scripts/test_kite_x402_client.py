@@ -79,6 +79,18 @@ class ClientSettlementTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(send.call_count, 1)
 
+    def test_non_array_accepts_is_rejected_before_signing(self):
+        for accepts in (True, 1, 1.5, "invalid", {"network": NETWORK}):
+            with self.subTest(accepts=accepts):
+                challenge = response(402, **{"Payment-Required": encode_header({"accepts": accepts})})
+                with patch.object(client, "build_payment_header") as sign:
+                    status, errors, send = self.run_client(challenge)
+                self.assertEqual(status, 1)
+                self.assertIn("accepts", errors)
+                self.assertIn("no payment was signed", errors)
+                self.assertEqual(send.call_count, 1)
+                sign.assert_not_called()
+
     def test_invalid_json_body_stops_before_any_request(self):
         for body in ('{"message":}', ""):
             with self.subTest(body=body):

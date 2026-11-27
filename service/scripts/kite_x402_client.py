@@ -326,9 +326,10 @@ def main() -> int:
     print("\npayment required:")
     print(pretty(challenge))
 
-    accepts = challenge.get("accepts") or []
-    if not accepts:
-        print("error: 402 challenge has an empty `accepts` list", file=sys.stderr)
+    accepts = challenge.get("accepts")
+    # 远端 JSON 不能信任类型；在选择报价前拒绝不可迭代或非数组字段，避免异常退出。
+    if not isinstance(accepts, list) or not accepts:
+        print("error: 402 challenge has an invalid or empty `accepts` list; no payment was signed", file=sys.stderr)
         return 1
     requirements = select_option(accepts, args.network)
     if requirements is None:
