@@ -80,6 +80,7 @@ impl RoutePattern {
 #[derive(Debug)]
 pub(super) struct RoutePrices {
     default: Arc<PaymentConfig>,
+    require_match: bool,
     overrides: HashMap<String, HashMap<Method, RoutePrice>>,
     patterns: HashMap<Method, Vec<RoutePattern>>,
     /// Default extras for routes without an explicit list.
@@ -89,6 +90,7 @@ pub(super) struct RoutePrices {
 impl RoutePrices {
     pub(super) fn parse(
         value: &str,
+        require_match: bool,
         default: Arc<PaymentConfig>,
         default_extras: Vec<PaymentOption>,
     ) -> Result<Self, String> {
@@ -177,16 +179,21 @@ impl RoutePrices {
                 }
             }
         }
-        Ok(Self {
+        let prices = Self {
             default,
+            require_match,
             overrides,
             patterns,
             extras: default_extras,
-        })
+        };
+        if require_match && !prices.has_overrides() {
+            return Err("ROUTE_PRICES_REQUIRE_MATCH=true requires at least one route rule".into());
+        }
+        Ok(prices)
     }
 
     pub(super) fn advertised_networks(&self) -> Vec<&'static str> {
-        // Unmatched routes always retain the default options.
+        // 路由可继承默认支付选项，因此仍需检查默认网络。
         let route_extras = self
             .overrides
             .values()
@@ -348,6 +355,9 @@ pub(super) async fn route_payment(
     }
     // Match the full public path before Axum strips the /v1 prefix.
     let route = prices.price_for(req.method(), uri.path());
+    if prices.require_match && route.is_none() {
+        return super::not_found().await.into_response();
+    }
     let config = route.map_or(&prices.default, |route| &route.primary);
     let extras = route
         .and_then(|route| route.extras.as_deref())
@@ -390,7 +400,7 @@ mod tests {
     }
 
     fn parse(rules: &str) -> Result<RoutePrices, String> {
-        RoutePrices::parse(rules, default_config(), Vec::new())
+        RoutePrices::parse(rules, false, default_config(), Vec::new())
     }
 
     #[test]

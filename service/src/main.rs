@@ -269,8 +269,18 @@ async fn main() {
                 .expect("ROUTE_PRICES_USD must be valid UTF-8")
         })
         .unwrap_or_default();
+    let route_prices_require_match = env::var_os("ROUTE_PRICES_REQUIRE_MATCH")
+        .map(|value| {
+            value
+                .into_string()
+                .expect("ROUTE_PRICES_REQUIRE_MATCH must be valid UTF-8")
+                .parse::<bool>()
+                .expect("ROUTE_PRICES_REQUIRE_MATCH must be true or false")
+        })
+        .unwrap_or(false);
     let route_prices = RoutePrices::parse(
         &route_prices_env,
+        route_prices_require_match,
         Arc::clone(&payment_cfg),
         extra_payment_options,
     )
