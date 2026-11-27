@@ -39,6 +39,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - `service` now declares the workspace license.
+- `kite-x402-axum`: webhook retries now follow one schedule. `claim_next_pending`
+  and `next_retry_delay` recomputed `initial_backoff * 2^(attempts-1)` without
+  the documented `MAX_RETRY_BACKOFF` cap, so past 13 failed attempts the queue
+  waited longer than one hour (4096 s at 14, overflowing to `Duration::MAX`
+  later) while `next_due` considered the same delivery overdue after an hour.
+  Both paths now call `WebhookConfig::backoff_for`.
 - `kite-x402-axum`: `CorsSecurityGuard` now advertises the legacy `X-PAYMENT`
   header in `Access-Control-Allow-Headers`, and sends `Vary: Origin` whenever it
   echoes the caller's origin.
