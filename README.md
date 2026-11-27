@@ -56,16 +56,32 @@ matched as URL-encoded strings, so a literal brace must be encoded as `%7B` or
 
 An exact path rule takes priority over a matching template for the same method.
 Invalid rules, duplicate exact rules, and overlapping templates for the same
-method fail at startup. Unmatched metered requests use `PRICE_USD`, as do all
-metered requests when the array is empty or unset.
+method fail at startup. By default, unmatched metered requests use `PRICE_USD`,
+as do all metered requests when the array is empty or unset.
+
+Set `ROUTE_PRICES_REQUIRE_MATCH=true` to expose only the methods and paths
+configured in `ROUTE_PRICES_USD`. With the example above, `GET /v1/forecast`
+and `GET /v1/reports/42` can be paid for. `POST /v1/forecast` and
+`GET /v1/admin` return HTTP `404` with
+`{"error":"not_found","message":"route not found"}` before payment verification,
+upstream forwarding or settlement, including when a payment signature is supplied.
+Exact paths keep priority over templates, and query strings do not affect matching.
+`HEAD` and ordinary `OPTIONS` requests need their own rules. When CORS is enabled,
+the outer middleware still answers browser preflights without contacting the
+upstream; the actual request must match a rule. Free diagnostic and discovery
+endpoints remain available.
+
+The switch accepts only `true` or `false` and defaults to `false`. Enabling it
+with an empty or unset rule list fails at startup. Use it to limit the proxy's
+published routes and keep upstream authorization for user-specific permissions.
 
 Use `extra_payment_options` in a rule to set the alternatives for that route.
 Omit the field to inherit `EXTRA_PAYMENT_OPTIONS`, use `[]` to offer only the
 primary option, or provide an array of `{"network":"mainnet","price":"0.06"}`
 objects to replace the defaults. The primary option stays first. Each extra uses
 `mainnet` or `testnet` and a positive USD amount valid for that network's token.
-An invalid local list prevents the service from starting. Unmatched routes use
-`PRICE_USD` and `EXTRA_PAYMENT_OPTIONS`.
+An invalid local list prevents the service from starting. With strict matching
+disabled, unmatched routes use `PRICE_USD` and `EXTRA_PAYMENT_OPTIONS`.
 
 ```dotenv
 EXTRA_PAYMENT_OPTIONS=mainnet:0.002
@@ -298,6 +314,7 @@ failure never changes the buyer's payment response.
 | `KITE_NETWORK` | `mainnet` | `mainnet` or `testnet`. |
 | `PRICE_USD` | `0.001` | Default price per call in USD, e.g. `0.001` or `$0.001`. It may use at most the asset's decimals and must be an amount a uint256 can hold. |
 | `ROUTE_PRICES_USD` | Empty | Optional JSON array of [route price overrides](#pricing-by-route). |
+| `ROUTE_PRICES_REQUIRE_MATCH` | `false` | Accept only methods and paths in `ROUTE_PRICES_USD`; unmatched requests return `404` before payment processing. Requires at least one rule. Accepts `true` or `false`. |
 | `EXTRA_PAYMENT_OPTIONS` | *(unset)* | Comma-separated default alternatives, e.g. `testnet:0.002,mainnet:$0.05`. A route rule can replace or disable them. |
 | `PORT` | `8402` | Port for the reverse proxy service. |
 | `FACILITATOR_URL` | `https://facilitator.pieverse.io/v2` | Kite facilitator URL (retaining `/v2`). |

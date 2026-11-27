@@ -8,6 +8,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `service`: optional `ROUTE_PRICES_REQUIRE_MATCH=true` limits paid proxy access
+  to the methods and paths configured in `ROUTE_PRICES_USD`. Unmatched requests
+  return `404` before verification, forwarding or settlement. Empty rule lists
+  are rejected at startup when enabled.
+
 - `kite-x402-axum`: `IdempotencyCache::acquire_lease` returns an
   `IdempotencyLease` whose `complete`/`release` only act while the caller still
   owns the key. The key-only `acquire`/`complete`/`release` cannot tell a holder

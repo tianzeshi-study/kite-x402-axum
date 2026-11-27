@@ -1552,10 +1552,190 @@ async fn a_price_no_authorization_could_carry_is_a_500_not_a_challenge() {
 }
 
 #[tokio::test]
+async fn route_prices_require_match_rejects_unlisted_requests_before_payment() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.extend([
+        ("ROUTE_PRICES_REQUIRE_MATCH".into(), "true".into()),
+        (
+            "ROUTE_PRICES_USD".into(),
+            json!([
+                {"method": "GET", "path": "/v1/reports/{id}", "price": "0.05"},
+                {"method": "GET", "path": "/v1/reports/sample", "price": "0.02"}
+            ])
+            .to_string(),
+        ),
+    ]);
+    let svc = Service::start(env).await;
+    let requirements = svc.requirements("/v1/reports/sample").await;
+    let valid_signature = payment_header(&requirements);
+
+    for (method, path) in [
+        (reqwest::Method::GET, "/v1/admin"),
+        (reqwest::Method::GET, "/v1/reports"),
+        (reqwest::Method::GET, "/v1/reports/"),
+        (reqwest::Method::GET, "/v1/reports/a/b"),
+        (reqwest::Method::POST, "/v1/reports/sample"),
+        (reqwest::Method::DELETE, "/v1/reports/42"),
+        (reqwest::Method::OPTIONS, "/v1/reports/sample"),
+        (reqwest::Method::HEAD, "/v1/reports/sample"),
+    ] {
+        for signature in [
+            None,
+            Some("invalid-payment"),
+            Some(valid_signature.as_str()),
+        ] {
+            let mut request = svc.http.request(method.clone(), svc.url(path));
+            if let Some(signature) = signature {
+                request = request.header("PAYMENT-SIGNATURE", signature);
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), 404, "{method} {path}");
+            assert!(!response.headers().contains_key("payment-required"));
+            assert!(!response.headers().contains_key("payment-response"));
+            if method != reqwest::Method::HEAD {
+                assert_eq!(
+                    response.json::<Value>().await.unwrap(),
+                    json!({"error": "not_found", "message": "route not found"})
+                );
+            }
+        }
+    }
+    assert!(mocks.timeline().is_empty());
+    assert_eq!(mocks.facilitator.verify_count(), 0);
+    assert_eq!(mocks.upstream.count(), 0);
+    assert_eq!(mocks.facilitator.settle_count(), 0);
+
+    for (path, upstream_path, amount) in [
+        (
+            "/v1/reports/sample?format=json",
+            "/reports/sample?format=json",
+            "20000000000000000",
+        ),
+        (
+            "/v1/reports/second%20id",
+            "/reports/second%20id",
+            "50000000000000000",
+        ),
+    ] {
+        let requirements = svc.requirements(path).await;
+        assert_eq!(requirements.amount, amount);
+        let response = svc
+            .http
+            .get(svc.url(path))
+            .header("PAYMENT-SIGNATURE", payment_header(&requirements))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(header_json(&response, "payment-response")["success"], true);
+        assert_eq!(mocks.upstream.last().path_and_query, upstream_path);
+    }
+    assert_eq!(mocks.facilitator.verify_count(), 2);
+    assert_eq!(mocks.upstream.count(), 2);
+    assert_eq!(mocks.facilitator.settle_count(), 2);
+    let settlements = mocks.facilitator.settle_requests.lock().unwrap();
+    assert_eq!(
+        settlements[0]["paymentRequirements"]["amount"],
+        "20000000000000000"
+    );
+    assert_eq!(
+        settlements[1]["paymentRequirements"]["amount"],
+        "50000000000000000"
+    );
+}
+
+#[tokio::test]
+async fn route_prices_require_match_preserves_cors_and_free_endpoints() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.extend([
+        ("ROUTE_PRICES_REQUIRE_MATCH".into(), "true".into()),
+        ("CORS_ORIGIN".into(), "https://app.example.com".into()),
+        (
+            "ROUTE_PRICES_USD".into(),
+            r#"[{"method":"GET","path":"/v1/data","price":"0.01"}]"#.into(),
+        ),
+    ]);
+    let svc = Service::start(env).await;
+    for path in [
+        "/healthz",
+        "/livez",
+        "/metrics",
+        "/metrics/x402",
+        "/.well-known/x402",
+    ] {
+        assert_eq!(svc.get(path).await.status(), 200, "{path}");
+    }
+    for path in ["/v1/data", "/v1/admin"] {
+        let preflight = svc
+            .http
+            .request(reqwest::Method::OPTIONS, svc.url(path))
+            .header("Origin", "https://app.example.com")
+            .header("Access-Control-Request-Method", "GET")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), 204);
+        assert_eq!(
+            preflight.headers()["access-control-allow-origin"],
+            "https://app.example.com"
+        );
+        let response = svc
+            .http
+            .get(svc.url(path))
+            .header("Origin", "https://app.example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if path == "/v1/data" { 402 } else { 404 }
+        );
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            "https://app.example.com"
+        );
+    }
+    assert!(mocks.timeline().is_empty());
+}
+
+#[test]
+fn route_prices_require_match_rejects_invalid_configuration_at_startup() {
+    for (strict, rules, expected) in [
+        ("true", "", "requires at least one route rule"),
+        ("true", "[]", "requires at least one route rule"),
+        ("true", "  ", "requires at least one route rule"),
+        (
+            "1",
+            "[]",
+            "ROUTE_PRICES_REQUIRE_MATCH must be true or false",
+        ),
+        (
+            "TRUE",
+            "[]",
+            "ROUTE_PRICES_REQUIRE_MATCH must be true or false",
+        ),
+        ("", "[]", "ROUTE_PRICES_REQUIRE_MATCH must be true or false"),
+    ] {
+        let (status, stderr) = run_expecting_failure(vec![
+            ("PAY_TO", PAY_TO),
+            ("UPSTREAM_URL", "http://127.0.0.1:1"),
+            ("RUST_LOG", "off"),
+            ("ROUTE_PRICES_REQUIRE_MATCH", strict),
+            ("ROUTE_PRICES_USD", rules),
+        ]);
+        assert!(!status.success(), "{strict:?} {rules:?}");
+        assert!(stderr.contains(expected), "{stderr}");
+    }
+}
+
+#[tokio::test]
 async fn route_prices_control_challenges_and_settlement() {
     let mocks = Mocks::start().await;
     let mut env = Service::base_env(&mocks, free_port());
     env.extend([
+        ("ROUTE_PRICES_REQUIRE_MATCH".into(), "false".into()),
         ("PRICE_USD".into(), "0.01".into()),
         (
             "ROUTE_PRICES_USD".into(),
