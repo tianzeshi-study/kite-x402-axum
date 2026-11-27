@@ -57,6 +57,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import secrets
 import shlex
 import sys
@@ -452,7 +453,8 @@ def main() -> int:
         or settlement.get("success") is not True
         or settlement.get("network") != requirements["network"]
         or not isinstance(transaction, str)
-        or not transaction.strip()
+        # 标识形状只用于拒绝畸形服务回报，不能替代链上交易核验。
+        or re.fullmatch(r"0x[0-9a-fA-F]{64}", transaction) is None
     ):
         print(
             "error: settlement could not be confirmed. Reconcile the original payment before retrying",

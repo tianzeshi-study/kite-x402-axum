@@ -183,6 +183,14 @@ struct WebhookState {
     history: VecDeque<WebhookDeliveryRecord>,
 }
 
+impl WebhookState {
+    fn target_is_idle(&self, target_url: &str) -> bool {
+        self.in_flight
+            .values()
+            .all(|delivery| delivery.target_url != target_url)
+    }
+}
+
 impl WebhookDispatcher {
     /// Creates a dispatcher with the given configuration.
     #[must_use]
@@ -286,13 +294,29 @@ impl WebhookDispatcher {
     /// Atomically claims a pending delivery that is ready, preventing duplicate sends across workers.
     #[must_use]
     pub fn claim_next_pending(&self) -> Option<WebhookDeliveryRecord> {
+        self.claim_pending(false)
+    }
+
+    /// Claims a due delivery whose target URL has no in-flight attempt.
+    ///
+    /// Use this method for all claims on a dispatcher to limit concurrency to
+    /// one attempt per target URL. Record every result to release the target.
+    #[must_use]
+    pub fn claim_next_for_idle_target(&self) -> Option<WebhookDeliveryRecord> {
+        self.claim_pending(true)
+    }
+
+    fn claim_pending(&self, idle_targets_only: bool) -> Option<WebhookDeliveryRecord> {
         let now = unix_time_ms();
         let mut state = self.state.write().expect("lock poisoned");
-        let position = state.queue.iter().position(|record| match &record.status {
-            DeliveryStatus::Pending => true,
-            DeliveryStatus::Failed => retry_delay(&self.config, record)
-                .is_some_and(|delay| retry_is_due(record, now, delay)),
-            DeliveryStatus::Delivered | DeliveryStatus::Abandoned => false,
+        let position = state.queue.iter().position(|record| {
+            (!idle_targets_only || state.target_is_idle(&record.target_url))
+                && match &record.status {
+                    DeliveryStatus::Pending => true,
+                    DeliveryStatus::Failed => retry_delay(&self.config, record)
+                        .is_some_and(|delay| retry_is_due(record, now, delay)),
+                    DeliveryStatus::Delivered | DeliveryStatus::Abandoned => false,
+                }
         })?;
         let mut record = state.queue.remove(position)?;
         record.status = DeliveryStatus::Pending;
@@ -303,11 +327,24 @@ impl WebhookDispatcher {
     /// Returns the delay until the next delivery can be claimed, or `None` when no deliveries are queued.
     #[must_use]
     pub fn next_retry_delay(&self) -> Option<Duration> {
+        self.retry_delay_for_targets(false)
+    }
+
+    /// Returns the next claim delay for idle targets, or `None` if they have no queued work.
+    ///
+    /// A busy target becomes eligible when its in-flight result is recorded.
+    #[must_use]
+    pub fn next_retry_delay_for_idle_targets(&self) -> Option<Duration> {
+        self.retry_delay_for_targets(true)
+    }
+
+    fn retry_delay_for_targets(&self, idle_targets_only: bool) -> Option<Duration> {
         let now = unix_time_ms();
         let state = self.state.read().expect("lock poisoned");
         state
             .queue
             .iter()
+            .filter(|record| !idle_targets_only || state.target_is_idle(&record.target_url))
             .filter_map(|record| match &record.status {
                 DeliveryStatus::Pending => Some(Duration::ZERO),
                 DeliveryStatus::Failed => {
@@ -538,6 +575,62 @@ fn fastrand_hex(len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_target_claims_skip_busy_receivers_and_respect_retry_delay() {
+        let slow_url = "https://slow.example.com/webhook";
+        let fast_url = "https://fast.example.com/webhook";
+        let dispatcher = WebhookDispatcher::new(WebhookConfig {
+            target_urls: vec![slow_url.into(), fast_url.into()],
+            initial_backoff: Duration::from_secs(60),
+            ..Default::default()
+        });
+        let prompted = dispatcher.enqueue_event(
+            WebhookEventType::PaymentPrompted,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let settled = dispatcher.enqueue_event(
+            WebhookEventType::PaymentSettled,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let slow = dispatcher.claim_next_for_idle_target().unwrap();
+        let fast = dispatcher.claim_next_for_idle_target().unwrap();
+        assert_eq!(slow.delivery_id, prompted[0]);
+        assert_eq!(fast.delivery_id, prompted[1]);
+        assert!(dispatcher.claim_next_for_idle_target().is_none());
+        assert_eq!(dispatcher.next_retry_delay_for_idle_targets(), None);
+
+        dispatcher
+            .record_attempt_result(fast.delivery_id, true, Some(204), None)
+            .unwrap();
+        assert_eq!(
+            dispatcher.next_retry_delay_for_idle_targets(),
+            Some(Duration::ZERO)
+        );
+        let fast = dispatcher.claim_next_for_idle_target().unwrap();
+        assert_eq!(fast.delivery_id, settled[1]);
+        assert!(dispatcher.claim_next_for_idle_target().is_none());
+
+        dispatcher
+            .record_attempt_result(slow.delivery_id, false, Some(503), None)
+            .unwrap();
+        let next_slow = dispatcher.claim_next_for_idle_target().unwrap();
+        assert_eq!(next_slow.delivery_id, settled[0]);
+        assert_eq!(dispatcher.next_retry_delay_for_idle_targets(), None);
+        dispatcher
+            .record_attempt_result(next_slow.delivery_id, true, Some(204), None)
+            .unwrap();
+        assert!(dispatcher.claim_next_for_idle_target().is_none());
+        assert!(dispatcher.next_retry_delay_for_idle_targets().unwrap() > Duration::ZERO);
+    }
 
     #[test]
     fn test_webhook_enqueue_and_delivery() {

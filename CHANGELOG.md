@@ -8,6 +8,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `service`: optional `ROUTE_PRICES_REQUIRE_MATCH=true` limits paid proxy access
+  to the methods and paths configured in `ROUTE_PRICES_USD`. Unmatched requests
+  return `404` before verification, forwarding or settlement. Empty rule lists
+  are rejected at startup when enabled.
+
 - `kite-x402-axum`: `IdempotencyCache::acquire_lease` returns an
   `IdempotencyLease` whose `complete`/`release` only act while the caller still
   owns the key. The key-only `acquire`/`complete`/`release` cannot tell a holder
@@ -22,6 +27,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a GitHub release.
 
 ### Changed
+
+- `service`: payment webhooks now deliver concurrently across endpoint URLs,
+  with at most one in-flight attempt per URL. Receivers share the existing
+  bounded queue and retry policy.
 
 - `kite-x402-axum`: `cors_guard`, `cache_store` and `sliding_limiter` types are
   re-exported by name instead of through glob re-exports. The set of exported
