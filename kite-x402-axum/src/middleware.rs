@@ -1289,17 +1289,16 @@ mod tests {
         use std::sync::Arc;
 
         let ledger = Arc::new(SettlementLedger::new(100));
-        let cfg = PaymentConfig {
-            pay_to: PAY_TO.to_owned(),
-            chain: KITE_TESTNET,
-            price_usd: "0.001".to_owned(),
-            description: "test".to_owned(),
-            facilitator: dead_facilitator(),
-            expiration_guard: None,
-            metrics: None,
-            nonce_guard: None,
-            settlement_ledger: Some(ledger.clone()),
-        };
+        let cfg = Arc::new(
+            PaymentConfig::new(
+                PAY_TO,
+                KITE_TESTNET,
+                "0.001",
+                "Unit test service",
+                dead_facilitator(),
+            )
+            .with_expiration_guard(guard),
+        );
         let req = requirements();
         let clean_network = req.network.clone();
         let settle = SettleResponse {
