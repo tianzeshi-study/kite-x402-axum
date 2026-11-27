@@ -79,6 +79,22 @@ class ClientSettlementTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(send.call_count, 1)
 
+    def test_malformed_reported_transaction_is_not_confirmation(self):
+        for transaction in ("not-a-hash", "0x12", "0x" + "gg" * 32, "0x" + "42" * 33,
+                            " " + self.receipt["transaction"], self.receipt["transaction"] + "\n"):
+            with self.subTest(transaction=transaction):
+                settled = response(200, **{"Payment-Response": encode_header({**self.receipt, "transaction": transaction})})
+                status, errors, send = self.run_client(self.challenge, settled)
+                self.assertEqual(status, 1)
+                self.assertIn("Reconcile the original payment before retrying", errors)
+                self.assertEqual(send.call_count, 2)
+
+    def test_uppercase_hex_transaction_remains_supported(self):
+        settled = response(200, **{"Payment-Response": encode_header({**self.receipt, "transaction": "0x" + "aB" * 32})})
+        status, _, send = self.run_client(self.challenge, settled)
+        self.assertEqual(status, 0)
+        self.assertEqual(send.call_count, 2)
+
     def test_invalid_json_body_stops_before_any_request(self):
         for body in ('{"message":}', ""):
             with self.subTest(body=body):
