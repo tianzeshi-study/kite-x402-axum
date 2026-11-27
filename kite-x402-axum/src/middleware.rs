@@ -1289,6 +1289,7 @@ mod tests {
         use std::sync::Arc;
 
         let ledger = Arc::new(SettlementLedger::new(100));
+        let guard = crate::expiration::ExpirationGuardConfig::new(5, 5);
         let cfg = Arc::new(
             PaymentConfig::new(
                 PAY_TO,
