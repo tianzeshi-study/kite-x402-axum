@@ -168,6 +168,35 @@ impl WebhookConfig {
     }
 }
 
+/// Runs webhook deliveries in the background until `shutdown` becomes `true`
+/// (or its sender is dropped).
+///
+/// Each wake-up delivers every webhook that is currently due, then sleeps for
+/// `poll_interval` (or until shutdown). Run exactly one worker per
+/// dispatcher. Pending deliveries live in memory only: on shutdown anything
+/// still queued is not delivered and is lost when the process exits.
+pub async fn run_delivery_worker(
+    dispatcher: WebhookDispatcher,
+    client: reqwest::Client,
+    poll_interval: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        while !*shutdown.borrow() && dispatcher.deliver_next(&client).await.is_some() {}
+        if *shutdown.borrow() {
+            return;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(poll_interval) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Thread-safe webhook queue and dispatcher.
 #[derive(Debug, Clone)]
 pub struct WebhookDispatcher {
