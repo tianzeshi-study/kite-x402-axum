@@ -212,10 +212,12 @@ def main(argv=None):
         args.rpc_url = default_rpc
     try:
         parsed = urlsplit(args.rpc_url)
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        # urlsplit validates a malformed port only when .port is read.
+        # Requests drops port zero, which would send the lookup to the default port.
+        if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.port == 0:
             raise ValueError
     except ValueError:
-        parser.error("--rpc-url must be an HTTP or HTTPS URL")
+        parser.error("--rpc-url must be a valid HTTP or HTTPS URL")
 
     try:
         with requests.Session() as http:
