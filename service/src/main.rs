@@ -41,7 +41,7 @@ mod health;
 mod rate_limit;
 mod route_prices;
 mod settlement_query;
-mod webhook_delivery;
+mod webhooks;
 use cors::{cors_middleware, CorsConfig};
 use health::ReadinessState;
 use rate_limit::{
@@ -269,10 +269,27 @@ async fn main() {
     if let Some(store) = durable_store {
         tokio::spawn((*store).clone().run(shutdown_rx.clone()));
     }
-    let webhook_runtime = webhook_delivery::WebhookRuntime::from_env()
-        .unwrap_or_else(|err| panic!("invalid webhook configuration: {err}"));
 
     let health = health_info(chain, &price_usd);
+    let webhook_settings = webhooks::WebhookSettings::from_lookup(|key| env::var(key).ok())
+        .unwrap_or_else(|message| panic!("{message}"));
+    let webhook_dispatcher = webhook_settings.map(|settings| {
+        if settings.insecure_targets() > 0 {
+            tracing::warn!(
+                count = settings.insecure_targets(),
+                "WEBHOOK_URLS has plain-http targets on non-loopback hosts; \
+                 payment events (payer address, amount) will cross the network unencrypted"
+            );
+        }
+        if settings.secret.is_none() {
+            tracing::warn!("WEBHOOK_SECRET is not set; webhook deliveries are not signed");
+        }
+        tracing::info!(targets = settings.urls.len(), "Webhook delivery enabled");
+        Arc::new(kite_x402_axum::WebhookDispatcher::new(
+            settings.into_config(),
+        ))
+    });
+
     let payment_cfg = Arc::new(PaymentConfig {
         pay_to,
         chain,
@@ -287,7 +304,7 @@ async fn main() {
         metrics: Some(Arc::clone(&metrics)),
         nonce_guard,
         settlement_ledger: settlement_ledger.clone(),
-        webhooks: None,
+        webhooks: webhook_dispatcher.clone(),
     });
     let discovery = DiscoveryInfo {
         primary: chain,
@@ -360,15 +377,17 @@ async fn main() {
             concurrency_semaphore,
             concurrency_limiter,
         ));
-    let paid = if let Some(webhook_runtime) = &webhook_runtime {
-        paid.layer(middleware::from_fn_with_state(
-            Arc::clone(webhook_runtime),
-            webhook_delivery::observe_payment_events,
-        ))
-    } else {
-        paid
-    };
 
+    if let Some(dispatcher) = webhook_dispatcher {
+        let client = kite_x402_axum::webhook::delivery_client()
+            .expect("failed to build the webhook HTTP client");
+        tokio::spawn(kite_x402_axum::run_delivery_worker(
+            (*dispatcher).clone(),
+            client,
+            Duration::from_millis(500),
+            shutdown_rx.clone(),
+        ));
+    }
     let readyz_state = Arc::new(ReadyzState {
         payment_cfg,
         networks: advertised_networks,
@@ -472,7 +491,6 @@ async fn main() {
 
     let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
     let (settlement_shutdown_tx, mut settlement_shutdown_rx) = tokio::sync::watch::channel(false);
-    let webhook_worker = webhook_runtime.map(|runtime| runtime.spawn_worker(shutdown_rx.clone()));
     let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -496,23 +514,7 @@ async fn main() {
     };
 
     tokio::select! {
-        res = async {
-            if let Some(worker) = webhook_worker {
-                tokio::try_join!(
-                    async { server.await },
-                    settlement_server,
-                    async {
-                        worker
-                            .await
-                            .map_err(|error| std::io::Error::other(error.to_string()))?;
-                        Ok::<(), std::io::Error>(())
-                    }
-                )?;
-            } else {
-                tokio::try_join!(async { server.await }, settlement_server)?;
-            }
-            Ok::<(), std::io::Error>(())
-        } => {
+        res = async { tokio::try_join!(async { server.await }, settlement_server) } => {
             res.expect("server error");
             tracing::info!("Server shut down gracefully");
         }
