@@ -221,6 +221,23 @@ pub async fn run_delivery_worker(
     }
 }
 
+/// Aggregate delivery counters and queue gauges for a webhook dispatcher.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WebhookMetricsSnapshot {
+    /// Deliveries waiting in the queue, including retries awaiting backoff.
+    pub queued: usize,
+    /// Deliveries currently being sent.
+    pub in_flight: usize,
+    /// Total completed HTTP delivery attempts.
+    pub attempts_total: u64,
+    /// Total deliveries accepted with a successful HTTP response.
+    pub delivered_total: u64,
+    /// Total failed HTTP delivery attempts, including attempts later abandoned.
+    pub failed_attempts_total: u64,
+    /// Total deliveries abandoned after exhausting retries or due to queue capacity.
+    pub abandoned_total: u64,
+}
+
 /// Thread-safe webhook queue and dispatcher.
 #[derive(Debug, Clone)]
 pub struct WebhookDispatcher {
@@ -234,6 +251,10 @@ struct WebhookState {
     queue: VecDeque<WebhookDeliveryRecord>,
     in_flight: HashMap<u64, WebhookDeliveryRecord>,
     history: VecDeque<WebhookDeliveryRecord>,
+    attempts_total: u64,
+    delivered_total: u64,
+    failed_attempts_total: u64,
+    abandoned_total: u64,
 }
 
 impl WebhookState {
@@ -255,6 +276,10 @@ impl WebhookDispatcher {
                 queue: VecDeque::new(),
                 in_flight: HashMap::new(),
                 history: VecDeque::new(),
+                attempts_total: 0,
+                delivered_total: 0,
+                failed_attempts_total: 0,
+                abandoned_total: 0,
             })),
         }
     }
@@ -319,6 +344,7 @@ impl WebhookDispatcher {
                     // Keep dropped deliveries visible to callers that already
                     // received their delivery id.
                     evicted.status = DeliveryStatus::Abandoned;
+                    state.abandoned_total = state.abandoned_total.saturating_add(1);
                     evicted.last_error = Some("evicted: webhook queue full".into());
                     if state.history.len() >= self.config.max_queue_size {
                         state.history.pop_front();
@@ -328,6 +354,7 @@ impl WebhookDispatcher {
                     // In-flight work cannot be evicted safely. Record the new
                     // delivery as abandoned rather than exceeding the bound.
                     record.status = DeliveryStatus::Abandoned;
+                    state.abandoned_total = state.abandoned_total.saturating_add(1);
                     record.last_error = Some("dropped: webhook queue full".into());
                     if state.history.len() >= self.config.max_queue_size {
                         state.history.pop_front();
@@ -443,12 +470,14 @@ impl WebhookDispatcher {
             state.in_flight.remove(&delivery_id)
         };
         if let Some(mut record) = record {
+            state.attempts_total = state.attempts_total.saturating_add(1);
             record.attempts += 1;
             record.last_attempt_ms = Some(now);
             record.last_status_code = status_code;
             record.last_error = error_msg;
 
             if success {
+                state.delivered_total = state.delivered_total.saturating_add(1);
                 record.status = DeliveryStatus::Delivered;
                 if state.history.len() >= self.config.max_queue_size {
                     state.history.pop_front();
@@ -456,6 +485,8 @@ impl WebhookDispatcher {
                 state.history.push_back(record.clone());
                 Some(record)
             } else if record.attempts > record.max_retries {
+                state.failed_attempts_total = state.failed_attempts_total.saturating_add(1);
+                state.abandoned_total = state.abandoned_total.saturating_add(1);
                 record.status = DeliveryStatus::Abandoned;
                 if state.history.len() >= self.config.max_queue_size {
                     state.history.pop_front();
@@ -463,6 +494,7 @@ impl WebhookDispatcher {
                 state.history.push_back(record.clone());
                 Some(record)
             } else {
+                state.failed_attempts_total = state.failed_attempts_total.saturating_add(1);
                 record.status = DeliveryStatus::Failed;
                 state.queue.push_back(record.clone());
                 Some(record)
@@ -574,6 +606,20 @@ impl WebhookDispatcher {
         }
     }
 
+    /// Returns aggregate delivery counters and queue gauges.
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> WebhookMetricsSnapshot {
+        let state = self.state.read().expect("lock poisoned");
+        WebhookMetricsSnapshot {
+            queued: state.queue.len(),
+            in_flight: state.in_flight.len(),
+            attempts_total: state.attempts_total,
+            delivered_total: state.delivered_total,
+            failed_attempts_total: state.failed_attempts_total,
+            abandoned_total: state.abandoned_total,
+        }
+    }
+
     /// Number of pending deliveries in queue.
     #[must_use]
     pub fn pending_count(&self) -> usize {
@@ -636,6 +682,87 @@ fn fastrand_hex(len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metrics_snapshot_tracks_queue_attempts_and_abandonment() {
+        let dispatcher = WebhookDispatcher::new(WebhookConfig {
+            target_urls: vec!["https://one.example/hook".into()],
+            max_queue_size: 1,
+            max_retries: 1,
+            initial_backoff: Duration::ZERO,
+            ..Default::default()
+        });
+        assert_eq!(
+            dispatcher.metrics_snapshot(),
+            WebhookMetricsSnapshot::default()
+        );
+
+        let first = dispatcher.enqueue_event(
+            WebhookEventType::PaymentSettled,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )[0];
+        assert_eq!(dispatcher.metrics_snapshot().queued, 1);
+        let claimed = dispatcher.claim_next_for_idle_target().unwrap();
+        assert_eq!(claimed.delivery_id, first);
+        let snapshot = dispatcher.metrics_snapshot();
+        assert_eq!(snapshot.queued, 0);
+        assert_eq!(snapshot.in_flight, 1);
+
+        let _ = dispatcher.enqueue_event(
+            WebhookEventType::PaymentSettled,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let snapshot = dispatcher.metrics_snapshot();
+        assert_eq!(snapshot.in_flight, 1);
+        assert_eq!(snapshot.abandoned_total, 1);
+
+        dispatcher
+            .record_attempt_result(first, false, Some(503), None)
+            .unwrap();
+        let snapshot = dispatcher.metrics_snapshot();
+        assert_eq!(snapshot.queued, 1);
+        assert_eq!(snapshot.in_flight, 0);
+        assert_eq!(snapshot.attempts_total, 1);
+        assert_eq!(snapshot.failed_attempts_total, 1);
+
+        let retry = dispatcher.claim_next_for_idle_target().unwrap();
+        dispatcher
+            .record_attempt_result(retry.delivery_id, false, Some(503), None)
+            .unwrap();
+        let snapshot = dispatcher.metrics_snapshot();
+        assert_eq!(snapshot.queued, 0);
+        assert_eq!(snapshot.in_flight, 0);
+        assert_eq!(snapshot.attempts_total, 2);
+        assert_eq!(snapshot.failed_attempts_total, 2);
+        assert_eq!(snapshot.delivered_total, 0);
+        assert_eq!(snapshot.abandoned_total, 2);
+
+        let delivered = dispatcher.enqueue_event(
+            WebhookEventType::PaymentSettled,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )[0];
+        dispatcher.claim_next_for_idle_target().unwrap();
+        dispatcher
+            .record_attempt_result(delivered, true, Some(204), None)
+            .unwrap();
+        let snapshot = dispatcher.metrics_snapshot();
+        assert_eq!(snapshot.attempts_total, 3);
+        assert_eq!(snapshot.delivered_total, 1);
+        assert_eq!(snapshot.failed_attempts_total, 2);
+        assert_eq!(snapshot.abandoned_total, 2);
+    }
 
     #[test]
     fn idle_target_claims_skip_busy_receivers_and_respect_retry_delay() {

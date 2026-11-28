@@ -265,6 +265,14 @@ The service exposes endpoints outside `/v1/*` that are unmetered (free) and neve
   - `successful_requests`: Requests returning status < 400.
   - `server_errors`: Requests returning status >= 500.
   - `uptime_seconds`: Seconds elapsed since service startup.
+  - `webhooks`: Aggregate webhook delivery metrics. `enabled` indicates whether
+    `WEBHOOK_URLS` is configured; `queued` counts waiting deliveries, including
+    retries; `in_flight` counts active HTTP attempts; `attempts_total`,
+    `delivered_total`, `failed_attempts_total`, and `abandoned_total` are
+    process-local cumulative counters. Failed attempts include attempts later
+    abandoned; abandoned deliveries include retry exhaustion and queue-capacity
+    drops. The snapshot contains no endpoint URLs or payment event data. Counters
+    reset when the process restarts.
 
 ## Timeouts & Configuration
 

@@ -30,7 +30,7 @@ use kite_x402_axum::{
     middleware::PaymentConfig,
     payment_options::PaymentOption,
     proxy::{proxy, same_origin_redirect_policy, UpstreamConfig},
-    PaymentMetrics, PaymentMetricsSnapshot, SettlementLedger,
+    PaymentMetrics, PaymentMetricsSnapshot, SettlementLedger, WebhookDispatcher,
 };
 use serde_json::json;
 
@@ -378,11 +378,11 @@ async fn main() {
             concurrency_limiter,
         ));
 
-    if let Some(dispatcher) = webhook_dispatcher {
+    if let Some(dispatcher) = &webhook_dispatcher {
         let client = kite_x402_axum::webhook::delivery_client()
             .expect("failed to build the webhook HTTP client");
         tokio::spawn(kite_x402_axum::run_delivery_worker(
-            (*dispatcher).clone(),
+            (**dispatcher).clone(),
             client,
             Duration::from_millis(500),
             shutdown_rx.clone(),
@@ -416,10 +416,19 @@ async fn main() {
         .route("/metrics/x402", axum::routing::get(metrics_x402_handler))
         .with_state(Arc::clone(&metrics));
 
+    let metrics_state = Arc::new(MetricsEndpointState {
+        service: Arc::clone(&service_metrics),
+        webhooks: webhook_dispatcher.clone(),
+    });
     let diag_router = Router::new()
-        .route("/livez", axum::routing::get(livez))
-        .route("/metrics", axum::routing::get(metrics_endpoint))
-        .with_state(Arc::clone(&service_metrics));
+        .route(
+            "/livez",
+            axum::routing::get(livez).with_state(Arc::clone(&service_metrics)),
+        )
+        .route(
+            "/metrics",
+            axum::routing::get(metrics_endpoint).with_state(metrics_state),
+        );
 
     let security_enabled = match env::var("SECURITY_HEADERS_ENABLED") {
         Ok(v) => v.trim() != "0" && !v.trim().eq_ignore_ascii_case("false"),
@@ -568,6 +577,12 @@ async fn metrics_x402_handler(
 ) -> Json<PaymentMetricsSnapshot> {
     tracing::debug!("Handling /metrics/x402 request");
     Json(metrics.snapshot())
+}
+
+#[derive(Clone)]
+struct MetricsEndpointState {
+    service: Arc<ServiceMetrics>,
+    webhooks: Option<Arc<WebhookDispatcher>>,
 }
 
 /// Process-wide request counters exposed on the metrics endpoint.
@@ -794,9 +809,36 @@ async fn livez(State(metrics): State<Arc<ServiceMetrics>>) -> Json<serde_json::V
     }))
 }
 
-async fn metrics_endpoint(State(metrics): State<Arc<ServiceMetrics>>) -> Json<serde_json::Value> {
+async fn metrics_endpoint(
+    State(state): State<Arc<MetricsEndpointState>>,
+) -> Json<serde_json::Value> {
     tracing::debug!("Handling /metrics request");
-    Json(metrics.snapshot())
+    let mut snapshot = state.service.snapshot();
+    let webhook = state
+        .webhooks
+        .as_ref()
+        .map(|dispatcher| dispatcher.metrics_snapshot());
+    snapshot["webhooks"] = match webhook {
+        Some(metrics) => json!({
+            "enabled": true,
+            "queued": metrics.queued,
+            "in_flight": metrics.in_flight,
+            "attempts_total": metrics.attempts_total,
+            "delivered_total": metrics.delivered_total,
+            "failed_attempts_total": metrics.failed_attempts_total,
+            "abandoned_total": metrics.abandoned_total,
+        }),
+        None => json!({
+            "enabled": false,
+            "queued": 0,
+            "in_flight": 0,
+            "attempts_total": 0,
+            "delivered_total": 0,
+            "failed_attempts_total": 0,
+            "abandoned_total": 0,
+        }),
+    };
+    Json(snapshot)
 }
 
 async fn concurrency_limiter(
@@ -1345,6 +1387,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_endpoint_reports_aggregate_webhook_state_without_payloads() {
+        let service = Arc::new(ServiceMetrics::new());
+        let disabled = metrics_endpoint(State(Arc::new(MetricsEndpointState {
+            service: Arc::clone(&service),
+            webhooks: None,
+        })))
+        .await
+        .0;
+        assert_eq!(disabled["webhooks"]["enabled"], false);
+        assert_eq!(disabled["webhooks"]["queued"], 0);
+
+        let dispatcher = Arc::new(WebhookDispatcher::new(kite_x402_axum::WebhookConfig {
+            target_urls: vec!["https://private.example/hook".into()],
+            ..Default::default()
+        }));
+        let _ = dispatcher.enqueue_event(
+            kite_x402_axum::WebhookEventType::PaymentSettled,
+            Some("0xprivate-payer".into()),
+            Some("eip155:2368".into()),
+            Some("100".into()),
+            Some("0xprivate-hash".into()),
+            Some("/v1/private".into()),
+        );
+        let enabled = metrics_endpoint(State(Arc::new(MetricsEndpointState {
+            service,
+            webhooks: Some(dispatcher),
+        })))
+        .await
+        .0;
+        assert_eq!(enabled["webhooks"]["enabled"], true);
+        assert_eq!(enabled["webhooks"]["queued"], 1);
+        assert_eq!(enabled["webhooks"]["in_flight"], 0);
+        assert_eq!(enabled["webhooks"]["abandoned_total"], 0);
+        let body = enabled.to_string();
+        assert!(!body.contains("private.example"));
+        assert!(!body.contains("private-payer"));
+        assert!(!body.contains("private-hash"));
+        assert!(!body.contains("/v1/private"));
+    }
+
+    #[tokio::test]
     async fn metrics_endpoint_tracks_and_reports_requests() {
         let metrics = Arc::new(ServiceMetrics::new());
         let app = Router::new()
@@ -1354,7 +1437,10 @@ mod tests {
             )
             .route(
                 "/metrics",
-                get(metrics_endpoint).with_state(metrics.clone()),
+                get(metrics_endpoint).with_state(Arc::new(MetricsEndpointState {
+                    service: metrics.clone(),
+                    webhooks: None,
+                })),
             )
             .layer(middleware::from_fn_with_state(
                 metrics.clone(),
@@ -1395,7 +1481,11 @@ mod tests {
             .unwrap();
         assert_eq!(res2.status(), StatusCode::OK);
 
-        let Json(snapshot) = metrics_endpoint(State(metrics.clone())).await;
+        let Json(snapshot) = metrics_endpoint(State(Arc::new(MetricsEndpointState {
+            service: metrics.clone(),
+            webhooks: None,
+        })))
+        .await;
         assert_eq!(snapshot["total_requests"], 2);
         assert_eq!(snapshot["successful_requests"], 2);
         assert_eq!(metrics.active_requests.load(Ordering::SeqCst), 0);
