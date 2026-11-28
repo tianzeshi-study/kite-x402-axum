@@ -4,7 +4,7 @@
 use axum::{http::StatusCode, response::IntoResponse, routing::get, Json, Router};
 use kite_x402_axum::{FacilitatorClient, FacilitatorError};
 use serde_json::{json, Value};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 
 const NETWORK: &str = "eip155:2368";
 
@@ -131,9 +131,10 @@ async fn probe_treats_an_unparseable_success_body_as_an_error() {
 
 #[tokio::test]
 async fn probe_fails_when_the_facilitator_is_unreachable() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
+    // Reserve the port without listening so parallel tests cannot reuse it.
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = socket.local_addr().unwrap();
     let err = FacilitatorClient::new(format!("http://{addr}"))
         .probe()
         .await

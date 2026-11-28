@@ -20,6 +20,11 @@ allow = [
     "CDLA-Permissive-2.0",
 ]
 
+# Transitive dependency of sqlx-core via hashbrown.
+[[licenses.exceptions]]
+crate = "foldhash@0.1.5"
+allow = ["Zlib"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"

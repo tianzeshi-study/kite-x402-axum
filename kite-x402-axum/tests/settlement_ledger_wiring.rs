@@ -41,13 +41,19 @@ async fn successful_payment_is_recorded_with_its_receipt() {
     assert_eq!(record.network, KITE_TESTNET.network);
     assert_eq!(record.payer, PAYER);
     assert_eq!(record.pay_to, PAY_TO);
-    assert!(record.amount > 0, "amount comes from the matched option");
+    assert!(
+        record.amount.is_some(),
+        "amount comes from the matched option"
+    );
     assert!(record.error_reason.is_none());
 
     let summary = ledger.summary();
     assert_eq!(summary.successful_count, 1);
     assert_eq!(summary.failed_count, 0);
-    assert_eq!(summary.total_settled_volume, record.amount);
+    assert_eq!(
+        Some(&summary.volumes[0].amount_atomic),
+        record.amount.as_ref()
+    );
 }
 
 #[tokio::test]

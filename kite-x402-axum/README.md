@@ -176,3 +176,11 @@ TypeScript SDK's `500`/`502` split. See the crate's top-level documentation
 ## License
 
 Apache-2.0, matching the rest of `kite-x402-services`.
+
+### Settlement ledger amounts
+
+`SettlementRecord::amount` is an `Option<String>` containing the exact
+base-10 atomic amount. Each record carries the token contract as `asset`.
+`LedgerSummary::volumes` groups successful volume by `network` and `asset`.
+Use `SettlementLedger::with_store` to supply the optional durable payment
+store. Database-backed reads are provided by the backend implementation.

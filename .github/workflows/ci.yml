@@ -58,6 +58,32 @@ jobs:
       # secrets or external network access are needed.
       - run: cargo test --workspace --locked
 
+  durable-settlement:
+    name: durable settlement (PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: kite
+          POSTGRES_PASSWORD: kite-ci
+          POSTGRES_DB: kite
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kite"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      SETTLEMENT_TEST_DATABASE_URL: postgres://kite:kite-ci@127.0.0.1:5432/kite
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p kite-x402-service --locked --test e2e durable_settlement -- --ignored
+
   msrv:
     name: msrv (1.88)
     runs-on: ubuntu-latest
@@ -279,7 +305,7 @@ jobs:
   ci-success:
     name: CI success
     if: always()
-    needs: [fmt, clippy, test, msrv, docs, package, scripts, kx402, compose, deny, docker]
+    needs: [fmt, clippy, test, durable-settlement, msrv, docs, package, scripts, kx402, compose, deny, docker]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any required job failed or was cancelled

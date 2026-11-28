@@ -26,7 +26,7 @@ use axum::{
 };
 use kite_x402_axum::{
     facilitator::{FacilitatorClient, RetryConfig},
-    kite::{kite_chain_by_name, KiteChain, FACILITATOR_URL},
+    kite::{kite_chain_by_name, KiteChain, FACILITATOR_URL, KITE_MAINNET, KITE_TESTNET},
     middleware::PaymentConfig,
     payment_options::PaymentOption,
     proxy::{proxy, same_origin_redirect_policy, UpstreamConfig},
@@ -34,7 +34,9 @@ use kite_x402_axum::{
 };
 use serde_json::json;
 
+mod chain_reconciliation;
 mod cors;
+mod durable_settlement;
 mod health;
 mod rate_limit;
 mod route_prices;
@@ -235,7 +237,38 @@ async fn main() {
             .unwrap_or_else(|message| panic!("{message}"));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let settlement_port = settlement_query::configured_port().unwrap_or_else(|err| panic!("{err}"));
-    let settlement_ledger = settlement_port.map(|_| Arc::new(SettlementLedger::default()));
+    let durable_store = if env_or("SETTLEMENT_DATABASE_URL", "").is_empty() {
+        None
+    } else {
+        let rpc = chain_reconciliation::ChainRpc::new(
+            &env_or("SETTLEMENT_MAINNET_RPC_URL", KITE_MAINNET.rpc_url),
+            &env_or("SETTLEMENT_TESTNET_RPC_URL", KITE_TESTNET.rpc_url),
+        )
+        .unwrap_or_else(|error| panic!("Invalid settlement RPC configuration: {error}"));
+        let database_url = env_or("SETTLEMENT_DATABASE_URL", "");
+        let store = durable_settlement::DurableStore::connect(&database_url, rpc)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("Could not connect to or initialize the settlement database")
+            });
+        tracing::info!("Using shared PostgreSQL settlement journal");
+        Some(Arc::new(store))
+    };
+    let settlement_ledger = match &durable_store {
+        Some(store) => Some(Arc::new(
+            SettlementLedger::default().with_store(store.clone()),
+        )),
+        None => settlement_port.map(|_| Arc::new(SettlementLedger::default())),
+    };
+    let settlement_query_source = match &durable_store {
+        Some(store) => Some(settlement_query::Source::Durable(store.clone())),
+        None => settlement_ledger
+            .clone()
+            .map(settlement_query::Source::Local),
+    };
+    if let Some(store) = durable_store {
+        tokio::spawn((*store).clone().run(shutdown_rx.clone()));
+    }
     let webhook_runtime = webhook_delivery::WebhookRuntime::from_env()
         .unwrap_or_else(|err| panic!("invalid webhook configuration: {err}"));
 
@@ -452,7 +485,7 @@ async fn main() {
         let _ = signal_tx.send(());
     });
     let settlement_server = async move {
-        if let Some(((listener, addr), ledger)) = settlement_listener.zip(settlement_ledger) {
+        if let Some(((listener, addr), ledger)) = settlement_listener.zip(settlement_query_source) {
             axum::serve(listener, settlement_query::router(ledger, addr))
                 .with_graceful_shutdown(async move {
                     let _ = settlement_shutdown_rx.wait_for(|stopping| *stopping).await;
