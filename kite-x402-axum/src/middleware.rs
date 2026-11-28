@@ -283,6 +283,23 @@ fn forwarded_scheme(req: &Request) -> Option<&'static str> {
     }
 }
 
+/// Whether `value` is a 32-byte hash in `0x` form: the prefix plus exactly 64
+/// hex digits, surrounding whitespace ignored.
+///
+/// The settlement ledger keys each successful record by network plus this
+/// string, so a receipt that carries anything else — "settled", "pending" or a
+/// truncated hash — would occupy a key that can never match a chain
+/// transaction. The gate therefore only enforces the shape when a ledger is
+/// configured: with no ledger the string is echoed back untouched (callers and
+/// the kx402 client contract rely on that pass-through), while with a ledger
+/// the attempt is recorded as unconfirmed instead of poisoning the index.
+fn is_transaction_hash(value: &str) -> bool {
+    let Some(hex) = value.trim().strip_prefix("0x") else {
+        return false;
+    };
+    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn unix_now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -801,6 +818,8 @@ async fn payment_gate_inner(
             Some("Settlement receipt does not match the journaled authorization")
         } else if settle.transaction.trim().is_empty() {
             Some("Settlement receipt is missing a transaction ID")
+        } else if cfg.settlement_ledger.is_some() && !is_transaction_hash(&settle.transaction) {
+            Some("Settlement receipt transaction ID is not a 32-byte 0x hash")
         } else {
             None
         };
@@ -948,7 +967,9 @@ async fn payment_gate_inner(
 /// 5. If it answers `< 400`, `/settle` is called. With a durable store, the
 ///    EIP-3009 identity is reserved across replicas, and the settlement intent
 ///    is journaled before the facilitator request. A successful receipt must
-///    identify the selected network and carry a nonblank transaction ID. It
+///    identify the selected network and carry a nonblank transaction ID —
+///    and, when a settlement ledger is configured, a full 32-byte `0x` hash,
+///    since that is the key the ledger indexes on. It
 ///    is attached as `PAYMENT-RESPONSE` and `Cache-Control` gets `private`
 ///    merged in. On failure, a `402` with `PAYMENT-RESPONSE` (`success: false`)
 ///    is returned instead of the handler's response.
@@ -1299,6 +1320,31 @@ mod tests {
         payment.payload["authorization"]["to"] = json!(req.pay_to);
         payment.payload["authorization"]["nonce"] = json!("0xabc");
         assert!(reconciliation_details(&payment, &req).is_none());
+    }
+
+    #[test]
+    fn a_transaction_hash_must_be_a_full_32_byte_hex_id() {
+        assert!(is_transaction_hash(
+            "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        ));
+        assert!(is_transaction_hash(
+            "0xDEADBEEFdeadbeefDEADBEEFdeadbeefDEADBEEFdeadbeefDEADBEEFdeadbeef"
+        ));
+        assert!(is_transaction_hash(
+            "  0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef  "
+        ));
+        // What a facilitator actually sends when it cannot name a transaction.
+        for rejected in [
+            "settled",
+            "pending",
+            "0x",
+            "0xdeadbeef",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeeg",
+            "0Xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        ] {
+            assert!(!is_transaction_hash(rejected), "accepted {rejected:?}");
+        }
     }
 
     #[test]

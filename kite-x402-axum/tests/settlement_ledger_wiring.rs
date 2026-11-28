@@ -12,6 +12,7 @@ use axum::http::StatusCode;
 use common::*;
 use kite_x402_axum::kite::KITE_TESTNET;
 use kite_x402_axum::SettlementLedger;
+use serde_json::json;
 
 fn options_with(ledger: &Arc<SettlementLedger>) -> AppOptions {
     AppOptions {
@@ -54,6 +55,43 @@ async fn successful_payment_is_recorded_with_its_receipt() {
         Some(&summary.volumes[0].amount_atomic),
         record.amount.as_ref()
     );
+}
+
+#[tokio::test]
+async fn a_receipt_with_a_malformed_transaction_id_is_not_a_paid_settlement() {
+    // The facilitator reports success, the right network, and a transaction id
+    // that is not a hash. Before the shape check the gate accepted it: the
+    // response went out and the ledger recorded a "successful" settlement keyed
+    // by a string that can never match a chain transaction.
+    let mocks = Mocks::start().await;
+    mocks.facilitator.set_settle(Reply::Json(json!({
+        "success": true,
+        "transaction": "settled",
+        "network": KITE_TESTNET.network,
+        "payer": PAYER,
+    })));
+    let ledger = Arc::new(SettlementLedger::new(1000));
+    let app = build_app(
+        &mocks.facilitator_url,
+        &mocks.upstream_url,
+        &options_with(&ledger),
+    );
+
+    let resp = pay_get(&app, "/v1/forecast").await;
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+
+    let recent = ledger.recent(10);
+    assert_eq!(recent.len(), 1, "the attempt is still recorded");
+    assert!(!recent[0].success);
+    assert_eq!(
+        recent[0].error_reason.as_deref(),
+        Some("invalid_settlement_receipt")
+    );
+    assert_eq!(
+        recent[0].tx_hash, "settled",
+        "the reported id is kept as evidence, not silently dropped"
+    );
+    assert_eq!(ledger.summary().successful_count, 0);
 }
 
 #[tokio::test]
