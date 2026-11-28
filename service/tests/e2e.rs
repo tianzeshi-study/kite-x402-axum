@@ -406,30 +406,27 @@ async fn webhook_delivers_to_healthy_receivers_while_a_slow_receiver_is_busy() {
     let (healthy_url, healthy) = start_webhook_receiver(false).await;
     let svc = Service::start(webhook_env(&mocks, format!("{slow_url},{healthy_url}"))).await;
 
-    let requirements = svc.requirements("/v1/forecast").await;
+    let first = svc.pay_get("/v1/forecast").await;
+    assert_eq!(first.status(), 200);
+    wait_for_webhook_count(&slow, 1).await;
+
     tokio::time::timeout(Duration::from_secs(3), async {
-        let paid = svc
-            .http
-            .get(svc.url("/v1/forecast"))
-            .header("PAYMENT-SIGNATURE", payment_header(&requirements))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(paid.status(), 200);
-        wait_for_webhook_count(&healthy, 1).await;
+        let second = svc.pay_get("/v1/forecast").await;
+        assert_eq!(second.status(), 200);
+        wait_for_webhook_count(&healthy, 2).await;
     })
     .await
     .expect("the healthy receiver should get the settlement before the slow receiver times out");
 
     let healthy_event: Value =
-        serde_json::from_slice(&healthy.requests.lock().unwrap()[0].body).unwrap();
+        serde_json::from_slice(&healthy.requests.lock().unwrap()[1].body).unwrap();
     assert_eq!(healthy_event["event_type"], "payment_settled");
     assert_eq!(healthy_event["tx_hash"], TX_HASH);
-    assert_eq!(slow.requests.lock().unwrap().len(), 0);
+    assert_eq!(slow.requests.lock().unwrap().len(), 1);
 
     gate.add_permits(1);
-    wait_for_webhook_count(&slow, 1).await;
-    let slow_event: Value = serde_json::from_slice(&slow.requests.lock().unwrap()[0].body).unwrap();
+    wait_for_webhook_count(&slow, 2).await;
+    let slow_event: Value = serde_json::from_slice(&slow.requests.lock().unwrap()[1].body).unwrap();
     assert_eq!(slow_event["event_id"], healthy_event["event_id"]);
 }
 

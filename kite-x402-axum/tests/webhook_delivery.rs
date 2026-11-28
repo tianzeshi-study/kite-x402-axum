@@ -402,9 +402,10 @@ async fn worker_delivers_to_healthy_target_while_slow_target_is_busy() {
     ));
 
     enqueue(&d);
-    wait_until("healthy target receives event while slow target blocks", || {
-        healthy_rx.seen.lock().unwrap().len() == 1
-    })
+    wait_until(
+        "healthy target receives event while slow target blocks",
+        || healthy_rx.seen.lock().unwrap().len() == 1,
+    )
     .await;
     assert_eq!(slow_seen.lock().unwrap().len(), 0);
 
