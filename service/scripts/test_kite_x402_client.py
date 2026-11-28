@@ -79,6 +79,67 @@ class ClientSettlementTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(send.call_count, 1)
 
+    def test_non_array_accepts_is_rejected_before_signing(self):
+        for accepts in (True, 1, 1.5, "invalid", {"network": NETWORK}):
+            with self.subTest(accepts=accepts):
+                challenge = response(402, **{"Payment-Required": encode_header({"accepts": accepts})})
+                with patch.object(client, "build_payment_header") as sign:
+                    status, errors, send = self.run_client(challenge)
+                self.assertEqual(status, 1)
+                self.assertIn("accepts", errors)
+                self.assertIn("no payment was signed", errors)
+                self.assertEqual(send.call_count, 1)
+                sign.assert_not_called()
+
+    def test_malformed_reported_transaction_is_not_confirmation(self):
+        for transaction in ("not-a-hash", "0x12", "0x" + "gg" * 32, "0x" + "42" * 33,
+                            " " + self.receipt["transaction"], self.receipt["transaction"] + "\n"):
+            with self.subTest(transaction=transaction):
+                settled = response(200, **{"Payment-Response": encode_header({**self.receipt, "transaction": transaction})})
+                status, errors, send = self.run_client(self.challenge, settled)
+                self.assertEqual(status, 1)
+                self.assertIn("Reconcile the original payment before retrying", errors)
+                self.assertEqual(send.call_count, 2)
+
+    def test_uppercase_hex_transaction_remains_supported(self):
+        settled = response(200, **{"Payment-Response": encode_header({**self.receipt, "transaction": "0x" + "aB" * 32})})
+        status, _, send = self.run_client(self.challenge, settled)
+        self.assertEqual(status, 0)
+        self.assertEqual(send.call_count, 2)
+
+    def test_invalid_json_body_stops_before_any_request(self):
+        for body in ('{"message":}', ""):
+            with self.subTest(body=body):
+                with patch.object(client.Account, "from_key") as load_key:
+                    status, errors, send = self.run_client(argv=["--method", "POST", "--body", body])
+                self.assertEqual(status, 2)
+                self.assertIn("--body must be valid JSON", errors)
+                load_key.assert_not_called()
+                send.assert_not_called()
+
+    def test_non_finite_json_body_stops_before_any_request(self):
+        for number in ("NaN", "Infinity", "-Infinity", "1e400"):
+            with self.subTest(number=number):
+                body = '{"values": [' + number + ']}'
+                with patch.object(client.Account, "from_key") as load_key:
+                    status, errors, send = self.run_client(argv=["--method", "POST", "--body", body])
+                self.assertEqual(status, 2)
+                self.assertIn("--body must be valid JSON", errors)
+                load_key.assert_not_called()
+                send.assert_not_called()
+
+    def test_valid_json_body_is_sent_on_both_requests(self):
+        body = {"message": "hello"}
+        settled = response(200, **{"Payment-Response": encode_header(self.receipt)})
+        status, _, send = self.run_client(
+            self.challenge, settled, argv=["--method", "POST", "--body", json.dumps(body)]
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(send.call_count, 2)
+        for request in send.call_args_list:
+            self.assertEqual(request.args[0], "POST")
+            self.assertEqual(request.kwargs["json"], body)
+
     def test_initial_request_failure_stops_before_signing(self):
         for failure in (requests.ConnectionError, requests.Timeout):
             with self.subTest(failure=failure.__name__):

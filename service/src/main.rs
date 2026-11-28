@@ -18,7 +18,7 @@ use std::{
 
 use axum::{
     extract::{Request, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::any,
@@ -41,6 +41,7 @@ mod health;
 mod rate_limit;
 mod route_prices;
 mod settlement_query;
+mod webhook_delivery;
 use cors::{cors_middleware, CorsConfig};
 use health::ReadinessState;
 use rate_limit::{
@@ -268,6 +269,8 @@ async fn main() {
     if let Some(store) = durable_store {
         tokio::spawn((*store).clone().run(shutdown_rx.clone()));
     }
+    let webhook_runtime = webhook_delivery::WebhookRuntime::from_env()
+        .unwrap_or_else(|err| panic!("invalid webhook configuration: {err}"));
 
     let health = health_info(chain, &price_usd);
     let payment_cfg = Arc::new(PaymentConfig {
@@ -284,7 +287,15 @@ async fn main() {
         metrics: Some(Arc::clone(&metrics)),
         nonce_guard,
         settlement_ledger: settlement_ledger.clone(),
+        webhooks: None,
     });
+    let discovery = DiscoveryInfo {
+        primary: chain,
+        price_usd: payment_cfg.price_usd.clone(),
+        extra_payment_options: extra_payment_options.clone(),
+        pay_to: payment_cfg.pay_to.clone(),
+        description: payment_cfg.description.clone(),
+    };
     let route_prices_env = env::var_os("ROUTE_PRICES_USD")
         .map(|value| {
             value
@@ -292,8 +303,18 @@ async fn main() {
                 .expect("ROUTE_PRICES_USD must be valid UTF-8")
         })
         .unwrap_or_default();
+    let route_prices_require_match = env::var_os("ROUTE_PRICES_REQUIRE_MATCH")
+        .map(|value| {
+            value
+                .into_string()
+                .expect("ROUTE_PRICES_REQUIRE_MATCH must be valid UTF-8")
+                .parse::<bool>()
+                .expect("ROUTE_PRICES_REQUIRE_MATCH must be true or false")
+        })
+        .unwrap_or(false);
     let route_prices = RoutePrices::parse(
         &route_prices_env,
+        route_prices_require_match,
         Arc::clone(&payment_cfg),
         extra_payment_options,
     )
@@ -339,6 +360,14 @@ async fn main() {
             concurrency_semaphore,
             concurrency_limiter,
         ));
+    let paid = if let Some(webhook_runtime) = &webhook_runtime {
+        paid.layer(middleware::from_fn_with_state(
+            Arc::clone(webhook_runtime),
+            webhook_delivery::observe_payment_events,
+        ))
+    } else {
+        paid
+    };
 
     let readyz_state = Arc::new(ReadyzState {
         payment_cfg,
@@ -400,6 +429,10 @@ async fn main() {
             "/readyz",
             axum::routing::get(readyz).with_state(readyz_state),
         )
+        .route(
+            "/.well-known/x402",
+            axum::routing::get(well_known_x402).with_state(discovery),
+        )
         .merge(metrics_router)
         .merge(diag_router)
         .nest("/v1", paid)
@@ -439,6 +472,7 @@ async fn main() {
 
     let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
     let (settlement_shutdown_tx, mut settlement_shutdown_rx) = tokio::sync::watch::channel(false);
+    let webhook_worker = webhook_runtime.map(|runtime| runtime.spawn_worker(shutdown_rx.clone()));
     let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -462,7 +496,23 @@ async fn main() {
     };
 
     tokio::select! {
-        res = async { tokio::try_join!(async { server.await }, settlement_server) } => {
+        res = async {
+            if let Some(worker) = webhook_worker {
+                tokio::try_join!(
+                    async { server.await },
+                    settlement_server,
+                    async {
+                        worker
+                            .await
+                            .map_err(|error| std::io::Error::other(error.to_string()))?;
+                        Ok::<(), std::io::Error>(())
+                    }
+                )?;
+            } else {
+                tokio::try_join!(async { server.await }, settlement_server)?;
+            }
+            Ok::<(), std::io::Error>(())
+        } => {
             res.expect("server error");
             tracing::info!("Server shut down gracefully");
         }
@@ -797,6 +847,85 @@ fn display_price(price_usd: &str) -> String {
     }
 }
 
+/// What `/.well-known/x402` publishes: the payment surface an agent needs
+/// before it requests a paid route — the protocol, every network and asset
+/// the service accepts, the payee and the prices. It is built once from the
+/// configuration and holds nothing the service does not already put in its
+/// 402 challenges.
+///
+/// Two things are left out on purpose. Per-route prices (`ROUTE_PRICES_USD`)
+/// would list the metered routes at an unmetered URL, and the facilitator URL
+/// is server-side infrastructure that a buyer never contacts.
+#[derive(Clone)]
+struct DiscoveryInfo {
+    primary: KiteChain,
+    price_usd: String,
+    extra_payment_options: Vec<PaymentOption>,
+    pay_to: String,
+    description: String,
+}
+
+impl DiscoveryInfo {
+    /// The document served for `/.well-known/x402`. Where it and the 402
+    /// challenge both carry a field, the key is the same (`x402Version`,
+    /// `scheme`, `payTo`).
+    fn document(&self) -> serde_json::Value {
+        let mut networks = vec![self.primary.network];
+        let mut assets = vec![asset_info(self.primary)];
+        for option in &self.extra_payment_options {
+            if !networks.contains(&option.chain.network) {
+                networks.push(option.chain.network);
+                assets.push(asset_info(option.chain));
+            }
+        }
+        let mut document = json!({
+            "x402Version": 2,
+            "scheme": "exact",
+            "networks": networks,
+            "assets": assets,
+            "payTo": &self.pay_to,
+            "price": display_price(&self.price_usd),
+            "description": &self.description,
+        });
+        if !self.extra_payment_options.is_empty() {
+            let extras: Vec<serde_json::Value> = self
+                .extra_payment_options
+                .iter()
+                .map(|option| {
+                    json!({
+                        "network": option.chain.network,
+                        "price": display_price(&option.price_usd),
+                    })
+                })
+                .collect();
+            document["extraPaymentOptions"] = json!(extras);
+        }
+        document
+    }
+}
+
+/// The `assets` entry for one network: what a client needs to show the token
+/// and to reproduce the EIP-712 domain the facilitator checks.
+fn asset_info(chain: KiteChain) -> serde_json::Value {
+    json!({
+        "network": chain.network,
+        "address": chain.asset_address,
+        "symbol": chain.asset_symbol,
+        "decimals": chain.asset_decimals,
+        "name": chain.eip712_name,
+        "version": chain.eip712_version,
+    })
+}
+
+/// `GET /.well-known/x402`: unmetered discovery for autonomous agents, so a
+/// client can learn what the service accepts without requesting a paid route
+/// first. Reads configuration only; it never calls the facilitator or the
+/// upstream.
+async fn well_known_x402(State(info): State<DiscoveryInfo>) -> impl IntoResponse {
+    tracing::debug!("Handling /.well-known/x402 request");
+    ([(header::CACHE_CONTROL, "no-store")], Json(info.document()))
+}
+
 /// `PAY_TO` must be present and be the 20-byte address the facilitator will
 /// settle to. The catalog schema uses the same `0x` + 40 hex pattern.
 fn require_pay_to(raw: &str) -> String {
@@ -1114,6 +1243,77 @@ mod tests {
         assert_eq!(display_price("0.001"), "$0.001");
         assert_eq!(display_price("$0.001"), "$0.001");
         assert_eq!(display_price("  0.05"), "$0.05");
+    }
+
+    fn discovery_info(extras: Vec<PaymentOption>) -> DiscoveryInfo {
+        DiscoveryInfo {
+            primary: kite_x402_axum::kite::KITE_TESTNET,
+            price_usd: "0.01".into(),
+            extra_payment_options: extras,
+            pay_to: "0xE2E0000000000000000000000000000000000E2E".into(),
+            description: "Test wrapper".into(),
+        }
+    }
+
+    #[test]
+    fn well_known_x402_reports_the_primary_option_and_nothing_else_by_default() {
+        // Compared whole: no `extraPaymentOptions` key appears unconfigured,
+        // and neither does a facilitator URL or a per-route price table.
+        let document = discovery_info(Vec::new()).document();
+        assert_eq!(
+            document,
+            json!({
+                "x402Version": 2,
+                "scheme": "exact",
+                "networks": ["eip155:2368"],
+                "assets": [{
+                    "network": "eip155:2368",
+                    "address": "0x38129cf4CE5E183eFF248F42A7D345Bb1B47621A",
+                    "symbol": "pieUSD",
+                    "decimals": 18,
+                    "name": "pieUSD",
+                    "version": "1",
+                }],
+                "payTo": "0xE2E0000000000000000000000000000000000E2E",
+                "price": "$0.01",
+                "description": "Test wrapper",
+            })
+        );
+    }
+
+    #[test]
+    fn well_known_x402_lists_each_advertised_network_once_with_its_asset() {
+        // Two prices on one network are a valid configuration: only options
+        // identical on the wire are rejected at startup.
+        let extras = vec![
+            PaymentOption::new(kite_x402_axum::kite::KITE_MAINNET, "$0.002"),
+            PaymentOption::new(kite_x402_axum::kite::KITE_MAINNET, "0.05"),
+        ];
+        let document = discovery_info(extras).document();
+        assert_eq!(document["networks"], json!(["eip155:2368", "eip155:2366"]));
+        let assets = document["assets"].as_array().unwrap();
+        assert_eq!(assets.len(), 2);
+        assert_eq!(
+            assets[1]["address"],
+            "0x7aB6f3ed87C42eF0aDb67Ed95090f8bF5240149e"
+        );
+        assert_eq!(assets[1]["decimals"], 6);
+        assert_eq!(
+            document["extraPaymentOptions"],
+            json!([
+                {"network": "eip155:2366", "price": "$0.002"},
+                {"network": "eip155:2366", "price": "$0.05"},
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn well_known_x402_answers_uncached() {
+        let response = well_known_x402(State(discovery_info(Vec::new())))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     #[test]

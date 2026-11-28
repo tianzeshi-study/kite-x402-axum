@@ -80,6 +80,7 @@ impl RoutePattern {
 #[derive(Debug)]
 pub(super) struct RoutePrices {
     default: Arc<PaymentConfig>,
+    require_match: bool,
     overrides: HashMap<String, HashMap<Method, RoutePrice>>,
     patterns: HashMap<Method, Vec<RoutePattern>>,
     /// Default extras for routes without an explicit list.
@@ -89,6 +90,7 @@ pub(super) struct RoutePrices {
 impl RoutePrices {
     pub(super) fn parse(
         value: &str,
+        require_match: bool,
         default: Arc<PaymentConfig>,
         default_extras: Vec<PaymentOption>,
     ) -> Result<Self, String> {
@@ -177,16 +179,21 @@ impl RoutePrices {
                 }
             }
         }
-        Ok(Self {
+        let prices = Self {
             default,
+            require_match,
             overrides,
             patterns,
             extras: default_extras,
-        })
+        };
+        if require_match && !prices.has_overrides() {
+            return Err("ROUTE_PRICES_REQUIRE_MATCH=true requires at least one route rule".into());
+        }
+        Ok(prices)
     }
 
     pub(super) fn advertised_networks(&self) -> Vec<&'static str> {
-        // Unmatched routes always retain the default options.
+        // Routes can inherit default payment options, so include their networks.
         let route_extras = self
             .overrides
             .values()
@@ -348,6 +355,9 @@ pub(super) async fn route_payment(
     }
     // Match the full public path before Axum strips the /v1 prefix.
     let route = prices.price_for(req.method(), uri.path());
+    if prices.require_match && route.is_none() {
+        return super::not_found().await.into_response();
+    }
     let config = route.map_or(&prices.default, |route| &route.primary);
     let extras = route
         .and_then(|route| route.extras.as_deref())
@@ -367,6 +377,7 @@ pub(super) async fn route_payment(
         metrics: config.metrics.clone(),
         nonce_guard: config.nonce_guard.clone(),
         settlement_ledger: config.settlement_ledger.clone(),
+        webhooks: config.webhooks.clone(),
     });
     x402_payment_multi(State(multi), req, next).await
 }
@@ -376,21 +387,17 @@ mod tests {
     use super::*;
 
     fn default_config() -> Arc<PaymentConfig> {
-        Arc::new(PaymentConfig {
-            pay_to: "0x2222222222222222222222222222222222222222".into(),
-            chain: kite_chain_by_name("testnet").expect("testnet chain"),
-            price_usd: "0.01".into(),
-            description: "test".into(),
-            facilitator: kite_x402_axum::facilitator::FacilitatorClient::new("http://127.0.0.1:9"),
-            expiration_guard: None,
-            metrics: None,
-            nonce_guard: None,
-            settlement_ledger: None,
-        })
+        Arc::new(PaymentConfig::new(
+            "0x2222222222222222222222222222222222222222",
+            kite_chain_by_name("testnet").expect("testnet chain"),
+            "0.01",
+            "test",
+            kite_x402_axum::facilitator::FacilitatorClient::new("http://127.0.0.1:9"),
+        ))
     }
 
     fn parse(rules: &str) -> Result<RoutePrices, String> {
-        RoutePrices::parse(rules, default_config(), Vec::new())
+        RoutePrices::parse(rules, false, default_config(), Vec::new())
     }
 
     #[test]

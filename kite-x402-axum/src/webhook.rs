@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,6 +15,24 @@ pub enum WebhookEventType {
     PaymentSettled,
     /// A payment failed verification or settlement.
     PaymentFailed,
+}
+
+/// The x402 payment gate's outcome, attached as an in-process response extension.
+///
+/// The gate emits at most one event per request. Downstream middleware can
+/// consume this extension to notify a merchant without interpreting HTTP headers.
+#[derive(Debug, Clone)]
+pub struct PaymentEvent {
+    /// Kind of payment outcome.
+    pub event_type: WebhookEventType,
+    /// Address reported by the facilitator, if available.
+    pub payer: Option<String>,
+    /// Network identifier (CAIP-2), if known.
+    pub network: Option<String>,
+    /// Amount in atomic token units, if known.
+    pub amount_atomic: Option<String>,
+    /// Transaction hash on the selected network, if reported by the facilitator.
+    pub tx_hash: Option<String>,
 }
 
 /// A dispatched webhook event payload.
@@ -102,6 +120,83 @@ impl Default for WebhookConfig {
     }
 }
 
+/// Header carrying the delivery id (unique per target).
+pub const DELIVERY_ID_HEADER: &str = "X-Kite-Delivery-Id";
+/// Header carrying the event id (shared by all targets of one event).
+pub const EVENT_ID_HEADER: &str = "X-Kite-Event-Id";
+
+use crate::webhook_signing::{SIGNATURE_HEADER, TIMESTAMP_HEADER};
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Builds the HTTP client webhooks should be delivered with: a 10 second
+/// timeout and **no redirect following**, so a configured target cannot
+/// bounce the service's POST to an unintended host.
+///
+/// # Errors
+///
+/// Returns an error if the TLS backend cannot be initialised.
+pub fn delivery_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .user_agent(concat!("kite-x402-axum/", env!("CARGO_PKG_VERSION")))
+        .build()
+}
+
+/// Upper bound on the delay between two delivery attempts of one webhook.
+pub const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(3600);
+
+impl WebhookConfig {
+    /// Delay to wait after `failed_attempts` consecutive failures before the
+    /// next attempt: `initial_backoff` after the first failure, doubling each
+    /// time, capped at [`MAX_RETRY_BACKOFF`]. Zero failures means no delay.
+    #[must_use]
+    pub fn backoff_for(&self, failed_attempts: u32) -> Duration {
+        if failed_attempts == 0 {
+            return Duration::ZERO;
+        }
+        let factor = 2u32.saturating_pow(failed_attempts - 1);
+        self.initial_backoff
+            .saturating_mul(factor)
+            .min(MAX_RETRY_BACKOFF)
+    }
+}
+
+/// Runs webhook deliveries in the background until `shutdown` becomes `true`
+/// (or its sender is dropped).
+///
+/// Each wake-up delivers every webhook that is currently due, then sleeps for
+/// `poll_interval` (or until shutdown). Run exactly one worker per
+/// dispatcher. Pending deliveries live in memory only: on shutdown anything
+/// still queued is not delivered and is lost when the process exits.
+pub async fn run_delivery_worker(
+    dispatcher: WebhookDispatcher,
+    client: reqwest::Client,
+    poll_interval: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        while !*shutdown.borrow() && dispatcher.deliver_next(&client).await.is_some() {}
+        if *shutdown.borrow() {
+            return;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(poll_interval) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Thread-safe webhook queue and dispatcher.
 #[derive(Debug, Clone)]
 pub struct WebhookDispatcher {
@@ -113,7 +208,16 @@ pub struct WebhookDispatcher {
 struct WebhookState {
     next_delivery_id: u64,
     queue: VecDeque<WebhookDeliveryRecord>,
+    in_flight: HashMap<u64, WebhookDeliveryRecord>,
     history: VecDeque<WebhookDeliveryRecord>,
+}
+
+impl WebhookState {
+    fn target_is_idle(&self, target_url: &str) -> bool {
+        self.in_flight
+            .values()
+            .all(|delivery| delivery.target_url != target_url)
+    }
 }
 
 impl WebhookDispatcher {
@@ -125,6 +229,7 @@ impl WebhookDispatcher {
             state: Arc::new(RwLock::new(WebhookState {
                 next_delivery_id: 1,
                 queue: VecDeque::new(),
+                in_flight: HashMap::new(),
                 history: VecDeque::new(),
             })),
         }
@@ -173,7 +278,7 @@ impl WebhookDispatcher {
             let delivery_id = state.next_delivery_id;
             state.next_delivery_id += 1;
 
-            let record = WebhookDeliveryRecord {
+            let mut record = WebhookDeliveryRecord {
                 delivery_id,
                 target_url: target.clone(),
                 payload: payload.clone(),
@@ -185,21 +290,27 @@ impl WebhookDispatcher {
                 last_attempt_ms: None,
             };
 
-            if state.queue.len() >= self.config.max_queue_size {
-                if let Some(evicted) = state.queue.pop_front() {
-                    // The caller was handed this delivery_id by an earlier
-                    // enqueue_event call and will never receive a result for
-                    // it: dropping it without a trace loses the notification
-                    // entirely. Park it in history as abandoned so the loss is
-                    // observable. Reuse `Abandoned` rather than adding an enum
-                    // variant, which would break downstream exhaustive matches.
-                    let mut evicted = evicted;
+            if state.queue.len() + state.in_flight.len() >= self.config.max_queue_size {
+                if let Some(mut evicted) = state.queue.pop_front() {
+                    // Keep dropped deliveries visible to callers that already
+                    // received their delivery id.
                     evicted.status = DeliveryStatus::Abandoned;
                     evicted.last_error = Some("evicted: webhook queue full".into());
                     if state.history.len() >= self.config.max_queue_size {
                         state.history.pop_front();
                     }
                     state.history.push_back(evicted);
+                } else {
+                    // In-flight work cannot be evicted safely. Record the new
+                    // delivery as abandoned rather than exceeding the bound.
+                    record.status = DeliveryStatus::Abandoned;
+                    record.last_error = Some("dropped: webhook queue full".into());
+                    if state.history.len() >= self.config.max_queue_size {
+                        state.history.pop_front();
+                    }
+                    state.history.push_back(record);
+                    delivery_ids.push(delivery_id);
+                    continue;
                 }
             }
             state.queue.push_back(record);
@@ -207,6 +318,74 @@ impl WebhookDispatcher {
         }
 
         delivery_ids
+    }
+
+    /// Atomically claims a pending delivery that is ready, preventing duplicate sends across workers.
+    #[must_use]
+    pub fn claim_next_pending(&self) -> Option<WebhookDeliveryRecord> {
+        self.claim_pending(false)
+    }
+
+    /// Claims a due delivery whose target URL has no in-flight attempt.
+    ///
+    /// Use this method for all claims on a dispatcher to limit concurrency to
+    /// one attempt per target URL. Record every result to release the target.
+    #[must_use]
+    pub fn claim_next_for_idle_target(&self) -> Option<WebhookDeliveryRecord> {
+        self.claim_pending(true)
+    }
+
+    fn claim_pending(&self, idle_targets_only: bool) -> Option<WebhookDeliveryRecord> {
+        let now = unix_time_ms();
+        let mut state = self.state.write().expect("lock poisoned");
+        let position = state.queue.iter().position(|record| {
+            (!idle_targets_only || state.target_is_idle(&record.target_url))
+                && match &record.status {
+                    DeliveryStatus::Pending => true,
+                    DeliveryStatus::Failed => {
+                        retry_is_due(record, now, retry_delay(&self.config, record))
+                    }
+                    DeliveryStatus::Delivered | DeliveryStatus::Abandoned => false,
+                }
+        })?;
+        let mut record = state.queue.remove(position)?;
+        record.status = DeliveryStatus::Pending;
+        state.in_flight.insert(record.delivery_id, record.clone());
+        Some(record)
+    }
+
+    /// Returns the delay until the next delivery can be claimed, or `None` when no deliveries are queued.
+    #[must_use]
+    pub fn next_retry_delay(&self) -> Option<Duration> {
+        self.retry_delay_for_targets(false)
+    }
+
+    /// Returns the next claim delay for idle targets, or `None` if they have no queued work.
+    ///
+    /// A busy target becomes eligible when its in-flight result is recorded.
+    #[must_use]
+    pub fn next_retry_delay_for_idle_targets(&self) -> Option<Duration> {
+        self.retry_delay_for_targets(true)
+    }
+
+    fn retry_delay_for_targets(&self, idle_targets_only: bool) -> Option<Duration> {
+        let now = unix_time_ms();
+        let state = self.state.read().expect("lock poisoned");
+        state
+            .queue
+            .iter()
+            .filter(|record| !idle_targets_only || state.target_is_idle(&record.target_url))
+            .filter_map(|record| match &record.status {
+                DeliveryStatus::Pending => Some(Duration::ZERO),
+                DeliveryStatus::Failed => {
+                    let last_attempt_ms = record.last_attempt_ms.unwrap_or_default();
+                    let delay = retry_delay(&self.config, record);
+                    let elapsed = Duration::from_millis(now.saturating_sub(last_attempt_ms));
+                    Some(delay.saturating_sub(elapsed))
+                }
+                DeliveryStatus::Delivered | DeliveryStatus::Abandoned => None,
+            })
+            .min()
     }
 
     /// Records the result of a delivery attempt.
@@ -218,18 +397,28 @@ impl WebhookDispatcher {
         status_code: Option<u16>,
         error_msg: Option<String>,
     ) -> Option<WebhookDeliveryRecord> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        self.record_attempt_result_at(delivery_id, success, status_code, error_msg, now_ms())
+    }
 
+    fn record_attempt_result_at(
+        &self,
+        delivery_id: u64,
+        success: bool,
+        status_code: Option<u16>,
+        error_msg: Option<String>,
+        now: u64,
+    ) -> Option<WebhookDeliveryRecord> {
         let mut state = self.state.write().expect("lock poisoned");
-        if let Some(pos) = state
+        let record = if let Some(pos) = state
             .queue
             .iter()
             .position(|r| r.delivery_id == delivery_id)
         {
-            let mut record = state.queue.remove(pos).unwrap();
+            state.queue.remove(pos)
+        } else {
+            state.in_flight.remove(&delivery_id)
+        };
+        if let Some(mut record) = record {
             record.attempts += 1;
             record.last_attempt_ms = Some(now);
             record.last_status_code = status_code;
@@ -259,11 +448,104 @@ impl WebhookDispatcher {
         }
     }
 
+    /// Returns a copy of the oldest queued delivery that is due at `now_ms`
+    /// (Unix milliseconds), or `None` if nothing is due.
+    ///
+    /// A delivery is due if it has never been attempted, or if
+    /// [`WebhookConfig::backoff_for`] has elapsed since its last attempt.
+    #[must_use]
+    pub fn next_due(&self, now_ms: u64) -> Option<WebhookDeliveryRecord> {
+        let state = self.state.read().expect("lock poisoned");
+        state
+            .queue
+            .iter()
+            .find(|record| match record.last_attempt_ms {
+                None => true,
+                Some(last) => {
+                    let wait = u64::try_from(retry_delay(&self.config, record).as_millis())
+                        .unwrap_or(u64::MAX);
+                    now_ms >= last.saturating_add(wait)
+                }
+            })
+            .cloned()
+    }
+
+    /// Delivers the next due webhook over HTTP and records the outcome.
+    ///
+    /// Returns the updated record, or `None` if nothing was due. The delivery
+    /// is a `POST` of the JSON [`WebhookPayload`] with `X-Kite-Timestamp`,
+    /// `X-Kite-Delivery-Id`, `X-Kite-Event-Id` and, when a signing secret is
+    /// configured, `X-Kite-Signature` (see [`crate::webhook_signing`]). Any
+    /// 2xx status counts as delivered; everything else, including transport
+    /// errors, is a failed attempt that is retried per [`WebhookConfig`].
+    ///
+    /// Use [`delivery_client`] to build `client`. Run at most one caller at a
+    /// time per dispatcher (a single background worker); concurrent
+    /// callers could deliver the same record twice.
+    pub async fn deliver_next(&self, client: &reqwest::Client) -> Option<WebhookDeliveryRecord> {
+        self.deliver_next_at(client, now_ms()).await
+    }
+
+    /// Like [`Self::deliver_next`], with the current time supplied by the
+    /// caller so scheduling can be tested without sleeping.
+    pub async fn deliver_next_at(
+        &self,
+        client: &reqwest::Client,
+        now_ms: u64,
+    ) -> Option<WebhookDeliveryRecord> {
+        let record = self.next_due(now_ms)?;
+        let timestamp_secs = now_ms / 1000;
+
+        let outcome = match serde_json::to_vec(&record.payload) {
+            Err(error) => Err((None, format!("could not serialize payload: {error}"))),
+            Ok(body) => {
+                let mut request = client
+                    .post(&record.target_url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .header(TIMESTAMP_HEADER, timestamp_secs.to_string())
+                    .header(DELIVERY_ID_HEADER, record.delivery_id.to_string())
+                    .header(EVENT_ID_HEADER, record.payload.event_id.as_str());
+                if let Some(secret) = &self.config.signing_secret {
+                    request = request.header(
+                        SIGNATURE_HEADER,
+                        crate::webhook_signing::sign_payload(secret, timestamp_secs, &body),
+                    );
+                }
+                match request.body(body).send().await {
+                    Ok(response) if response.status().is_success() => {
+                        Ok(response.status().as_u16())
+                    }
+                    Ok(response) => Err((
+                        Some(response.status().as_u16()),
+                        format!("HTTP {}", response.status()),
+                    )),
+                    // Drop the URL from the message: webhook URLs often carry
+                    // secrets in their path or query, and this text is stored
+                    // and may be logged.
+                    Err(error) => Err((None, error.without_url().to_string())),
+                }
+            }
+        };
+
+        match outcome {
+            Ok(status) => {
+                self.record_attempt_result_at(record.delivery_id, true, Some(status), None, now_ms)
+            }
+            Err((status, message)) => self.record_attempt_result_at(
+                record.delivery_id,
+                false,
+                status,
+                Some(message),
+                now_ms,
+            ),
+        }
+    }
+
     /// Number of pending deliveries in queue.
     #[must_use]
     pub fn pending_count(&self) -> usize {
         let state = self.state.read().expect("lock poisoned");
-        state.queue.len()
+        state.queue.len() + state.in_flight.len()
     }
 
     /// Number of completed deliveries in history.
@@ -284,6 +566,31 @@ impl WebhookDispatcher {
     }
 }
 
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn retry_delay(config: &WebhookConfig, record: &WebhookDeliveryRecord) -> Duration {
+    // One schedule, defined once: `backoff_for` is the documented curve and the
+    // only place that applies `MAX_RETRY_BACKOFF`. Recomputing the exponential
+    // here (as this function used to) let the two paths disagree: past 12 failed
+    // attempts the queue would wait minutes to hours longer than the cap, and
+    // `Duration::MAX` from an overflow made a retry wait effectively forever,
+    // while `next_due` still considered the same record due after one hour.
+    config.backoff_for(record.attempts)
+}
+
+fn retry_is_due(record: &WebhookDeliveryRecord, now_ms: u64, delay: Duration) -> bool {
+    let retry_at = record
+        .last_attempt_ms
+        .unwrap_or_default()
+        .saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+    now_ms >= retry_at
+}
+
 fn fastrand_hex(len: usize) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -296,6 +603,62 @@ fn fastrand_hex(len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_target_claims_skip_busy_receivers_and_respect_retry_delay() {
+        let slow_url = "https://slow.example.com/webhook";
+        let fast_url = "https://fast.example.com/webhook";
+        let dispatcher = WebhookDispatcher::new(WebhookConfig {
+            target_urls: vec![slow_url.into(), fast_url.into()],
+            initial_backoff: Duration::from_secs(60),
+            ..Default::default()
+        });
+        let prompted = dispatcher.enqueue_event(
+            WebhookEventType::PaymentPrompted,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let settled = dispatcher.enqueue_event(
+            WebhookEventType::PaymentSettled,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let slow = dispatcher.claim_next_for_idle_target().unwrap();
+        let fast = dispatcher.claim_next_for_idle_target().unwrap();
+        assert_eq!(slow.delivery_id, prompted[0]);
+        assert_eq!(fast.delivery_id, prompted[1]);
+        assert!(dispatcher.claim_next_for_idle_target().is_none());
+        assert_eq!(dispatcher.next_retry_delay_for_idle_targets(), None);
+
+        dispatcher
+            .record_attempt_result(fast.delivery_id, true, Some(204), None)
+            .unwrap();
+        assert_eq!(
+            dispatcher.next_retry_delay_for_idle_targets(),
+            Some(Duration::ZERO)
+        );
+        let fast = dispatcher.claim_next_for_idle_target().unwrap();
+        assert_eq!(fast.delivery_id, settled[1]);
+        assert!(dispatcher.claim_next_for_idle_target().is_none());
+
+        dispatcher
+            .record_attempt_result(slow.delivery_id, false, Some(503), None)
+            .unwrap();
+        let next_slow = dispatcher.claim_next_for_idle_target().unwrap();
+        assert_eq!(next_slow.delivery_id, settled[0]);
+        assert_eq!(dispatcher.next_retry_delay_for_idle_targets(), None);
+        dispatcher
+            .record_attempt_result(next_slow.delivery_id, true, Some(204), None)
+            .unwrap();
+        assert!(dispatcher.claim_next_for_idle_target().is_none());
+        assert!(dispatcher.next_retry_delay_for_idle_targets().unwrap() > Duration::ZERO);
+    }
 
     #[test]
     fn test_webhook_enqueue_and_delivery() {
@@ -572,6 +935,27 @@ mod tests {
     }
 
     #[test]
+    fn in_flight_deliveries_count_toward_queue_capacity() {
+        let dispatcher = dispatcher(&["https://a.example/hook"], 3, 1);
+        let first = enqueue(&dispatcher)[0];
+        assert_eq!(dispatcher.claim_next_pending().unwrap().delivery_id, first);
+
+        let second = enqueue(&dispatcher)[0];
+        assert_eq!(dispatcher.pending_count(), 1);
+        assert!(dispatcher.claim_next_pending().is_none());
+        let dropped = dispatcher
+            .history()
+            .into_iter()
+            .find(|record| record.delivery_id == second)
+            .expect("capacity overflow must remain visible in history");
+        assert_eq!(dropped.status, DeliveryStatus::Abandoned);
+        assert_eq!(
+            dropped.last_error.as_deref(),
+            Some("dropped: webhook queue full")
+        );
+    }
+
+    #[test]
     fn history_is_bounded_and_keeps_the_newest_records() {
         let dispatcher = dispatcher(&["https://a.example/hook"], 0, 2);
         let mut delivered_ids = Vec::new();
@@ -587,5 +971,184 @@ mod tests {
         let history = dispatcher.history();
         assert_eq!(history[0].delivery_id, delivered_ids[3]);
         assert_eq!(history[1].delivery_id, delivered_ids[4]);
+    }
+
+    #[test]
+    fn claimed_deliveries_are_exclusive_and_retry_after_backoff() {
+        let dispatcher = WebhookDispatcher::new(WebhookConfig {
+            target_urls: vec!["https://a.example/hook".into()],
+            max_retries: 1,
+            initial_backoff: Duration::ZERO,
+            max_queue_size: 10,
+            signing_secret: None,
+        });
+        let id = enqueue(&dispatcher)[0];
+
+        let first = dispatcher.claim_next_pending().unwrap();
+        assert_eq!(first.delivery_id, id);
+        assert!(dispatcher.claim_next_pending().is_none());
+        assert_eq!(dispatcher.pending_count(), 1);
+
+        let failed = dispatcher
+            .record_attempt_result(id, false, Some(503), Some("unavailable".into()))
+            .unwrap();
+        assert_eq!(failed.status, DeliveryStatus::Failed);
+        assert_eq!(failed.attempts, 1);
+
+        let retry = dispatcher.claim_next_pending().unwrap();
+        assert_eq!(retry.delivery_id, id);
+        assert_eq!(retry.attempts, 1);
+        assert_eq!(
+            dispatcher
+                .record_attempt_result(id, true, Some(204), None)
+                .unwrap()
+                .status,
+            DeliveryStatus::Delivered
+        );
+    }
+
+    #[test]
+    fn failed_claims_wait_for_the_configured_backoff() {
+        let dispatcher = WebhookDispatcher::new(WebhookConfig {
+            target_urls: vec!["https://a.example/hook".into()],
+            max_retries: 1,
+            initial_backoff: Duration::from_secs(60),
+            max_queue_size: 10,
+            signing_secret: None,
+        });
+        let id = enqueue(&dispatcher)[0];
+        assert!(dispatcher.claim_next_pending().is_some());
+        dispatcher
+            .record_attempt_result(id, false, Some(503), None)
+            .unwrap();
+
+        assert!(dispatcher.claim_next_pending().is_none());
+        assert!(dispatcher.next_retry_delay().unwrap() > Duration::ZERO);
+    }
+
+    #[test]
+    fn backoff_doubles_from_the_initial_delay_and_is_capped() {
+        let config = WebhookConfig {
+            initial_backoff: Duration::from_millis(500),
+            ..Default::default()
+        };
+        assert_eq!(config.backoff_for(0), Duration::ZERO);
+        assert_eq!(config.backoff_for(1), Duration::from_millis(500));
+        assert_eq!(config.backoff_for(2), Duration::from_secs(1));
+        assert_eq!(config.backoff_for(3), Duration::from_secs(2));
+        assert_eq!(config.backoff_for(4), Duration::from_secs(4));
+        assert_eq!(config.backoff_for(40), MAX_RETRY_BACKOFF);
+        assert_eq!(config.backoff_for(u32::MAX), MAX_RETRY_BACKOFF);
+    }
+
+    #[test]
+    fn backoff_never_exceeds_the_cap_even_for_huge_initial_delays() {
+        let config = WebhookConfig {
+            initial_backoff: Duration::MAX,
+            ..Default::default()
+        };
+        assert_eq!(config.backoff_for(1), MAX_RETRY_BACKOFF);
+        assert_eq!(config.backoff_for(30), MAX_RETRY_BACKOFF);
+    }
+
+    #[test]
+    fn a_zero_initial_backoff_retries_immediately() {
+        let config = WebhookConfig {
+            initial_backoff: Duration::ZERO,
+            ..Default::default()
+        };
+        assert_eq!(config.backoff_for(5), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_queue_retry_delay_is_the_documented_capped_curve() {
+        // The queue path (`claim_next_pending`, `next_retry_delay`) used to
+        // recompute `initial_backoff * 2^(attempts-1)` on its own, without the
+        // cap. At 14 failed attempts that is 4096 s and past 32 it overflowed to
+        // `Duration::MAX`, while `next_due` treated the same record as due after
+        // `MAX_RETRY_BACKOFF`. Both paths must answer with one curve.
+        let config = WebhookConfig {
+            initial_backoff: Duration::from_millis(500),
+            ..Default::default()
+        };
+        let record = WebhookDeliveryRecord {
+            delivery_id: 1,
+            target_url: "https://a.example/hook".into(),
+            payload: WebhookPayload {
+                event_id: "evt_1".into(),
+                event_type: WebhookEventType::PaymentSettled,
+                timestamp_ms: 0,
+                payer: None,
+                network: None,
+                amount_atomic: None,
+                tx_hash: None,
+                request_path: None,
+            },
+            attempts: 14,
+            max_retries: 20,
+            status: DeliveryStatus::Failed,
+            last_status_code: Some(500),
+            last_error: None,
+            last_attempt_ms: Some(0),
+        };
+
+        assert_eq!(retry_delay(&config, &record), MAX_RETRY_BACKOFF);
+        let huge = WebhookDeliveryRecord {
+            attempts: u32::MAX,
+            ..record
+        };
+        assert_eq!(retry_delay(&config, &huge), MAX_RETRY_BACKOFF);
+    }
+
+    #[test]
+    fn next_retry_delay_never_exceeds_the_cap() {
+        // A record that has failed 14 times and was tried just now must sleep
+        // no longer than the documented bound, or the worker parks for hours
+        // while `next_due` says the same delivery is overdue.
+        let dispatcher = dispatcher(&["https://a.example/hook"], 20, 10);
+        let id = enqueue(&dispatcher)[0];
+        for _ in 0..14 {
+            dispatcher
+                .record_attempt_result(id, false, Some(503), None)
+                .expect("the delivery stays retryable while under max_retries");
+        }
+
+        let delay = dispatcher.next_retry_delay().expect("a retry is pending");
+        assert!(
+            delay <= MAX_RETRY_BACKOFF,
+            "retry delay {delay:?} exceeded the documented cap"
+        );
+        assert!(
+            delay > Duration::from_secs(600),
+            "the curve must still back off past the initial delay: {delay:?}"
+        );
+    }
+
+    #[test]
+    fn idle_target_claims_follow_the_same_capped_curve() {
+        // The per-target claim path added in #178 reads the same queue delay, so
+        // it has to inherit the cap too: otherwise a receiver held busy by one
+        // attempt would wait 4096 s after 14 failures while a plain claim on the
+        // same record releases it after an hour.
+        let dispatcher = dispatcher(&["https://a.example/hook"], 20, 10);
+        let id = enqueue(&dispatcher)[0];
+        for _ in 0..14 {
+            dispatcher
+                .record_attempt_result(id, false, Some(503), None)
+                .expect("the delivery stays retryable while under max_retries");
+        }
+
+        let delay = dispatcher
+            .next_retry_delay_for_idle_targets()
+            .expect("a retry is pending");
+        assert!(
+            delay <= MAX_RETRY_BACKOFF,
+            "idle-target delay {delay:?} exceeded the documented cap"
+        );
+        assert!(
+            delay > Duration::from_secs(600),
+            "the cap must not collapse the curve to no wait: {delay:?}"
+        );
+        assert!(dispatcher.claim_next_for_idle_target().is_none());
     }
 }

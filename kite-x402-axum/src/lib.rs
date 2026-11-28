@@ -94,7 +94,10 @@ pub use cors_guard::{CorsGuardConfig, CorsSecurityGuard};
 pub use expiration::{ExpirationError, ExpirationGuardConfig};
 pub use facilitator::{FacilitatorClient, FacilitatorError, RetryConfig};
 pub use firewall::{FirewallRule, IpFilterAction, IpFirewall, IpFirewallConfig};
-pub use idempotency::{AcquireResult, CachedResponse, IdempotencyCache, IdempotencyConfig};
+pub use idempotency::{
+    AcquireResult, CachedResponse, IdempotencyCache, IdempotencyConfig, IdempotencyLease,
+    LeaseAcquire,
+};
 pub use kite::{kite_chain_by_name, KiteChain, KiteError, KITE_MAINNET, KITE_TESTNET};
 pub use metrics::{PaymentMetrics, PaymentMetricsSnapshot};
 pub use middleware::{x402_payment, x402_payment_multi, MultiPaymentConfig, PaymentConfig};
@@ -108,8 +111,9 @@ pub use settlement_ledger::{
 pub use settlement_store::{SettlementStorageError, SettlementStore};
 pub use sliding_limiter::{SlidingWindowConfig, SlidingWindowLimiter};
 pub use webhook::{
-    DeliveryStatus, WebhookConfig, WebhookDeliveryRecord, WebhookDispatcher, WebhookEventType,
-    WebhookPayload,
+    delivery_client, run_delivery_worker, DeliveryStatus, WebhookConfig, WebhookDeliveryRecord,
+    WebhookDispatcher, WebhookEventType, WebhookPayload, DELIVERY_ID_HEADER, EVENT_ID_HEADER,
+    MAX_RETRY_BACKOFF,
 };
 pub use webhook_signing::{
     sign_payload, verify_signature, verify_signature_at, SIGNATURE_HEADER, TIMESTAMP_HEADER,

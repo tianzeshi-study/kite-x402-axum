@@ -92,6 +92,24 @@ class ReconciliationTests(unittest.TestCase):
         status, result, _ = self.run_query("--transaction", "0x" + TX[2:].upper())
         self.assertEqual((status, result["status"], result["transaction"]), (0, "confirmed", TX))
 
+    def test_contradictory_receipt_log_membership_never_confirms(self):
+        for lookup in ((), ("--transaction", TX)):
+            for index in (0, 1):
+                for field, wrong in (("transactionHash", "0x" + "77" * 32),
+                                     ("blockHash", "0x" + "88" * 32), ("blockNumber", "0xbe1")):
+                    with self.subTest(lookup=lookup, index=index, field=field):
+                        self.setUp()
+                        self.receipt["logs"][index][field] = wrong
+                        status, result, errors = self.run_query(*lookup)
+                        self.assertEqual(status, 1)
+                        self.assertIsNone(result)
+                        self.assertIn("receipt", errors)
+
+    def test_consistent_optional_log_metadata_preserves_legacy_and_direct_lookups(self):
+        self.receipt["logs"][1].update({"transactionHash": TX, "blockHash": BLOCK, "blockNumber": "0xbe0"})
+        status, result, errors = self.run_query("--transaction", TX)
+        self.assertEqual((status, result["status"], errors), (0, "confirmed", ""))
+
     def test_known_transaction_must_contain_the_original_nonce(self):
         self.receipt["logs"][0]["topics"] = [*self.event["topics"][:2], "0x" + "77" * 32]
         status, result, _ = self.run_query("--transaction", TX)

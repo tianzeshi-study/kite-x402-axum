@@ -43,6 +43,16 @@ pub struct CachedResponse {
 enum Entry {
     InProgress {
         started_at: Instant,
+        /// Identity of the lease holder that created this entry.
+        ///
+        /// `in_progress_timeout` lets a later `acquire` take over an expired
+        /// lease, which means two holders can exist for one key in sequence.
+        /// The first one can still come back (its upstream call failed late, or
+        /// its task was only polled after the timeout). Comparing this token is
+        /// what stops that stale holder from cancelling or overwriting the
+        /// holder that owns the key now — the same generation check
+        /// `PaymentNonceReservation::drop` uses.
+        generation: Arc<()>,
     },
     Completed {
         response: CachedResponse,
@@ -54,7 +64,7 @@ impl Entry {
     /// When this entry was recorded; used to pick the oldest one for eviction.
     fn timestamp(&self) -> Instant {
         match self {
-            Self::InProgress { started_at } => *started_at,
+            Self::InProgress { started_at, .. } => *started_at,
             Self::Completed { cached_at, .. } => *cached_at,
         }
     }
@@ -62,7 +72,7 @@ impl Entry {
     /// Whether the entry is still within its TTL / in-progress window.
     fn is_live(&self, now: Instant, config: &IdempotencyConfig) -> bool {
         match self {
-            Self::InProgress { started_at } => {
+            Self::InProgress { started_at, .. } => {
                 now.duration_since(*started_at) < config.in_progress_timeout
             }
             Self::Completed { cached_at, .. } => now.duration_since(*cached_at) < config.ttl,
@@ -85,6 +95,89 @@ pub enum AcquireResult {
     /// risk a duplicate settlement. The sibling `PaymentNonceReplayGuard`
     /// applies the same fail-at-capacity policy to pending reservations.
     CapacityBusy,
+}
+
+/// Result of an acquisition, before it is reshaped for the public API.
+enum TryAcquire {
+    Acquired(Arc<()>),
+    InProgress,
+    Cached(CachedResponse),
+    CapacityBusy,
+}
+
+/// Outcome of [`IdempotencyCache::acquire_lease`].
+#[derive(Debug)]
+pub enum LeaseAcquire<'a> {
+    /// The lease was acquired.
+    Acquired(IdempotencyLease<'a>),
+    /// A concurrent request with this key is already executing.
+    InProgress,
+    /// Response already cached from a previous completed execution.
+    Cached(CachedResponse),
+    /// The cache is full of live execution leases; callers must retry later.
+    CapacityBusy,
+}
+
+/// An execution lease for one idempotency key.
+///
+/// Dropping the lease releases it, but only while this holder still owns the
+/// key. A holder whose lease expired and was reclaimed by a newer request
+/// cannot cancel that request's lease — it just loses the right to act on the
+/// key, which is what stops one payment from being executed twice.
+pub struct IdempotencyLease<'a> {
+    cache: &'a IdempotencyCache,
+    key: String,
+    generation: Arc<()>,
+    finished: bool,
+}
+
+impl IdempotencyLease<'_> {
+    /// The idempotency key this lease holds.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Publishes the response and gives up the lease.
+    ///
+    /// Returns `false`, caching nothing, when this holder no longer owns the
+    /// key: the lease expired and another request took it over, so this result
+    /// must not become the key's answer.
+    #[must_use]
+    pub fn complete(mut self, status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> bool {
+        let published =
+            self.cache
+                .complete_if_current(&self.key, &self.generation, status, headers, body);
+        self.finished = true;
+        published
+    }
+
+    /// Gives up the lease explicitly, with the same ownership check as drop.
+    ///
+    /// Returns whether the lease was still this holder's to release.
+    #[must_use]
+    pub fn release(mut self) -> bool {
+        let released = self.cache.release_if_current(&self.key, &self.generation);
+        self.finished = true;
+        released
+    }
+}
+
+impl std::fmt::Debug for IdempotencyLease<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdempotencyLease")
+            .field("key", &self.key)
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for IdempotencyLease<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cache.release_if_current(&self.key, &self.generation);
+        }
+    }
 }
 
 /// Thread-safe idempotency cache.
@@ -117,16 +210,54 @@ impl IdempotencyCache {
     }
 
     /// Attempts to acquire an execution lease for the given idempotency key.
+    ///
+    /// This is the single-holder entry point: it returns no handle, so a caller
+    /// that later calls [`Self::complete`] or [`Self::release`] after its lease
+    /// expired — and was reclaimed by another request — cannot prove it still
+    /// owns the key. Use [`Self::acquire_lease`] whenever the work can outlive
+    /// `in_progress_timeout`.
     #[must_use]
     pub fn acquire(&self, key: &str) -> AcquireResult {
+        match self.try_acquire(key) {
+            TryAcquire::Acquired(_) => AcquireResult::Acquired,
+            TryAcquire::InProgress => AcquireResult::InProgress,
+            TryAcquire::Cached(response) => AcquireResult::Cached(response),
+            TryAcquire::CapacityBusy => AcquireResult::CapacityBusy,
+        }
+    }
+
+    /// Acquires an execution lease that can only be completed or released by
+    /// its holder.
+    ///
+    /// The returned [`IdempotencyLease`] carries the generation of the entry it
+    /// created. If the lease expires and another request takes the key over,
+    /// the older holder's `complete`/`release` become no-ops instead of
+    /// cancelling the newer holder's lease — which would let a third request
+    /// acquire a key that is still executing.
+    #[must_use]
+    pub fn acquire_lease(&self, key: &str) -> LeaseAcquire<'_> {
+        match self.try_acquire(key) {
+            TryAcquire::Acquired(generation) => LeaseAcquire::Acquired(IdempotencyLease {
+                cache: self,
+                key: key.to_owned(),
+                generation,
+                finished: false,
+            }),
+            TryAcquire::InProgress => LeaseAcquire::InProgress,
+            TryAcquire::Cached(response) => LeaseAcquire::Cached(response),
+            TryAcquire::CapacityBusy => LeaseAcquire::CapacityBusy,
+        }
+    }
+
+    fn try_acquire(&self, key: &str) -> TryAcquire {
         let mut entries = self.entries.lock().expect("idempotency cache poisoned");
         let now = Instant::now();
 
         if let Some(entry) = entries.get(key) {
             match entry {
-                Entry::InProgress { started_at } => {
+                Entry::InProgress { started_at, .. } => {
                     if now.duration_since(*started_at) < self.config.in_progress_timeout {
-                        return AcquireResult::InProgress;
+                        return TryAcquire::InProgress;
                     }
                     // In-progress entry expired/timed out; allow re-acquisition.
                 }
@@ -135,7 +266,7 @@ impl IdempotencyCache {
                     cached_at,
                 } => {
                     if now.duration_since(*cached_at) < self.config.ttl {
-                        return AcquireResult::Cached(response.clone());
+                        return TryAcquire::Cached(response.clone());
                     }
                     // TTL expired; allow re-acquisition.
                 }
@@ -166,16 +297,74 @@ impl IdempotencyCache {
                 .min_by_key(|(_, entry)| entry.timestamp())
                 .map(|(key, _)| key.clone());
             let Some(oldest_completed) = oldest_completed else {
-                return AcquireResult::CapacityBusy;
+                return TryAcquire::CapacityBusy;
             };
             entries.remove(&oldest_completed);
         }
 
-        entries.insert(key.to_owned(), Entry::InProgress { started_at: now });
-        AcquireResult::Acquired
+        let generation = Arc::new(());
+        entries.insert(
+            key.to_owned(),
+            Entry::InProgress {
+                started_at: now,
+                generation: Arc::clone(&generation),
+            },
+        );
+        TryAcquire::Acquired(generation)
+    }
+
+    /// Removes `key`'s lease only if `generation` still identifies its holder.
+    ///
+    /// Returns whether the entry was removed, so a stale holder can tell that
+    /// its release was ignored.
+    fn release_if_current(&self, key: &str, generation: &Arc<()>) -> bool {
+        let mut entries = self.entries.lock().expect("idempotency cache poisoned");
+        if entries.get(key).is_some_and(|entry| {
+            matches!(entry, Entry::InProgress { generation: current, .. } if Arc::ptr_eq(current, generation))
+        }) {
+            entries.remove(key);
+            return true;
+        }
+        false
+    }
+
+    /// Publishes a response only if `generation` still identifies the holder.
+    fn complete_if_current(
+        &self,
+        key: &str,
+        generation: &Arc<()>,
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> bool {
+        let mut entries = self.entries.lock().expect("idempotency cache poisoned");
+        let still_owner = entries.get(key).is_some_and(|entry| {
+            matches!(entry, Entry::InProgress { generation: current, .. } if Arc::ptr_eq(current, generation))
+        });
+        if !still_owner {
+            return false;
+        }
+        entries.insert(
+            key.to_owned(),
+            Entry::Completed {
+                response: CachedResponse {
+                    status,
+                    headers,
+                    body,
+                },
+                cached_at: Instant::now(),
+            },
+        );
+        true
     }
 
     /// Marks an idempotency key as completed and stores the response.
+    ///
+    /// This matches on the key alone, so it cannot tell whether the caller
+    /// still owns the key. If the lease expired and another request took it
+    /// over, this overwrites that request's lease with a stale result. Use
+    /// [`IdempotencyLease::complete`] whenever the work can outlive
+    /// `in_progress_timeout`.
     pub fn complete(&self, key: &str, status: u16, headers: Vec<(String, String)>, body: Vec<u8>) {
         let mut entries = self.entries.lock().expect("idempotency cache poisoned");
         entries.insert(
@@ -192,6 +381,12 @@ impl IdempotencyCache {
     }
 
     /// Releases an in-progress idempotency key if an operation fails or was aborted.
+    ///
+    /// Like [`Self::complete`], this matches on the key alone: a caller whose
+    /// lease already expired can release the lease of the request that took the
+    /// key over, and the next acquire then runs one payment twice. Use
+    /// [`IdempotencyLease::release`] (or just drop the lease) whenever the work
+    /// can outlive `in_progress_timeout`.
     pub fn release(&self, key: &str) {
         let mut entries = self.entries.lock().expect("idempotency cache poisoned");
         if let Some(Entry::InProgress { .. }) = entries.get(key) {

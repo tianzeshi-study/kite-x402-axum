@@ -14,6 +14,7 @@ use axum::{
     http::{header, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Json, Response},
+    Extension,
 };
 use serde_json::json;
 
@@ -24,7 +25,8 @@ use crate::{
         decimal_uint256, SettlementLedger, SettlementReconciliation, SettlementRecord,
     },
     settlement_store::SettlementStore,
-    types::{PaymentPayload, PaymentRequired, PaymentRequirements, ResourceInfo},
+    types::{PaymentPayload, PaymentRequired, PaymentRequirements, ResourceInfo, SettleResponse},
+    webhook::{PaymentEvent, WebhookEventType},
     wire::{decode_payment_payload, encode_payment_required, encode_settle_response},
 };
 
@@ -53,6 +55,11 @@ pub struct PaymentConfig {
     /// reconciliation. A ledger configured with a shared store also fences
     /// authorizations and journals them before submitting settlement.
     pub settlement_ledger: Option<Arc<crate::settlement_ledger::SettlementLedger>>,
+    /// Optional webhook dispatcher. Every settle attempt enqueues one
+    /// `payment_settled` or `payment_failed` event for its configured
+    /// targets; delivery itself is done by a worker (see
+    /// [`crate::webhook::run_delivery_worker`]).
+    pub webhooks: Option<Arc<crate::webhook::WebhookDispatcher>>,
 }
 
 impl PaymentConfig {
@@ -74,6 +81,7 @@ impl PaymentConfig {
             metrics: None,
             nonce_guard: None,
             settlement_ledger: None,
+            webhooks: None,
         }
     }
 
@@ -118,6 +126,16 @@ impl PaymentConfig {
         self
     }
 
+    /// Enqueues a webhook event for every settle attempt: `payment_settled`
+    /// on success, `payment_failed` otherwise (including attempts whose
+    /// on-chain outcome is unknown). Enqueueing never delays or fails the
+    /// request.
+    #[must_use]
+    pub fn with_webhooks(mut self, webhooks: Arc<crate::webhook::WebhookDispatcher>) -> Self {
+        self.webhooks = Some(webhooks);
+        self
+    }
+
     fn requirements(&self) -> Result<PaymentRequirements, String> {
         let asset = self
             .chain
@@ -152,7 +170,23 @@ fn payment_required_response(
         accepts: requirements.to_vec(),
     };
 
-    let mut response = (StatusCode::PAYMENT_REQUIRED, Json(json!({}))).into_response();
+    let event = PaymentEvent {
+        event_type: if body.error.is_some() {
+            WebhookEventType::PaymentFailed
+        } else {
+            WebhookEventType::PaymentPrompted
+        },
+        payer: None,
+        network: requirements.first().map(|item| item.network.clone()),
+        amount_atomic: requirements.first().map(|item| item.amount.clone()),
+        tx_hash: None,
+    };
+    let mut response = (
+        StatusCode::PAYMENT_REQUIRED,
+        Extension(event),
+        Json(json!({})),
+    )
+        .into_response();
     let headers = response.headers_mut();
     headers.insert(
         "PAYMENT-REQUIRED",
@@ -163,7 +197,7 @@ fn payment_required_response(
     response
 }
 
-fn settlement_failure_response(settle: &crate::types::SettleResponse) -> Response {
+fn settlement_failure_response(settle: &SettleResponse) -> Response {
     let mut response = (StatusCode::PAYMENT_REQUIRED, Json(json!({}))).into_response();
     let headers = response.headers_mut();
     headers.insert(
@@ -173,6 +207,30 @@ fn settlement_failure_response(settle: &crate::types::SettleResponse) -> Respons
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+fn settlement_event(
+    settle: &SettleResponse,
+    requirements: &PaymentRequirements,
+    verified_payer: Option<String>,
+) -> PaymentEvent {
+    PaymentEvent {
+        event_type: if settle.success {
+            WebhookEventType::PaymentSettled
+        } else {
+            WebhookEventType::PaymentFailed
+        },
+        payer: settle
+            .payer
+            .as_deref()
+            .filter(|payer| !payer.trim().is_empty())
+            .map(str::to_owned)
+            .or(verified_payer),
+        network: Some(requirements.network.clone()),
+        amount_atomic: atomic_amount(requirements, settle),
+        tx_hash: (settle.network == requirements.network && !settle.transaction.trim().is_empty())
+            .then(|| settle.transaction.clone()),
+    }
 }
 
 /// Builds the absolute resource URL advertised in a 402 challenge.
@@ -201,13 +259,16 @@ fn absolute_resource_url(req: &Request, path_and_query: &str) -> String {
 }
 
 /// Accepts a host or host:port and rejects anything that could change the URL
-/// structure (spaces, slashes, userinfo).
+/// structure. Besides whitespace and non-graphic bytes, this rejects the
+/// userinfo delimiter (`@`), path separators (`/`, `\`), and the query and
+/// fragment delimiters (`?`, `#`) — all of which would let a hostile `Host`
+/// turn the advertised `resource.url` into a different URL.
 fn is_resource_host(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= 262
         && host
             .bytes()
-            .all(|b| b.is_ascii_graphic() && b != b'/' && b != b'\\' && b != b'@')
+            .all(|b| b.is_ascii_graphic() && !matches!(b, b'/' | b'\\' | b'@' | b'?' | b'#'))
 }
 
 fn forwarded_scheme(req: &Request) -> Option<&'static str> {
@@ -230,10 +291,7 @@ fn unix_now_secs() -> u64 {
 }
 
 /// Prefer a canonical receipt amount and fall back to the advertised amount.
-fn atomic_amount(
-    requirements: &PaymentRequirements,
-    settle: &crate::types::SettleResponse,
-) -> Option<String> {
+fn atomic_amount(requirements: &PaymentRequirements, settle: &SettleResponse) -> Option<String> {
     settle
         .amount
         .as_deref()
@@ -284,7 +342,7 @@ fn reconciliation_details(
 fn settlement_record(
     requirements: &PaymentRequirements,
     verified_payer: Option<&str>,
-    settle: &crate::types::SettleResponse,
+    settle: &SettleResponse,
 ) -> SettlementRecord {
     let payer = settle
         .payer
@@ -688,7 +746,14 @@ async fn payment_gate_inner(
             status = status.as_u16(),
             "Upstream returned HTTP status >= 400; skipping settlement"
         );
-        return response;
+        let event = PaymentEvent {
+            event_type: WebhookEventType::PaymentVerified,
+            payer: verify.payer,
+            network: Some(requirements.network.clone()),
+            amount_atomic: Some(requirements.amount.clone()),
+            tx_hash: None,
+        };
+        return (Extension(event), response).into_response();
     }
 
     tracing::info!(
@@ -708,7 +773,7 @@ async fn payment_gate_inner(
     let settle_duration = settle_start.elapsed();
     let mut settle = settle_outcome.unwrap_or_else(|error| {
         tracing::error!(%error, uri = %resource_url, "Facilitator settle unavailable");
-        crate::types::SettleResponse {
+        SettleResponse {
             success: false,
             error_reason: Some(format!("facilitator settle unavailable: {error}")),
             error_message: None,
@@ -747,10 +812,6 @@ async fn payment_gate_inner(
                 Some(format!("{message}. Reconcile the payment before retrying."));
         }
     }
-    if let Some(metrics) = &cfg.metrics {
-        metrics.record_settlement(settle.success, settle_duration);
-    }
-
     if let Some(ledger) = &cfg.settlement_ledger {
         let record = settlement_record(requirements, verify.payer.as_deref(), &settle);
         if let Some(payment) = &durable {
@@ -760,7 +821,6 @@ async fn payment_gate_inner(
                     settle.success = false;
                     settle.error_reason = Some("invalid_settlement_receipt".into());
                     settle.error_message = Some("The journal does not agree with the receipt. Reconcile the original payment.".into());
-                    return settlement_failure_response(&settle);
                 }
                 Err(error) => {
                     tracing::error!(%error, "Could not persist facilitator settlement response");
@@ -768,12 +828,26 @@ async fn payment_gate_inner(
                     settle.error_reason = Some("settlement_outcome_unconfirmed".into());
                     settle.error_message =
                         Some("Reconcile the original payment before retrying.".into());
-                    return settlement_failure_response(&settle);
                 }
             }
         } else {
             record_local_settlement(ledger, &payload, requirements, record);
         }
+    }
+
+    if let Some(metrics) = &cfg.metrics {
+        metrics.record_settlement(settle.success, settle_duration);
+    }
+    let event = settlement_event(&settle, requirements, verify.payer);
+    if let Some(webhooks) = &cfg.webhooks {
+        let _ = webhooks.enqueue_event(
+            event.event_type.clone(),
+            event.payer.clone(),
+            event.network.clone(),
+            event.amount_atomic.clone(),
+            event.tx_hash.clone(),
+            None,
+        );
     }
 
     if !settle.success {
@@ -790,7 +864,7 @@ async fn payment_gate_inner(
             error_reason = ?settle.error_reason,
             "Payment settlement audit: failed"
         );
-        return settlement_failure_response(&settle);
+        return (Extension(event), settlement_failure_response(&settle)).into_response();
     }
 
     tracing::info!(
@@ -817,6 +891,7 @@ async fn payment_gate_inner(
     );
 
     let (mut parts, body) = response.into_parts();
+    parts.extensions.insert(event);
     parts.headers.insert(
         "PAYMENT-RESPONSE",
         HeaderValue::from_str(&encode_settle_response(&settle))
@@ -923,6 +998,8 @@ pub struct MultiPaymentConfig {
     pub nonce_guard: Option<Arc<crate::nonce_guard::PaymentNonceReplayGuard>>,
     /// Optional settlement ledger shared with the single-option gate.
     pub settlement_ledger: Option<Arc<crate::settlement_ledger::SettlementLedger>>,
+    /// Optional webhook dispatcher, like [`PaymentConfig::webhooks`].
+    pub webhooks: Option<Arc<crate::webhook::WebhookDispatcher>>,
 }
 
 impl MultiPaymentConfig {
@@ -942,7 +1019,16 @@ impl MultiPaymentConfig {
             metrics: None,
             nonce_guard: None,
             settlement_ledger: None,
+            webhooks: None,
         }
+    }
+
+    /// Enqueues webhook events for settle attempts, like
+    /// [`PaymentConfig::with_webhooks`].
+    #[must_use]
+    pub fn with_webhooks(mut self, webhooks: Arc<crate::webhook::WebhookDispatcher>) -> Self {
+        self.webhooks = Some(webhooks);
+        self
     }
 
     /// Retains settle outcomes in the given ledger, like the single-option
@@ -975,6 +1061,7 @@ impl MultiPaymentConfig {
             metrics: self.metrics.clone(),
             nonce_guard: self.nonce_guard.clone(),
             settlement_ledger: self.settlement_ledger.clone(),
+            webhooks: self.webhooks.clone(),
         }
     }
 }
@@ -1053,6 +1140,7 @@ mod tests {
             metrics: None,
             nonce_guard: None,
             settlement_ledger: None,
+            webhooks: None,
         })
     }
 
@@ -1142,6 +1230,22 @@ mod tests {
                 "{bad:?}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn a_price_no_authorization_could_carry_is_reported_not_advertised() {
+        // One unit above 2^256 - 1. It is a positive decimal with exactly
+        // mainnet's six fractional digits, so nothing else is wrong with it;
+        // an EIP-3009 `value` still cannot hold it.
+        let max = crate::kite::MAX_UINT256_DECIMAL;
+        let fraction = max[max.len() - 6..].parse::<u32>().unwrap() + 1;
+        let too_large = format!("{}.{fraction:06}", &max[..max.len() - 6]);
+        let err = config(KITE_MAINNET, &too_large).requirements().unwrap_err();
+        assert!(
+            err.starts_with("invalid PRICE_USD configured on the server: ")
+                && err.contains("more than a uint256 can hold"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1240,17 +1344,18 @@ mod tests {
         use std::sync::Arc;
 
         let ledger = Arc::new(SettlementLedger::new(100));
-        let cfg = PaymentConfig {
-            pay_to: PAY_TO.to_owned(),
-            chain: KITE_TESTNET,
-            price_usd: "0.001".to_owned(),
-            description: "test".to_owned(),
-            facilitator: dead_facilitator(),
-            expiration_guard: None,
-            metrics: None,
-            nonce_guard: None,
-            settlement_ledger: Some(ledger.clone()),
-        };
+        let guard = crate::expiration::ExpirationGuardConfig::new(5, 5);
+        let cfg = Arc::new(
+            PaymentConfig::new(
+                PAY_TO,
+                KITE_TESTNET,
+                "0.001",
+                "Unit test service",
+                dead_facilitator(),
+            )
+            .with_expiration_guard(guard)
+            .with_settlement_ledger(Arc::clone(&ledger)),
+        );
         let req = requirements();
         let clean_network = req.network.clone();
         let settle = SettleResponse {
@@ -1334,6 +1439,9 @@ mod tests {
             Some("because".into()),
         );
         assert_eq!(decode_header(&resp, "PAYMENT-REQUIRED")["error"], "because");
+        let event = resp.extensions().get::<PaymentEvent>().unwrap();
+        assert_eq!(event.event_type, WebhookEventType::PaymentFailed);
+        assert!(event.payer.is_none());
     }
 
     #[test]
@@ -1436,15 +1544,22 @@ mod tests {
 
     #[tokio::test]
     async fn resource_url_ignores_a_host_that_could_rewrite_the_url() {
-        let (svc, _) = gate(config(KITE_TESTNET, "0.001"));
-        let resp = svc
-            .oneshot(request("/v1/x", &[("host", "evil.example/other")]))
-            .await
-            .unwrap();
-        assert_eq!(
-            decode_header(&resp, "PAYMENT-REQUIRED")["resource"]["url"],
-            "/v1/x"
-        );
+        for host in [
+            "evil.example/other",
+            "evil.example?x=1",
+            "evil.example#frag",
+        ] {
+            let (svc, _) = gate(config(KITE_TESTNET, "0.001"));
+            let resp = svc
+                .oneshot(request("/v1/x", &[("host", host)]))
+                .await
+                .unwrap();
+            assert_eq!(
+                decode_header(&resp, "PAYMENT-REQUIRED")["resource"]["url"],
+                "/v1/x",
+                "host {host} must not change the URL structure"
+            );
+        }
     }
 
     #[tokio::test]

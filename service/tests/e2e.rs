@@ -16,7 +16,19 @@ use std::{
     io::{Read, Write},
     net::{TcpListener as StdListener, TcpStream},
     process::{Child, Command, ExitStatus, Stdio},
-    time::{Duration, Instant},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    routing::post,
+    Router,
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -24,11 +36,94 @@ use common::{
     encode_payload, payload_for, payment_header, settle_failed, settle_ok, verify_invalid, Mocks,
     Reply, UpstreamReply, PAYER, TX_HASH,
 };
-use kite_x402_axum::types::PaymentRequirements;
+use kite_x402_axum::{
+    types::PaymentRequirements, verify_signature_at, SIGNATURE_HEADER, TIMESTAMP_HEADER,
+};
 use serde_json::{json, Value};
+use tokio::sync::Semaphore;
 
 const BIN: &str = env!("CARGO_BIN_EXE_kite-x402-service");
 const PAY_TO: &str = "0xE2E0000000000000000000000000000000000E2E";
+const WEBHOOK_SECRET: &str = "fixture-webhook-secret-with-at-least-32-bytes";
+
+#[derive(Clone, Debug)]
+struct CapturedWebhook {
+    headers: HeaderMap,
+    body: Vec<u8>,
+}
+
+#[derive(Default)]
+struct WebhookReceiver {
+    requests: Mutex<Vec<CapturedWebhook>>,
+    fail_first_settlement: AtomicBool,
+    first_response_gate: Option<Arc<Semaphore>>,
+}
+
+async fn capture_webhook(
+    State(receiver): State<Arc<WebhookReceiver>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    let fail = payload["event_type"] == "payment_settled"
+        && receiver
+            .fail_first_settlement
+            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+    let first_request = {
+        let mut requests = receiver.requests.lock().unwrap();
+        let first_request = requests.is_empty();
+        requests.push(CapturedWebhook {
+            headers,
+            body: body.to_vec(),
+        });
+        first_request
+    };
+    if let Some(gate) = receiver
+        .first_response_gate
+        .as_ref()
+        .filter(|_| first_request)
+    {
+        let _permit = gate.acquire().await.unwrap();
+    }
+    if fail {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::NO_CONTENT
+    }
+}
+
+async fn start_webhook_receiver(fail_first_settlement: bool) -> (String, Arc<WebhookReceiver>) {
+    start_webhook_receiver_with(WebhookReceiver {
+        fail_first_settlement: AtomicBool::new(fail_first_settlement),
+        ..Default::default()
+    })
+    .await
+}
+
+async fn start_webhook_receiver_with(receiver: WebhookReceiver) -> (String, Arc<WebhookReceiver>) {
+    let receiver = Arc::new(receiver);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/events", post(capture_webhook))
+        .with_state(Arc::clone(&receiver));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{address}/events"), receiver)
+}
+
+async fn wait_for_webhook_count(receiver: &WebhookReceiver, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if receiver.requests.lock().unwrap().len() >= count {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for webhooks");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // process harness
@@ -236,6 +331,190 @@ fn run_expecting_failure(env: Vec<(&str, &str)>) -> (ExitStatus, String) {
         out.status,
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+// ===========================================================================
+// Payment webhooks
+// ===========================================================================
+
+fn webhook_env(mocks: &Mocks, url: String) -> Vec<(String, String)> {
+    let mut env = Service::base_env(mocks, free_port());
+    env.extend([
+        ("WEBHOOK_URLS".into(), url),
+        ("WEBHOOK_SIGNING_SECRET".into(), WEBHOOK_SECRET.into()),
+    ]);
+    env
+}
+
+#[tokio::test]
+async fn webhook_events_are_signed_retried_and_isolated_from_payment_responses() {
+    let mocks = Mocks::start().await;
+    let (webhook_url, receiver) = start_webhook_receiver(true).await;
+    let svc = Service::start(webhook_env(&mocks, webhook_url)).await;
+
+    let challenge = svc.get("/v1/forecast?private=do-not-forward").await;
+    assert_eq!(challenge.status(), 402);
+    wait_for_webhook_count(&receiver, 1).await;
+    let challenged = svc.pay_get("/v1/forecast").await;
+    assert_eq!(challenged.status(), 200);
+
+    wait_for_webhook_count(&receiver, 4).await;
+    let requests = receiver.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 4, "settlement should retry once after 503");
+    for request in &requests {
+        let timestamp: u64 = request.headers[TIMESTAMP_HEADER]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let signature = request.headers[SIGNATURE_HEADER].to_str().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(verify_signature_at(
+            WEBHOOK_SECRET,
+            timestamp,
+            &request.body,
+            signature,
+            now,
+            30,
+        ));
+    }
+
+    let events: Vec<Value> = requests
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect();
+    assert_eq!(events[0]["event_type"], "payment_prompted");
+    assert_eq!(events[0]["request_path"], "/v1/forecast");
+    assert_eq!(events[1]["event_type"], "payment_prompted");
+    assert_eq!(events[2]["event_type"], "payment_settled");
+    assert_eq!(events[2]["tx_hash"], TX_HASH);
+    assert_eq!(events[2]["payer"], PAYER);
+    assert_eq!(events[2]["network"], events[1]["network"]);
+    assert_eq!(events[2]["amount_atomic"], events[1]["amount_atomic"]);
+    assert_eq!(events[3]["event_id"], events[2]["event_id"]);
+    assert_eq!(events[3]["request_path"], "/v1/forecast");
+    assert!(events
+        .iter()
+        .all(|event| event.get("payment_signature").is_none()));
+}
+
+#[tokio::test]
+async fn webhook_delivers_to_healthy_receivers_while_a_slow_receiver_is_busy() {
+    let mocks = Mocks::start().await;
+    let gate = Arc::new(Semaphore::new(0));
+    let (slow_url, slow) = start_webhook_receiver_with(WebhookReceiver {
+        first_response_gate: Some(Arc::clone(&gate)),
+        ..Default::default()
+    })
+    .await;
+    let (healthy_url, healthy) = start_webhook_receiver(false).await;
+    let svc = Service::start(webhook_env(&mocks, format!("{slow_url},{healthy_url}"))).await;
+
+    let requirements = svc.requirements("/v1/forecast").await;
+    wait_for_webhook_count(&slow, 1).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let paid = svc
+            .http
+            .get(svc.url("/v1/forecast"))
+            .header("PAYMENT-SIGNATURE", payment_header(&requirements))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(paid.status(), 200);
+        wait_for_webhook_count(&healthy, 2).await;
+    })
+    .await
+    .expect("the healthy receiver should get the settlement before the slow receiver times out");
+
+    let healthy_event: Value =
+        serde_json::from_slice(&healthy.requests.lock().unwrap()[1].body).unwrap();
+    assert_eq!(healthy_event["event_type"], "payment_settled");
+    assert_eq!(healthy_event["tx_hash"], TX_HASH);
+    assert_eq!(slow.requests.lock().unwrap().len(), 1);
+
+    gate.add_permits(1);
+    wait_for_webhook_count(&slow, 2).await;
+    let slow_event: Value = serde_json::from_slice(&slow.requests.lock().unwrap()[1].body).unwrap();
+    assert_eq!(slow_event["event_id"], healthy_event["event_id"]);
+}
+
+#[tokio::test]
+async fn webhook_skips_requests_rejected_before_the_payment_gate() {
+    let mocks = Mocks::start().await;
+    let (url, receiver) = start_webhook_receiver(false).await;
+    let mut env = webhook_env(&mocks, url);
+    env.extend([
+        ("RATE_LIMIT_RPS".into(), "0.001".into()),
+        ("RATE_LIMIT_BURST".into(), "1".into()),
+    ]);
+    let svc = Service::start(env).await;
+
+    let response = svc.pay_get("/v1/forecast").await;
+    assert_eq!(response.status(), 429);
+    assert!(mocks.timeline().is_empty());
+    wait_for_webhook_count(&receiver, 1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let requests = receiver.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let event: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(event["event_type"], "payment_prompted");
+}
+
+#[tokio::test]
+async fn webhook_reports_verification_when_the_upstream_returns_an_error() {
+    let mocks = Mocks::start().await;
+    mocks.upstream.set_status(402);
+    let (url, receiver) = start_webhook_receiver(false).await;
+    let svc = Service::start(webhook_env(&mocks, url)).await;
+
+    let response = svc.pay_get("/v1/forecast").await;
+    assert_eq!(response.status(), 402);
+    assert_eq!(mocks.facilitator.verify_count(), 1);
+    assert_eq!(mocks.facilitator.settle_count(), 0);
+    wait_for_webhook_count(&receiver, 2).await;
+    let requests = receiver.requests.lock().unwrap();
+    let event: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(event["event_type"], "payment_verified");
+    assert_eq!(event["payer"], PAYER);
+    assert!(event["tx_hash"].is_null());
+}
+
+#[tokio::test]
+async fn webhook_reports_a_failed_settlement_with_the_verified_payer() {
+    let mocks = Mocks::start().await;
+    mocks.facilitator.set_settle(settle_failed(
+        "settlement declined",
+        kite_x402_axum::KITE_TESTNET.network,
+    ));
+    let (url, receiver) = start_webhook_receiver(false).await;
+    let svc = Service::start(webhook_env(&mocks, url)).await;
+
+    let response = svc.pay_get("/v1/forecast").await;
+    assert_eq!(response.status(), 402);
+    assert_eq!(mocks.facilitator.settle_count(), 1);
+    wait_for_webhook_count(&receiver, 2).await;
+    let requests = receiver.requests.lock().unwrap();
+    let event: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(event["event_type"], "payment_failed");
+    assert_eq!(event["payer"], PAYER);
+    assert_eq!(event["network"], kite_x402_axum::KITE_TESTNET.network);
+    assert!(event["tx_hash"].is_null());
+}
+
+#[test]
+fn webhooks_require_a_signing_secret_at_startup() {
+    let (status, stderr) = run_expecting_failure(vec![
+        ("PORT", "0"),
+        ("PAY_TO", PAY_TO),
+        ("UPSTREAM_URL", "http://127.0.0.1:1"),
+        ("WEBHOOK_URLS", "http://127.0.0.1:9000/events"),
+        ("RUST_LOG", "off"),
+    ]);
+    assert!(!status.success());
+    assert!(stderr.contains("WEBHOOK_SIGNING_SECRET is required"));
 }
 
 // ===========================================================================
@@ -525,6 +804,57 @@ async fn healthz_is_free_and_never_contacts_the_backends() {
             "price": "$0.001",
         })
     );
+    assert!(mocks.timeline().is_empty());
+}
+
+#[tokio::test]
+async fn well_known_x402_publishes_the_payment_surface_without_contacting_the_backends() {
+    let mocks = Mocks::start().await;
+    let port = free_port();
+    let mut env = Service::base_env(&mocks, port);
+    env.push(("PRICE_USD".into(), "0.01".into()));
+    env.push(("EXTRA_PAYMENT_OPTIONS".into(), "mainnet:$0.002".into()));
+    let svc = Service::start(env).await;
+
+    let resp = svc.get("/.well-known/x402").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
+    // It sits on the same router as `/healthz`, so it gets the same headers.
+    assert_eq!(
+        resp.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({
+            "x402Version": 2,
+            "scheme": "exact",
+            "networks": ["eip155:2368", "eip155:2366"],
+            "assets": [
+                {
+                    "network": "eip155:2368",
+                    "address": "0x38129cf4CE5E183eFF248F42A7D345Bb1B47621A",
+                    "symbol": "pieUSD",
+                    "decimals": 18,
+                    "name": "pieUSD",
+                    "version": "1",
+                },
+                {
+                    "network": "eip155:2366",
+                    "address": "0x7aB6f3ed87C42eF0aDb67Ed95090f8bF5240149e",
+                    "symbol": "USDC.e",
+                    "decimals": 6,
+                    "name": "Bridged USDC (Kite AI)",
+                    "version": "2",
+                },
+            ],
+            "payTo": PAY_TO,
+            "price": "$0.01",
+            "description": "Paid API access via Kite x402",
+            "extraPaymentOptions": [{"network": "eip155:2366", "price": "$0.002"}],
+        })
+    );
+    // Unmetered and off the critical path: neither backend heard anything.
     assert!(mocks.timeline().is_empty());
 }
 
@@ -923,6 +1253,7 @@ async fn durable_settlement_survives_timeout_and_crash_across_replicas() {
     mocks
         .facilitator
         .set_settle(Reply::Delayed(Duration::from_secs(3), json!({})));
+    let (webhook_url, receiver) = start_webhook_receiver(false).await;
     let settings = |port, query, timeout: &str| {
         let mut env = Service::base_env(&mocks, port);
         env.extend([
@@ -938,7 +1269,12 @@ async fn durable_settlement_survives_timeout_and_crash_across_replicas() {
     let port_b = free_port();
     let query_a = free_port();
     let query_b = free_port();
-    let a = Service::start(settings(port_a, query_a, "500")).await;
+    let mut settings_a = settings(port_a, query_a, "500");
+    settings_a.extend([
+        ("WEBHOOK_URLS".into(), webhook_url),
+        ("WEBHOOK_SIGNING_SECRET".into(), WEBHOOK_SECRET.into()),
+    ]);
+    let a = Service::start(settings_a).await;
     let b = Service::start(settings(port_b, query_b, "5000")).await;
     let path = "/v1/durable";
     let req = a.requirements(path).await;
@@ -971,6 +1307,15 @@ async fn durable_settlement_survives_timeout_and_crash_across_replicas() {
     statuses.sort_unstable();
     assert_eq!(statuses, [402, 409]);
     assert_eq!(mocks.timeline(), ["verify", "upstream", "settle"]);
+    wait_for_webhook_count(&receiver, 2).await;
+    {
+        let requests = receiver.requests.lock().unwrap();
+        let event: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(event["event_type"], "payment_failed");
+        assert_eq!(event["amount_atomic"], AMOUNT);
+        assert_eq!(event["payer"], SIGNER);
+        assert!(event["tx_hash"].is_null());
+    }
 
     let in_flight = b.http.get(b.url(path)).header("PAYMENT-SIGNATURE", &second);
     let paid_task = tokio::spawn(in_flight.send());
@@ -1469,10 +1814,220 @@ async fn an_invalid_price_starts_fine_but_fails_every_metered_request_with_500()
 }
 
 #[tokio::test]
+async fn a_price_no_authorization_could_carry_is_a_500_not_a_challenge() {
+    // One unit above the uint256 an EIP-3009 `value` can hold, written as a
+    // USD price with mainnet's six decimals. Nothing is wrong with it as a
+    // decimal, so without the bound it went into every challenge: a price no
+    // buyer could sign.
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push(("KITE_NETWORK".into(), "mainnet".into()));
+    let max = kite_x402_axum::kite::MAX_UINT256_DECIMAL;
+    let fraction = max[max.len() - 6..].parse::<u32>().unwrap() + 1;
+    env.push((
+        "PRICE_USD".into(),
+        format!("{}.{fraction:06}", &max[..max.len() - 6]),
+    ));
+    let svc = Service::start(env).await;
+
+    assert_eq!(svc.get("/healthz").await.status(), 200);
+    let resp = svc.get("/v1/x").await;
+    assert_eq!(resp.status(), 500);
+    let error = resp.json::<Value>().await.unwrap()["error"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        error.contains("invalid PRICE_USD") && error.contains("more than a uint256 can hold"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn route_prices_require_match_rejects_unlisted_requests_before_payment() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.extend([
+        ("ROUTE_PRICES_REQUIRE_MATCH".into(), "true".into()),
+        (
+            "ROUTE_PRICES_USD".into(),
+            json!([
+                {"method": "GET", "path": "/v1/reports/{id}", "price": "0.05"},
+                {"method": "GET", "path": "/v1/reports/sample", "price": "0.02"}
+            ])
+            .to_string(),
+        ),
+    ]);
+    let svc = Service::start(env).await;
+    let requirements = svc.requirements("/v1/reports/sample").await;
+    let valid_signature = payment_header(&requirements);
+
+    for (method, path) in [
+        (reqwest::Method::GET, "/v1/admin"),
+        (reqwest::Method::GET, "/v1/reports"),
+        (reqwest::Method::GET, "/v1/reports/"),
+        (reqwest::Method::GET, "/v1/reports/a/b"),
+        (reqwest::Method::POST, "/v1/reports/sample"),
+        (reqwest::Method::DELETE, "/v1/reports/42"),
+        (reqwest::Method::OPTIONS, "/v1/reports/sample"),
+        (reqwest::Method::HEAD, "/v1/reports/sample"),
+    ] {
+        for signature in [
+            None,
+            Some("invalid-payment"),
+            Some(valid_signature.as_str()),
+        ] {
+            let mut request = svc.http.request(method.clone(), svc.url(path));
+            if let Some(signature) = signature {
+                request = request.header("PAYMENT-SIGNATURE", signature);
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), 404, "{method} {path}");
+            assert!(!response.headers().contains_key("payment-required"));
+            assert!(!response.headers().contains_key("payment-response"));
+            if method != reqwest::Method::HEAD {
+                assert_eq!(
+                    response.json::<Value>().await.unwrap(),
+                    json!({"error": "not_found", "message": "route not found"})
+                );
+            }
+        }
+    }
+    assert!(mocks.timeline().is_empty());
+    assert_eq!(mocks.facilitator.verify_count(), 0);
+    assert_eq!(mocks.upstream.count(), 0);
+    assert_eq!(mocks.facilitator.settle_count(), 0);
+
+    for (path, upstream_path, amount) in [
+        (
+            "/v1/reports/sample?format=json",
+            "/reports/sample?format=json",
+            "20000000000000000",
+        ),
+        (
+            "/v1/reports/second%20id",
+            "/reports/second%20id",
+            "50000000000000000",
+        ),
+    ] {
+        let requirements = svc.requirements(path).await;
+        assert_eq!(requirements.amount, amount);
+        let response = svc
+            .http
+            .get(svc.url(path))
+            .header("PAYMENT-SIGNATURE", payment_header(&requirements))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(header_json(&response, "payment-response")["success"], true);
+        assert_eq!(mocks.upstream.last().path_and_query, upstream_path);
+    }
+    assert_eq!(mocks.facilitator.verify_count(), 2);
+    assert_eq!(mocks.upstream.count(), 2);
+    assert_eq!(mocks.facilitator.settle_count(), 2);
+    let settlements = mocks.facilitator.settle_requests.lock().unwrap();
+    assert_eq!(
+        settlements[0]["paymentRequirements"]["amount"],
+        "20000000000000000"
+    );
+    assert_eq!(
+        settlements[1]["paymentRequirements"]["amount"],
+        "50000000000000000"
+    );
+}
+
+#[tokio::test]
+async fn route_prices_require_match_preserves_cors_and_free_endpoints() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.extend([
+        ("ROUTE_PRICES_REQUIRE_MATCH".into(), "true".into()),
+        ("CORS_ORIGIN".into(), "https://app.example.com".into()),
+        (
+            "ROUTE_PRICES_USD".into(),
+            r#"[{"method":"GET","path":"/v1/data","price":"0.01"}]"#.into(),
+        ),
+    ]);
+    let svc = Service::start(env).await;
+    for path in [
+        "/healthz",
+        "/livez",
+        "/metrics",
+        "/metrics/x402",
+        "/.well-known/x402",
+    ] {
+        assert_eq!(svc.get(path).await.status(), 200, "{path}");
+    }
+    for path in ["/v1/data", "/v1/admin"] {
+        let preflight = svc
+            .http
+            .request(reqwest::Method::OPTIONS, svc.url(path))
+            .header("Origin", "https://app.example.com")
+            .header("Access-Control-Request-Method", "GET")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), 204);
+        assert_eq!(
+            preflight.headers()["access-control-allow-origin"],
+            "https://app.example.com"
+        );
+        let response = svc
+            .http
+            .get(svc.url(path))
+            .header("Origin", "https://app.example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if path == "/v1/data" { 402 } else { 404 }
+        );
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            "https://app.example.com"
+        );
+    }
+    assert!(mocks.timeline().is_empty());
+}
+
+#[test]
+fn route_prices_require_match_rejects_invalid_configuration_at_startup() {
+    for (strict, rules, expected) in [
+        ("true", "", "requires at least one route rule"),
+        ("true", "[]", "requires at least one route rule"),
+        ("true", "  ", "requires at least one route rule"),
+        (
+            "1",
+            "[]",
+            "ROUTE_PRICES_REQUIRE_MATCH must be true or false",
+        ),
+        (
+            "TRUE",
+            "[]",
+            "ROUTE_PRICES_REQUIRE_MATCH must be true or false",
+        ),
+        ("", "[]", "ROUTE_PRICES_REQUIRE_MATCH must be true or false"),
+    ] {
+        let (status, stderr) = run_expecting_failure(vec![
+            ("PAY_TO", PAY_TO),
+            ("UPSTREAM_URL", "http://127.0.0.1:1"),
+            ("RUST_LOG", "off"),
+            ("ROUTE_PRICES_REQUIRE_MATCH", strict),
+            ("ROUTE_PRICES_USD", rules),
+        ]);
+        assert!(!status.success(), "{strict:?} {rules:?}");
+        assert!(stderr.contains(expected), "{stderr}");
+    }
+}
+
+#[tokio::test]
 async fn route_prices_control_challenges_and_settlement() {
     let mocks = Mocks::start().await;
     let mut env = Service::base_env(&mocks, free_port());
     env.extend([
+        ("ROUTE_PRICES_REQUIRE_MATCH".into(), "false".into()),
         ("PRICE_USD".into(), "0.01".into()),
         (
             "ROUTE_PRICES_USD".into(),

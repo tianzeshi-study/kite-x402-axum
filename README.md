@@ -56,16 +56,32 @@ matched as URL-encoded strings, so a literal brace must be encoded as `%7B` or
 
 An exact path rule takes priority over a matching template for the same method.
 Invalid rules, duplicate exact rules, and overlapping templates for the same
-method fail at startup. Unmatched metered requests use `PRICE_USD`, as do all
-metered requests when the array is empty or unset.
+method fail at startup. By default, unmatched metered requests use `PRICE_USD`,
+as do all metered requests when the array is empty or unset.
+
+Set `ROUTE_PRICES_REQUIRE_MATCH=true` to expose only the methods and paths
+configured in `ROUTE_PRICES_USD`. With the example above, `GET /v1/forecast`
+and `GET /v1/reports/42` can be paid for. `POST /v1/forecast` and
+`GET /v1/admin` return HTTP `404` with
+`{"error":"not_found","message":"route not found"}` before payment verification,
+upstream forwarding or settlement, including when a payment signature is supplied.
+Exact paths keep priority over templates, and query strings do not affect matching.
+`HEAD` and ordinary `OPTIONS` requests need their own rules. When CORS is enabled,
+the outer middleware still answers browser preflights without contacting the
+upstream; the actual request must match a rule. Free diagnostic and discovery
+endpoints remain available.
+
+The switch accepts only `true` or `false` and defaults to `false`. Enabling it
+with an empty or unset rule list fails at startup. Use it to limit the proxy's
+published routes and keep upstream authorization for user-specific permissions.
 
 Use `extra_payment_options` in a rule to set the alternatives for that route.
 Omit the field to inherit `EXTRA_PAYMENT_OPTIONS`, use `[]` to offer only the
 primary option, or provide an array of `{"network":"mainnet","price":"0.06"}`
 objects to replace the defaults. The primary option stays first. Each extra uses
 `mainnet` or `testnet` and a positive USD amount valid for that network's token.
-An invalid local list prevents the service from starting. Unmatched routes use
-`PRICE_USD` and `EXTRA_PAYMENT_OPTIONS`.
+An invalid local list prevents the service from starting. With strict matching
+disabled, unmatched routes use `PRICE_USD` and `EXTRA_PAYMENT_OPTIONS`.
 
 ```dotenv
 EXTRA_PAYMENT_OPTIONS=mainnet:0.002
@@ -240,6 +256,7 @@ payment only. It does not show whether the upstream service fulfilled the reques
 The service exposes endpoints outside `/v1/*` that are unmetered (free) and never invoke payment verification or settlement:
 
 - **`GET /healthz`**: Liveness check; returns `{"ok": true, "network", "asset", "price"}` when the HTTP listener is operational. `network` is the CAIP-2 id, `asset` is the stablecoin symbol, and `price` is the configured USD price with a leading `$`.
+- **`GET /.well-known/x402`**: Payment discovery for agents that should not have to request a paid route first; returns the protocol version, every network and asset the service accepts, the payee and the prices (see [Health and Readiness Probes](#health-and-readiness-probes)).
 - **`GET /livez`**: Liveness probe; returns `{"status": "ok", "uptime_seconds": ...}`.
 - **`GET /metrics`**: Operational diagnostics; returns a JSON snapshot of atomic counters:
   - `total_requests`: Lifetime total requests received.
@@ -249,6 +266,48 @@ The service exposes endpoints outside `/v1/*` that are unmetered (free) and neve
   - `server_errors`: Requests returning status >= 500.
   - `uptime_seconds`: Seconds elapsed since service startup.
 
+## Payment webhooks
+
+The example service can asynchronously notify configured merchant endpoints of
+payment challenges, verified authorizations, successful settlements, and
+failed verification or settlement. Webhooks are disabled unless
+`WEBHOOK_URLS` is set. Configure comma-separated absolute HTTP(S) endpoints and
+a shared signing secret of at least 32 bytes:
+
+```dotenv
+WEBHOOK_URLS=https://merchant.example.com/kite-events
+WEBHOOK_SIGNING_SECRET=replace-with-at-least-32-random-bytes
+```
+
+Generate a secret with `openssl rand -hex 32`. Each POST body is the serialized
+JSON event. `X-Kite-Timestamp` contains its Unix timestamp in seconds, and
+`X-Kite-Signature` is `v1=<hex HMAC-SHA256>` over the exact bytes
+`<timestamp>.<body>`. Receivers should verify the signature and reject
+timestamps outside a short tolerance using the shared secret. The event payload
+contains `event_id`, `event_type`, `timestamp_ms`, and optional `payer`,
+`network`, `amount_atomic`, `tx_hash`, and query-free `request_path`. It never
+contains the payment signature.
+
+The payment gate emits at most one event for a metered request:
+
+- `payment_prompted` when the gate issues a challenge to an unpaid request.
+- `payment_verified` when the facilitator verifies the authorization but the upstream returns an error and settlement is skipped.
+- `payment_settled` when the gate accepts a successful settlement receipt. Use this event to trigger fulfillment.
+- `payment_failed` when the gate rejects a payment or cannot confirm settlement. An unconfirmed settlement may still need reconciliation.
+
+Challenges and payment rejections that return a challenge report the first advertised payment option. Requests rejected before the payment gate, for example by the rate limiter, do not produce an event.
+
+Only 2xx responses count as delivered. The service retries failures up to three
+times with exponential backoff starting at 500 ms, disables redirects, and
+times out each attempt after five seconds. Deliveries to different endpoint URLs
+can run concurrently, with at most one in-flight attempt per URL, so a slow
+receiver does not block attempts to other receivers. All receivers share a
+bounded in-memory queue holding up to 1,000 pending and in-flight deliveries.
+If it fills, the oldest queued delivery is marked abandoned. Queue contents
+are process-local and are lost on restart, so webhooks provide best-effort
+notification rather than durable delivery. A webhook failure never changes
+the buyer's payment response.
+
 ## Timeouts & Configuration
 
 | Variable | Default | Description |
@@ -256,8 +315,9 @@ The service exposes endpoints outside `/v1/*` that are unmetered (free) and neve
 | `PAY_TO` | Required | Receiving wallet address on Kite (`0x` plus 40 hex characters). |
 | `UPSTREAM_URL` | Required | Protected upstream origin URL. |
 | `KITE_NETWORK` | `mainnet` | `mainnet` or `testnet`. |
-| `PRICE_USD` | `0.001` | Default price per call in USD. |
+| `PRICE_USD` | `0.001` | Default price per call in USD, e.g. `0.001` or `$0.001`. It may use at most the asset's decimals and must be an amount a uint256 can hold. |
 | `ROUTE_PRICES_USD` | Empty | Optional JSON array of [route price overrides](#pricing-by-route). |
+| `ROUTE_PRICES_REQUIRE_MATCH` | `false` | Accept only methods and paths in `ROUTE_PRICES_USD`; unmatched requests return `404` before payment processing. Requires at least one rule. Accepts `true` or `false`. |
 | `EXTRA_PAYMENT_OPTIONS` | *(unset)* | Comma-separated default alternatives, e.g. `testnet:0.002,mainnet:$0.05`. A route rule can replace or disable them. |
 | `PORT` | `8402` | Port for the reverse proxy service. |
 | `FACILITATOR_URL` | `https://facilitator.pieverse.io/v2` | Kite facilitator URL (retaining `/v2`). |
@@ -280,6 +340,8 @@ The service exposes endpoints outside `/v1/*` that are unmetered (free) and neve
 | `SETTLEMENT_QUERY_PORT` | Empty (off) | Enables [local settlement queries](#merchant-settlement-queries) on a separate IPv4 loopback port. |
 | `SETTLEMENT_DATABASE_URL` | Empty (off) | PostgreSQL connection URL for the [shared settlement journal](#durable-settlement-and-automatic-reconciliation). |
 | `SETTLEMENT_MAINNET_RPC_URL` / `SETTLEMENT_TESTNET_RPC_URL` | Kite public RPCs | Optional trusted JSON-RPC endpoints for automatic reconciliation. |
+| `WEBHOOK_URLS` | Empty (off) | Comma-separated HTTP(S) payment event endpoints; requires `WEBHOOK_SIGNING_SECRET`. |
+| `WEBHOOK_SIGNING_SECRET` | Required when webhooks are enabled | At least 32 bytes shared with receivers to verify HMAC signatures. |
 | `FACILITATOR_HEALTH_INTERVAL_SECS` | Empty (off) | Background facilitator probe interval; 60..=86400 enables. |
 | `PAYMENT_CLOCK_DRIFT_SECS` | Empty (off) | Enables the expiration guard with this clock-drift tolerance. |
 | `PAYMENT_REPLAY_CACHE_SIZE` | Empty (off) | Enables nonce replay protection with this cache capacity (1..=1000000). |
@@ -359,6 +421,34 @@ The service exposes lightweight Kubernetes-compatible health endpoints outside t
 - **`GET /readyz`** checks x402 v2 `exact` support for every network advertised by the service. Each probe uses a single facilitator `/supported` request and checks the primary network plus all global and route-specific alternatives. The `networks` field lists the configured networks without duplicates. On success, `network` still identifies the primary network.
   - Returns `200` when all configured networks are supported, or `503` when the response is unsuccessful, malformed, or missing support for a configured network. This checks advertised capabilities only. Confirm funded settlements separately.
   - By default, each readiness request runs a live check. Set `FACILITATOR_HEALTH_INTERVAL_SECS` (1 to 86400) to probe in the background and return the cached result with its Unix `checked_at` timestamp. Until the first probe completes, `/readyz` returns `503` with `status` set to `not_ready` and `facilitator` set to `pending`. `/healthz` remains available during this wait.
+
+- **`GET /.well-known/x402`** (Payment discovery): Returns `200 OK` with the service's payment surface, so a client can learn what it accepts without requesting a paid route first. It is built from configuration only — no facilitator or upstream call — and is sent with `Cache-Control: no-store`:
+
+  ```json
+  {
+    "x402Version": 2,
+    "scheme": "exact",
+    "networks": ["eip155:2368", "eip155:2366"],
+    "assets": [
+      {
+        "network": "eip155:2368",
+        "address": "0x38129cf4CE5E183eFF248F42A7D345Bb1B47621A",
+        "symbol": "pieUSD",
+        "decimals": 18,
+        "name": "pieUSD",
+        "version": "1"
+      }
+    ],
+    "payTo": "0x…",
+    "price": "$0.01",
+    "description": "Paid API access via Kite x402",
+    "extraPaymentOptions": [{ "network": "eip155:2366", "price": "$0.002" }]
+  }
+  ```
+
+  - `networks` and `assets` list the primary `KITE_NETWORK` first and then every network named in `EXTRA_PAYMENT_OPTIONS`, each once. An `assets` entry carries the token contract, its symbol and decimals, and the EIP-712 domain name and version the facilitator checks.
+  - `price` is `PRICE_USD` and `extraPaymentOptions` mirrors `EXTRA_PAYMENT_OPTIONS`; the latter is absent when none is configured. Where the document and the 402 challenge both have a field, the key is the same.
+  - Per-route prices (`ROUTE_PRICES_USD`) and the facilitator URL are not published. The first would list the metered routes at an unmetered URL, and the second is server-side infrastructure that a buyer never contacts.
 
 ## Browser CORS support
 

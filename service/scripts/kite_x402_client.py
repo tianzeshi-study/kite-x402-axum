@@ -57,6 +57,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import secrets
 import shlex
 import sys
@@ -276,10 +277,18 @@ def main() -> int:
         print("error: missing --private-key (or set X402_PRIVATE_KEY)", file=sys.stderr)
         return 2
 
+    try:
+        body = json.loads(args.body) if args.body is not None else None
+        if args.body is not None:
+            # Match requests' strict JSON encoding before loading the payer key.
+            json.dumps(body, allow_nan=False)
+    except (ValueError, RecursionError):
+        print("error: --body must be valid JSON", file=sys.stderr)
+        return 2
+
     account = Account.from_key(args.private_key)
     print(f"payer address: {account.address}")
 
-    body = json.loads(args.body) if args.body else None
     headers = {}
 
     print(f"\n--- 1) unauthenticated {args.method} {args.url}")
@@ -321,9 +330,10 @@ def main() -> int:
     print("\npayment required:")
     print(pretty(challenge))
 
-    accepts = challenge.get("accepts") or []
-    if not accepts:
-        print("error: 402 challenge has an empty `accepts` list", file=sys.stderr)
+    accepts = challenge.get("accepts")
+    # 远端 JSON 不能信任类型；在选择报价前拒绝不可迭代或非数组字段，避免异常退出。
+    if not isinstance(accepts, list) or not accepts:
+        print("error: 402 challenge has an invalid or empty `accepts` list; no payment was signed", file=sys.stderr)
         return 1
     requirements = select_option(accepts, args.network)
     if requirements is None:
@@ -446,7 +456,8 @@ def main() -> int:
         or settlement.get("success") is not True
         or settlement.get("network") != requirements["network"]
         or not isinstance(transaction, str)
-        or not transaction.strip()
+        # 标识形状只用于拒绝畸形服务回报，不能替代链上交易核验。
+        or re.fullmatch(r"0x[0-9a-fA-F]{64}", transaction) is None
     ):
         print(
             "error: settlement could not be confirmed. Reconcile the original payment before retrying",
