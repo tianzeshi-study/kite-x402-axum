@@ -8,6 +8,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+<<<<<<< HEAD
 - `service`: `/metrics` now includes aggregate webhook queue gauges and
   process-local attempt, success, failure and abandonment counters without
   exposing endpoint URLs or payment event data.
@@ -33,6 +34,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `WebhookConfig::backoff_for`, `WebhookDispatcher::{next_due, deliver_next,
   deliver_next_at}`, `delivery_client`, `run_delivery_worker`,
   `PaymentConfig::with_webhooks` and `MultiPaymentConfig::with_webhooks`.
+=======
+- `service`: `SETTLEMENT_LEDGER_CAPACITY` (100..=1000000) bounds how many
+  settlement attempts the process retains for reconciliation queries; unset keeps
+  the library default of 5000. The lower bound matches the library's own floor —
+  accepting a smaller number would silently retain more than requested. The value
+  is validated even when `SETTLEMENT_QUERY_PORT` is off, so a typo fails startup.
+>>>>>>> 4029b7c (feat(service): let SETTLEMENT_LEDGER_CAPACITY bound the settlement ledger)
 - `service`: `FACILITATOR_HEALTH_INTERVAL_SECS` starts a background facilitator
   probe; `/readyz` then answers from the latest result and reports `checked_at`.
 - CI: `cargo-deny` (licenses, bans, sources) and a Docker build + smoke test.

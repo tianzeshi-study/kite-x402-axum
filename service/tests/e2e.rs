@@ -998,6 +998,23 @@ fn settlement_queries_refuse_invalid_listener_ports() {
     }
 }
 
+#[test]
+fn refuses_an_invalid_settlement_ledger_capacity() {
+    for value in ["0", "99", "1000001", "abc"] {
+        let (status, stderr) = run_expecting_failure(vec![
+            ("PAY_TO", PAY_TO),
+            ("UPSTREAM_URL", "http://127.0.0.1:1"),
+            ("SETTLEMENT_LEDGER_CAPACITY", value),
+        ]);
+        assert!(!status.success(), "accepted invalid capacity {value}");
+        assert!(
+            stderr
+                .contains("SETTLEMENT_LEDGER_CAPACITY must be an integer between 100 and 1000000"),
+            "{value}: {stderr}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn settlement_queries_are_disabled_on_the_payment_port() {
     let mocks = Mocks::start().await;
