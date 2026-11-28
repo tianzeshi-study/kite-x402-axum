@@ -8,6 +8,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `service`: `/metrics` now includes aggregate webhook queue gauges and
+  process-local attempt, success, failure and abandonment counters without
+  exposing endpoint URLs or payment event data.
+
 - `service`: optional `ROUTE_PRICES_REQUIRE_MATCH=true` limits paid proxy access
   to the methods and paths configured in `ROUTE_PRICES_USD`. Unmatched requests
   return `404` before verification, forwarding or settlement. Empty rule lists

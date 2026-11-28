@@ -112,8 +112,8 @@ pub use settlement_store::{SettlementStorageError, SettlementStore};
 pub use sliding_limiter::{SlidingWindowConfig, SlidingWindowLimiter};
 pub use webhook::{
     delivery_client, run_delivery_worker, DeliveryStatus, WebhookConfig, WebhookDeliveryRecord,
-    WebhookDispatcher, WebhookEventType, WebhookPayload, DELIVERY_ID_HEADER, EVENT_ID_HEADER,
-    MAX_RETRY_BACKOFF,
+    WebhookDispatcher, WebhookEventType, WebhookMetricsSnapshot, WebhookPayload,
+    DELIVERY_ID_HEADER, EVENT_ID_HEADER, MAX_RETRY_BACKOFF,
 };
 pub use webhook_signing::{
     sign_payload, verify_signature, verify_signature_at, SIGNATURE_HEADER, TIMESTAMP_HEADER,

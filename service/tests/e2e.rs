@@ -392,6 +392,18 @@ async fn webhook_events_are_signed_retried_and_isolated_from_payment_responses()
     assert!(events
         .iter()
         .all(|event| event.get("payment_signature").is_none()));
+
+    let metrics: Value = svc.get("/metrics").await.json().await.unwrap();
+    assert_eq!(metrics["webhooks"]["enabled"], true);
+    assert_eq!(metrics["webhooks"]["queued"], 0);
+    assert_eq!(metrics["webhooks"]["in_flight"], 0);
+    assert_eq!(metrics["webhooks"]["attempts_total"], 2);
+    assert_eq!(metrics["webhooks"]["delivered_total"], 1);
+    assert_eq!(metrics["webhooks"]["failed_attempts_total"], 1);
+    assert_eq!(metrics["webhooks"]["abandoned_total"], 0);
+    let metrics_text = metrics.to_string();
+    assert!(!metrics_text.contains(WEBHOOK_SECRET));
+    assert!(!metrics_text.contains("fixture-webhook"));
 }
 
 #[tokio::test]
