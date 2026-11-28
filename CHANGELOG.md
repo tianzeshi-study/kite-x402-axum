@@ -65,6 +65,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `kite-x402-axum`: `CorsSecurityGuard` now advertises the legacy `X-PAYMENT`
   header in `Access-Control-Allow-Headers`, and sends `Vary: Origin` whenever it
   echoes the caller's origin.
+- `kite-x402-axum`: when a settlement ledger is configured, a settlement
+  receipt whose `transaction` is not `0x` plus 64 hex digits is now recorded as
+  `invalid_settlement_receipt` instead of claiming a successful settlement
+  under a key no chain transaction can match. The ledger indexes records by
+  that string, so the shape only matters once a ledger is present; without one
+  the receipt is still echoed untouched.
 
 ### Removed
 
