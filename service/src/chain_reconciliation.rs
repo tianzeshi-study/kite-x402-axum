@@ -237,6 +237,32 @@ fn receipt_state(
     let logs = receipt["logs"]
         .as_array()
         .ok_or_else(|| error("Invalid receipt logs"))?;
+    // A log may omit membership fields (older RPC shapes did not include them),
+    // but any field that is present must agree with the receipt that holds it.
+    // Otherwise a foreign transaction's Transfer log could be replayed into a
+    // receipt to confirm a payment that never reached the payee.
+    let receipt_tx = hex_field(&receipt["transactionHash"], 32);
+    let receipt_block_hash = hex_field(&receipt["blockHash"], 32);
+    let receipt_block = quantity(&receipt["blockNumber"]);
+    for log in logs {
+        if let Some(tx) = log.get("transactionHash") {
+            if hex_field(tx, 32).as_ref() != receipt_tx.as_ref() {
+                return Err(error(
+                    "Receipt log transaction hash disagrees with its receipt",
+                ));
+            }
+        }
+        if let Some(block_hash) = log.get("blockHash") {
+            if hex_field(block_hash, 32).as_ref() != receipt_block_hash.as_ref() {
+                return Err(error("Receipt log block hash disagrees with its receipt"));
+            }
+        }
+        if let Some(block_number) = log.get("blockNumber") {
+            if quantity(block_number) != receipt_block {
+                return Err(error("Receipt log block number disagrees with its receipt"));
+            }
+        }
+    }
     let mut matching = logs.iter().enumerate().filter(|(_, log)| {
         matches_event(log, &payment.asset, used) || matches_event(log, &payment.asset, canceled)
     });
@@ -268,5 +294,124 @@ fn receipt_state(
         Ok("confirmed")
     } else {
         Ok("transfer_mismatch")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{routing::post, Json, Router};
+    use kite_x402_axum::kite::KITE_TESTNET;
+
+    fn payment() -> SettlementReconciliation {
+        SettlementReconciliation {
+            network: KITE_TESTNET.network.to_owned(),
+            asset: KITE_TESTNET.asset_address.to_owned(),
+            payer: "0x1111111111111111111111111111111111111111".to_owned(),
+            pay_to: "0xE2E0000000000000000000000000000000000E2E".to_owned(),
+            amount_atomic: "20000000000000000000".to_owned(),
+            nonce: format!("0x{:064x}", 17),
+        }
+    }
+
+    /// Build a self-consistent receipt whose Transfer log optionally carries a
+    /// transaction hash from a *different* transaction (a foreign log).
+    fn payloads(foreign_transfer: bool) -> (Value, Value) {
+        let payment = payment();
+        let tx = format!("0x{:064x}", 0xab);
+        let foreign_tx = format!("0x{:064x}", 0x77);
+        let block_hash = format!("0x{:064x}", 0xcd);
+        let payer = padded_address(&payment.payer);
+        let pay_to = padded_address(&payment.pay_to);
+        let nonce = payment.nonce.as_str();
+        let transfer_tx = if foreign_transfer {
+            foreign_tx.as_str()
+        } else {
+            tx.as_str()
+        };
+
+        let authorization = json!({
+            "address": payment.asset,
+            "topics": [USED, payer, nonce],
+            "removed": false,
+            "transactionHash": tx,
+            "blockHash": block_hash,
+            "blockNumber": "0x111",
+            "logIndex": "0x1",
+        });
+        let amount = payment
+            .amount_atomic
+            .parse::<num_bigint::BigUint>()
+            .unwrap();
+        let transfer = json!({
+            "address": payment.asset,
+            "topics": [TRANSFER, payer, pay_to],
+            "removed": false,
+            // This is the only inconsistent field: it claims the Transfer
+            // belongs to another transaction than the receipt that holds it.
+            "transactionHash": transfer_tx,
+            "blockHash": block_hash,
+            "blockNumber": "0x111",
+            "data": format!("0x{amount:064x}"),
+        });
+        let receipt = json!({
+            "transactionHash": tx,
+            "blockHash": block_hash,
+            "blockNumber": "0x111",
+            "status": "0x1",
+            "logs": [authorization, transfer],
+        });
+        (json!([authorization]), receipt)
+    }
+
+    async fn mock_rpc(foreign_transfer: bool) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new().route(
+            "/",
+            post(move |Json(req): Json<Value>| async move {
+                let (events, receipt) = payloads(foreign_transfer);
+                let result = match req["method"].as_str().unwrap() {
+                    "eth_chainId" => json!("0x940"),
+                    "eth_blockNumber" => json!("0x130"),
+                    "eth_getLogs" => events,
+                    "eth_getTransactionReceipt" => receipt,
+                    other => panic!("unexpected RPC method: {other}"),
+                };
+                Json(json!({"jsonrpc": "2.0", "id": req["id"], "result": result}))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        url
+    }
+
+    #[tokio::test]
+    async fn receipt_log_from_foreign_transaction_never_confirms() {
+        let url = mock_rpc(true).await;
+        let rpc = ChainRpc::new(&url, &url).unwrap();
+        let result = rpc.scan(&payment(), 0).await;
+        assert!(
+            !matches!(
+                result,
+                Ok(ScanResult::Resolved {
+                    state: "confirmed",
+                    ..
+                })
+            ),
+            "a Transfer log from a foreign transaction must never confirm a payment: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn receipt_logs_with_consistent_metadata_still_confirm() {
+        let url = mock_rpc(false).await;
+        let rpc = ChainRpc::new(&url, &url).unwrap();
+        assert!(matches!(
+            rpc.scan(&payment(), 0).await,
+            Ok(ScanResult::Resolved {
+                state: "confirmed",
+                ..
+            })
+        ));
     }
 }
