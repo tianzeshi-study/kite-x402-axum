@@ -169,6 +169,18 @@ class ReconciliationTests(unittest.TestCase):
         self.assertIn("chain ID does not match", errors)
         self.assertNotIn("eth_call", self.calls)
 
+    def test_invalid_rpc_port_is_rejected_before_any_request(self):
+        for port in ("abc", "-1", "65536", "0"):
+            with self.subTest(port=port):
+                with self.assertRaises(SystemExit) as error:
+                    self.run_query("--rpc-url", f"http://localhost:{port}")
+                self.assertEqual(error.exception.code, 2)
+                self.assertEqual(self.calls, {})
+
+    def test_accepts_a_custom_rpc_port_on_an_ipv6_host(self):
+        status, result, errors = self.run_query("--rpc-url", "http://[::1]:8545")
+        self.assertEqual((status, result["status"], errors), (0, "confirmed", ""))
+
     def test_rpc_without_log_search_reports_how_to_continue(self):
         self.responses["eth_getLogs"] = {"error": {"code": -32601}}
         status, result, errors = self.run_query()
