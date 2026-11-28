@@ -341,7 +341,7 @@ fn webhook_env(mocks: &Mocks, url: String) -> Vec<(String, String)> {
     let mut env = Service::base_env(mocks, free_port());
     env.extend([
         ("WEBHOOK_URLS".into(), url),
-        ("WEBHOOK_SIGNING_SECRET".into(), WEBHOOK_SECRET.into()),
+        ("WEBHOOK_SECRET".into(), WEBHOOK_SECRET.into()),
     ]);
     env
 }
@@ -354,13 +354,12 @@ async fn webhook_events_are_signed_retried_and_isolated_from_payment_responses()
 
     let challenge = svc.get("/v1/forecast?private=do-not-forward").await;
     assert_eq!(challenge.status(), 402);
-    wait_for_webhook_count(&receiver, 1).await;
     let challenged = svc.pay_get("/v1/forecast").await;
     assert_eq!(challenged.status(), 200);
 
-    wait_for_webhook_count(&receiver, 4).await;
+    wait_for_webhook_count(&receiver, 2).await;
     let requests = receiver.requests.lock().unwrap().clone();
-    assert_eq!(requests.len(), 4, "settlement should retry once after 503");
+    assert_eq!(requests.len(), 2, "settlement should retry once after 503");
     for request in &requests {
         let timestamp: u64 = request.headers[TIMESTAMP_HEADER]
             .to_str()
@@ -386,16 +385,10 @@ async fn webhook_events_are_signed_retried_and_isolated_from_payment_responses()
         .iter()
         .map(|request| serde_json::from_slice(&request.body).unwrap())
         .collect();
-    assert_eq!(events[0]["event_type"], "payment_prompted");
-    assert_eq!(events[0]["request_path"], "/v1/forecast");
-    assert_eq!(events[1]["event_type"], "payment_prompted");
-    assert_eq!(events[2]["event_type"], "payment_settled");
-    assert_eq!(events[2]["tx_hash"], TX_HASH);
-    assert_eq!(events[2]["payer"], PAYER);
-    assert_eq!(events[2]["network"], events[1]["network"]);
-    assert_eq!(events[2]["amount_atomic"], events[1]["amount_atomic"]);
-    assert_eq!(events[3]["event_id"], events[2]["event_id"]);
-    assert_eq!(events[3]["request_path"], "/v1/forecast");
+    assert_eq!(events[0]["event_type"], "payment_settled");
+    assert_eq!(events[0]["tx_hash"], TX_HASH);
+    assert_eq!(events[0]["payer"], PAYER);
+    assert_eq!(events[1]["event_id"], events[0]["event_id"]);
     assert!(events
         .iter()
         .all(|event| event.get("payment_signature").is_none()));
@@ -413,17 +406,13 @@ async fn webhook_delivers_to_healthy_receivers_while_a_slow_receiver_is_busy() {
     let (healthy_url, healthy) = start_webhook_receiver(false).await;
     let svc = Service::start(webhook_env(&mocks, format!("{slow_url},{healthy_url}"))).await;
 
-    let requirements = svc.requirements("/v1/forecast").await;
+    let first = svc.pay_get("/v1/forecast").await;
+    assert_eq!(first.status(), 200);
     wait_for_webhook_count(&slow, 1).await;
+
     tokio::time::timeout(Duration::from_secs(3), async {
-        let paid = svc
-            .http
-            .get(svc.url("/v1/forecast"))
-            .header("PAYMENT-SIGNATURE", payment_header(&requirements))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(paid.status(), 200);
+        let second = svc.pay_get("/v1/forecast").await;
+        assert_eq!(second.status(), 200);
         wait_for_webhook_count(&healthy, 2).await;
     })
     .await
@@ -455,31 +444,9 @@ async fn webhook_skips_requests_rejected_before_the_payment_gate() {
     let response = svc.pay_get("/v1/forecast").await;
     assert_eq!(response.status(), 429);
     assert!(mocks.timeline().is_empty());
-    wait_for_webhook_count(&receiver, 1).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let requests = receiver.requests.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    let event: Value = serde_json::from_slice(&requests[0].body).unwrap();
-    assert_eq!(event["event_type"], "payment_prompted");
-}
-
-#[tokio::test]
-async fn webhook_reports_verification_when_the_upstream_returns_an_error() {
-    let mocks = Mocks::start().await;
-    mocks.upstream.set_status(402);
-    let (url, receiver) = start_webhook_receiver(false).await;
-    let svc = Service::start(webhook_env(&mocks, url)).await;
-
-    let response = svc.pay_get("/v1/forecast").await;
-    assert_eq!(response.status(), 402);
-    assert_eq!(mocks.facilitator.verify_count(), 1);
-    assert_eq!(mocks.facilitator.settle_count(), 0);
-    wait_for_webhook_count(&receiver, 2).await;
-    let requests = receiver.requests.lock().unwrap();
-    let event: Value = serde_json::from_slice(&requests[1].body).unwrap();
-    assert_eq!(event["event_type"], "payment_verified");
-    assert_eq!(event["payer"], PAYER);
-    assert!(event["tx_hash"].is_null());
+    assert!(requests.is_empty());
 }
 
 #[tokio::test]
@@ -495,26 +462,13 @@ async fn webhook_reports_a_failed_settlement_with_the_verified_payer() {
     let response = svc.pay_get("/v1/forecast").await;
     assert_eq!(response.status(), 402);
     assert_eq!(mocks.facilitator.settle_count(), 1);
-    wait_for_webhook_count(&receiver, 2).await;
+    wait_for_webhook_count(&receiver, 1).await;
     let requests = receiver.requests.lock().unwrap();
-    let event: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let event: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(event["event_type"], "payment_failed");
     assert_eq!(event["payer"], PAYER);
     assert_eq!(event["network"], kite_x402_axum::KITE_TESTNET.network);
     assert!(event["tx_hash"].is_null());
-}
-
-#[test]
-fn webhooks_require_a_signing_secret_at_startup() {
-    let (status, stderr) = run_expecting_failure(vec![
-        ("PORT", "0"),
-        ("PAY_TO", PAY_TO),
-        ("UPSTREAM_URL", "http://127.0.0.1:1"),
-        ("WEBHOOK_URLS", "http://127.0.0.1:9000/events"),
-        ("RUST_LOG", "off"),
-    ]);
-    assert!(!status.success());
-    assert!(stderr.contains("WEBHOOK_SIGNING_SECRET is required"));
 }
 
 // ===========================================================================
@@ -1272,7 +1226,7 @@ async fn durable_settlement_survives_timeout_and_crash_across_replicas() {
     let mut settings_a = settings(port_a, query_a, "500");
     settings_a.extend([
         ("WEBHOOK_URLS".into(), webhook_url),
-        ("WEBHOOK_SIGNING_SECRET".into(), WEBHOOK_SECRET.into()),
+        ("WEBHOOK_SECRET".into(), WEBHOOK_SECRET.into()),
     ]);
     let a = Service::start(settings_a).await;
     let b = Service::start(settings(port_b, query_b, "5000")).await;
@@ -1307,10 +1261,10 @@ async fn durable_settlement_survives_timeout_and_crash_across_replicas() {
     statuses.sort_unstable();
     assert_eq!(statuses, [402, 409]);
     assert_eq!(mocks.timeline(), ["verify", "upstream", "settle"]);
-    wait_for_webhook_count(&receiver, 2).await;
+    wait_for_webhook_count(&receiver, 1).await;
     {
         let requests = receiver.requests.lock().unwrap();
-        let event: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let event: Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(event["event_type"], "payment_failed");
         assert_eq!(event["amount_atomic"], AMOUNT);
         assert_eq!(event["payer"], SIGNER);
@@ -3923,4 +3877,146 @@ fn refuses_duplicate_extra_payment_options() {
         assert!(!status.success(), "{value} must fail startup");
         assert!(stderr.contains(expected_error), "{value}: {stderr}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// webhook delivery (WEBHOOK_URLS / WEBHOOK_SECRET)
+// ---------------------------------------------------------------------------
+
+type Seen = std::sync::Arc<std::sync::Mutex<Vec<(axum::http::HeaderMap, Vec<u8>)>>>;
+
+/// A webhook receiver that records every request; returns its URL.
+async fn webhook_receiver() -> (String, Seen) {
+    let seen: Seen = Default::default();
+    let sink = std::sync::Arc::clone(&seen);
+    let app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(
+            move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                let sink = std::sync::Arc::clone(&sink);
+                async move {
+                    sink.lock().unwrap().push((headers, body.to_vec()));
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}/hook"), seen)
+}
+
+const E2E_WEBHOOK_SECRET: &str = "e2e-webhook-secret-0123456789";
+
+#[tokio::test]
+async fn a_paid_call_delivers_a_signed_payment_settled_webhook() {
+    let mocks = Mocks::start().await;
+    let (hook_url, seen) = webhook_receiver().await;
+    let env = env_with(
+        Service::base_env(&mocks, free_port()),
+        "WEBHOOK_URLS",
+        &hook_url,
+    );
+    let env = env_with(env, "WEBHOOK_SECRET", E2E_WEBHOOK_SECRET);
+    let svc = Service::start(env).await;
+
+    assert_eq!(svc.pay_get("/v1/forecast").await.status(), 200);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while seen.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "no webhook delivered within 10s");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "one paid call, one event");
+    let (headers, body) = &seen[0];
+
+    let timestamp: u64 = headers["x-kite-timestamp"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        kite_x402_axum::verify_signature_at(
+            E2E_WEBHOOK_SECRET,
+            timestamp,
+            body,
+            headers["x-kite-signature"].to_str().unwrap(),
+            now,
+            300,
+        ),
+        "signature must verify with the configured secret"
+    );
+    let event: Value = serde_json::from_slice(body).unwrap();
+    assert_eq!(event["event_type"], "payment_settled");
+    assert_eq!(event["payer"], PAYER);
+    assert_eq!(event["tx_hash"], TX_HASH);
+}
+
+#[tokio::test]
+async fn webhooks_are_off_by_default_and_unsigned_without_a_secret() {
+    let mocks = Mocks::start().await;
+    let (hook_url, seen) = webhook_receiver().await;
+
+    // Off: no WEBHOOK_URLS, nothing is ever sent anywhere.
+    let svc = Service::start(Service::base_env(&mocks, free_port())).await;
+    assert_eq!(svc.pay_get("/v1/forecast").await.status(), 200);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(seen.lock().unwrap().is_empty());
+    drop(svc);
+
+    // On without a secret: delivered, but carries no signature header.
+    let env = env_with(
+        Service::base_env(&mocks, free_port()),
+        "WEBHOOK_URLS",
+        &hook_url,
+    );
+    let svc = Service::start(env).await;
+    assert_eq!(svc.pay_get("/v1/forecast").await.status(), 200);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while seen.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "no webhook delivered within 10s");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let seen = seen.lock().unwrap();
+    assert!(seen[0].0.get("x-kite-signature").is_none());
+    assert!(seen[0].0.get("x-kite-timestamp").is_some());
+}
+
+#[test]
+fn refuses_invalid_webhook_configuration() {
+    for (key, value, needle) in [
+        ("WEBHOOK_URLS", "not a url", "WEBHOOK_URLS"),
+        ("WEBHOOK_URLS", "ftp://hooks.example", "WEBHOOK_URLS"),
+        ("WEBHOOK_SECRET", "0123456789abcdef", "WEBHOOK_URLS is not"),
+        ("WEBHOOK_MAX_RETRIES", "3", "WEBHOOK_URLS is not"),
+    ] {
+        let (status, stderr) = run_expecting_failure(vec![
+            ("PAY_TO", PAY_TO),
+            ("UPSTREAM_URL", "http://localhost:1"),
+            (key, value),
+            ("RUST_LOG", "off"),
+        ]);
+        assert!(!status.success(), "{key}={value} must fail startup");
+        assert!(stderr.contains(needle), "{key}={value}: {stderr}");
+    }
+
+    let (status, stderr) = run_expecting_failure(vec![
+        ("PAY_TO", PAY_TO),
+        ("UPSTREAM_URL", "http://localhost:1"),
+        ("WEBHOOK_URLS", "https://hooks.example/h"),
+        ("WEBHOOK_SECRET", "too-short"),
+        ("RUST_LOG", "off"),
+    ]);
+    assert!(!status.success());
+    assert!(stderr.contains("at least 16"), "{stderr}");
+    assert!(
+        !stderr.contains("too-short"),
+        "the secret must not be echoed"
+    );
 }

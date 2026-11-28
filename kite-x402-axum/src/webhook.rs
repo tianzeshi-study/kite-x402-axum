@@ -171,23 +171,47 @@ impl WebhookConfig {
 /// Runs webhook deliveries in the background until `shutdown` becomes `true`
 /// (or its sender is dropped).
 ///
-/// Each wake-up delivers every webhook that is currently due, then sleeps for
-/// `poll_interval` (or until shutdown). Run exactly one worker per
-/// dispatcher. Pending deliveries live in memory only: on shutdown anything
-/// still queued is not delivered and is lost when the process exits.
+/// Each wake-up dispatches up to one concurrent delivery per idle target URL,
+/// then waits for an in-flight delivery to finish, for the next retry or
+/// `poll_interval`, or for shutdown. Run exactly one worker per dispatcher.
+/// Pending deliveries live in memory only: on shutdown anything still queued is
+/// not delivered and is lost when the process exits.
 pub async fn run_delivery_worker(
     dispatcher: WebhookDispatcher,
     client: reqwest::Client,
     poll_interval: Duration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    let mut attempts = tokio::task::JoinSet::new();
     loop {
-        while !*shutdown.borrow() && dispatcher.deliver_next(&client).await.is_some() {}
+        while let Some(result) = attempts.try_join_next() {
+            if let Err(error) = result {
+                tracing::error!(%error, "Webhook delivery task failed");
+            }
+        }
+        while !*shutdown.borrow() {
+            let Some(record) = dispatcher.claim_next_for_idle_target() else {
+                break;
+            };
+            let dispatcher = dispatcher.clone();
+            let client = client.clone();
+            attempts.spawn(async move {
+                dispatcher.deliver_record(&client, record, now_ms()).await;
+            });
+        }
         if *shutdown.borrow() {
             return;
         }
+        let wait = dispatcher
+            .next_retry_delay_for_idle_targets()
+            .map_or(poll_interval, |delay| delay.min(poll_interval));
         tokio::select! {
-            () = tokio::time::sleep(poll_interval) => {}
+            () = tokio::time::sleep(wait) => {}
+            Some(result) = attempts.join_next(), if !attempts.is_empty() => {
+                if let Err(error) = result {
+                    tracing::error!(%error, "Webhook delivery task failed");
+                }
+            }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return;
@@ -494,6 +518,15 @@ impl WebhookDispatcher {
         now_ms: u64,
     ) -> Option<WebhookDeliveryRecord> {
         let record = self.next_due(now_ms)?;
+        self.deliver_record(client, record, now_ms).await
+    }
+
+    async fn deliver_record(
+        &self,
+        client: &reqwest::Client,
+        record: WebhookDeliveryRecord,
+        now_ms: u64,
+    ) -> Option<WebhookDeliveryRecord> {
         let timestamp_secs = now_ms / 1000;
 
         let outcome = match serde_json::to_vec(&record.payload) {
