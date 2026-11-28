@@ -149,6 +149,8 @@ def reconcile(http, args):
     for log in logs:
         if not isinstance(log, dict):
             raise QueryError("transaction receipt contains an invalid log")
+        if "logIndex" in log:
+            quantity(log["logIndex"], "receipt log")
         for field, size, expected in (("transactionHash", 32, transaction), ("blockHash", 32, receipt_hash)):
             if field in log and hex_field(log[field], size) != expected:
                 raise QueryError("receipt log metadata disagrees with its containing receipt")
@@ -178,6 +180,11 @@ def reconcile(http, args):
         # Kite 代币紧接授权事件记录对应转账，以此区分同一笔交易中的多笔付款。
         following = logs[index + 1]
         if token_event(following, args.asset, transfer) and hex_field(following.get("data"), 32) == amount:
+            # 数组相邻不能覆盖已提供的链上索引矛盾；旧接口缺少该字段时保持兼容。
+            if "logIndex" in logs[index] and "logIndex" in following and (
+                quantity(following["logIndex"], "receipt log") != quantity(logs[index]["logIndex"], "receipt log") + 1
+            ):
+                raise QueryError("receipt transfer log index is not adjacent to the authorization log")
             result["status"] = "confirmed"
     return result
 

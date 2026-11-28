@@ -70,6 +70,27 @@ class ReconciliationTests(unittest.TestCase):
             ])
         return status, json.loads(stdout.getvalue() or "null"), stderr.getvalue()
 
+    def test_transfer_log_indices_must_be_adjacent_when_provided(self):
+        for lookup in ((), ("--transaction", TX)):
+            for invalid in ("0x0", "0x2", "0x10", "0x01", None, 1):
+                with self.subTest(lookup=lookup, log_index=invalid):
+                    self.setUp()
+                    self.receipt["logs"][1]["logIndex"] = invalid
+                    status, result, errors = self.run_query(*lookup)
+                    self.assertEqual(status, 1)
+                    self.assertIsNone(result)
+                    self.assertIn("log", errors.lower())
+
+    def test_valid_global_log_indices_preserve_confirmation_and_missing_field_compatibility(self):
+        self.event["logIndex"] = "0x7"
+        self.receipt["logs"][0]["logIndex"] = "0x7"
+        self.receipt["logs"][1]["logIndex"] = "0x8"
+        status, result, errors = self.run_query()
+        self.assertEqual((status, result["status"], errors), (0, "confirmed", ""))
+        self.receipt["logs"][1].pop("logIndex")
+        status, result, errors = self.run_query("--transaction", TX)
+        self.assertEqual((status, result["status"], errors), (0, "confirmed", ""))
+
     def test_nonce_lookup_confirms_payment_using_a_bounded_window(self):
         status, result, errors = self.run_query("--blocks", "30")
         self.assertEqual((status, errors), (0, ""))
