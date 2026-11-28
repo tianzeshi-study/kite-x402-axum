@@ -361,3 +361,62 @@ async fn worker_does_not_send_after_shutdown() {
     assert_eq!(rx.seen.lock().unwrap().len(), 0);
     assert_eq!(d.pending_count(), 1);
 }
+
+#[tokio::test]
+async fn worker_delivers_to_healthy_target_while_slow_target_is_busy() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let gate_handler = Arc::clone(&gate);
+    let slow_seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let slow_seen_handler = Arc::clone(&slow_seen);
+    let slow_app = Router::new().route(
+        "/hook",
+        post(move |body: Bytes| {
+            let gate = Arc::clone(&gate_handler);
+            let seen = Arc::clone(&slow_seen_handler);
+            async move {
+                gate.notified().await;
+                seen.lock().unwrap().push(body.to_vec());
+                StatusCode::OK
+            }
+        }),
+    );
+    let slow_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let slow_addr = slow_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(slow_listener, slow_app).await.unwrap() });
+    let slow_url = format!("http://{slow_addr}/hook");
+
+    let (healthy_url, healthy_rx) = receiver(&[]).await;
+    let d = WebhookDispatcher::new(WebhookConfig {
+        target_urls: vec![slow_url, healthy_url],
+        max_retries: 1,
+        initial_backoff: Duration::from_millis(30),
+        max_queue_size: 100,
+        signing_secret: Some("whsec".into()),
+    });
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(kite_x402_axum::run_delivery_worker(
+        d.clone(),
+        client(),
+        Duration::from_millis(50),
+        stopped,
+    ));
+
+    enqueue(&d);
+    wait_until("healthy target receives event while slow target blocks", || {
+        healthy_rx.seen.lock().unwrap().len() == 1
+    })
+    .await;
+    assert_eq!(slow_seen.lock().unwrap().len(), 0);
+
+    gate.notify_one();
+    wait_until("slow target completes after unblocking", || {
+        slow_seen.lock().unwrap().len() == 1
+    })
+    .await;
+
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .expect("worker stops on shutdown")
+        .unwrap();
+}
