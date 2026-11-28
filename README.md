@@ -266,48 +266,6 @@ The service exposes endpoints outside `/v1/*` that are unmetered (free) and neve
   - `server_errors`: Requests returning status >= 500.
   - `uptime_seconds`: Seconds elapsed since service startup.
 
-## Payment webhooks
-
-The example service can asynchronously notify configured merchant endpoints of
-payment challenges, verified authorizations, successful settlements, and
-failed verification or settlement. Webhooks are disabled unless
-`WEBHOOK_URLS` is set. Configure comma-separated absolute HTTP(S) endpoints and
-a shared signing secret of at least 32 bytes:
-
-```dotenv
-WEBHOOK_URLS=https://merchant.example.com/kite-events
-WEBHOOK_SIGNING_SECRET=replace-with-at-least-32-random-bytes
-```
-
-Generate a secret with `openssl rand -hex 32`. Each POST body is the serialized
-JSON event. `X-Kite-Timestamp` contains its Unix timestamp in seconds, and
-`X-Kite-Signature` is `v1=<hex HMAC-SHA256>` over the exact bytes
-`<timestamp>.<body>`. Receivers should verify the signature and reject
-timestamps outside a short tolerance using the shared secret. The event payload
-contains `event_id`, `event_type`, `timestamp_ms`, and optional `payer`,
-`network`, `amount_atomic`, `tx_hash`, and query-free `request_path`. It never
-contains the payment signature.
-
-The payment gate emits at most one event for a metered request:
-
-- `payment_prompted` when the gate issues a challenge to an unpaid request.
-- `payment_verified` when the facilitator verifies the authorization but the upstream returns an error and settlement is skipped.
-- `payment_settled` when the gate accepts a successful settlement receipt. Use this event to trigger fulfillment.
-- `payment_failed` when the gate rejects a payment or cannot confirm settlement. An unconfirmed settlement may still need reconciliation.
-
-Challenges and payment rejections that return a challenge report the first advertised payment option. Requests rejected before the payment gate, for example by the rate limiter, do not produce an event.
-
-Only 2xx responses count as delivered. The service retries failures up to three
-times with exponential backoff starting at 500 ms, disables redirects, and
-times out each attempt after five seconds. Deliveries to different endpoint URLs
-can run concurrently, with at most one in-flight attempt per URL, so a slow
-receiver does not block attempts to other receivers. All receivers share a
-bounded in-memory queue holding up to 1,000 pending and in-flight deliveries.
-If it fills, the oldest queued delivery is marked abandoned. Queue contents
-are process-local and are lost on restart, so webhooks provide best-effort
-notification rather than durable delivery. A webhook failure never changes
-the buyer's payment response.
-
 ## Timeouts & Configuration
 
 | Variable | Default | Description |
@@ -340,9 +298,10 @@ the buyer's payment response.
 | `SETTLEMENT_QUERY_PORT` | Empty (off) | Enables [local settlement queries](#merchant-settlement-queries) on a separate IPv4 loopback port. |
 | `SETTLEMENT_DATABASE_URL` | Empty (off) | PostgreSQL connection URL for the [shared settlement journal](#durable-settlement-and-automatic-reconciliation). |
 | `SETTLEMENT_MAINNET_RPC_URL` / `SETTLEMENT_TESTNET_RPC_URL` | Kite public RPCs | Optional trusted JSON-RPC endpoints for automatic reconciliation. |
-| `WEBHOOK_URLS` | Empty (off) | Comma-separated HTTP(S) payment event endpoints; requires `WEBHOOK_SIGNING_SECRET`. |
-| `WEBHOOK_SIGNING_SECRET` | Required when webhooks are enabled | At least 32 bytes shared with receivers to verify HMAC signatures. |
-| `FACILITATOR_HEALTH_INTERVAL_SECS` | Empty (off) | Background facilitator probe interval; 60..=86400 enables. |
+| `FACILITATOR_HEALTH_INTERVAL_SECS` | Empty (off) | Background facilitator probe interval; 1..=86400 enables, 0 or empty keeps live per-request probes. |
+| `WEBHOOK_URLS` | Empty (off) | Comma-separated `http(s)` endpoints (at most 16) that receive [payment webhooks](#payment-webhooks). |
+| `WEBHOOK_SECRET` | Empty (unsigned) | HMAC-SHA256 signing key, at least 16 characters. Requires `WEBHOOK_URLS`. |
+| `WEBHOOK_MAX_RETRIES` | `5` | Retries after the first attempt (0..=20). Requires `WEBHOOK_URLS`. |
 | `PAYMENT_CLOCK_DRIFT_SECS` | Empty (off) | Enables the expiration guard with this clock-drift tolerance. |
 | `PAYMENT_REPLAY_CACHE_SIZE` | Empty (off) | Enables nonce replay protection with this cache capacity (1..=1000000). |
 | `SECURITY_CSP` | `default-src 'none'; frame-ancestors 'none'` | Content-Security-Policy header value. |
@@ -449,6 +408,53 @@ The service exposes lightweight Kubernetes-compatible health endpoints outside t
   - `networks` and `assets` list the primary `KITE_NETWORK` first and then every network named in `EXTRA_PAYMENT_OPTIONS`, each once. An `assets` entry carries the token contract, its symbol and decimals, and the EIP-712 domain name and version the facilitator checks.
   - `price` is `PRICE_USD` and `extraPaymentOptions` mirrors `EXTRA_PAYMENT_OPTIONS`; the latter is absent when none is configured. Where the document and the 402 challenge both have a field, the key is the same.
   - Per-route prices (`ROUTE_PRICES_USD`) and the facilitator URL are not published. The first would list the metered routes at an unmetered URL, and the second is server-side infrastructure that a buyer never contacts.
+
+## Payment webhooks
+
+Set `WEBHOOK_URLS` to be notified of every settle attempt. After each attempt
+the service queues one event per URL and a single background worker delivers
+it with a `POST` of a JSON body:
+
+```json
+{"event_id": "evt_...", "event_type": "payment_settled", "timestamp_ms": 1700000000000,
+ "payer": "0x...", "network": "eip155:2368", "amount_atomic": "1000",
+ "tx_hash": "0x...", "request_path": null}
+```
+
+`event_type` is `payment_settled` for a successful settlement and
+`payment_failed` for anything else, including attempts whose on-chain outcome
+is unknown (reconcile those before retrying a payment). Unpaid challenges and
+rejected verifications do not reach settlement and send nothing.
+
+Every delivery carries `X-Kite-Delivery-Id` (unique per URL),
+`X-Kite-Event-Id` (shared by all URLs of one event) and `X-Kite-Timestamp`
+(Unix seconds). With `WEBHOOK_SECRET` set it also carries
+`X-Kite-Signature: v1=<hex>`, the HMAC-SHA256 of `"{timestamp}.{raw body}"`.
+Verify it over the **raw** body bytes and reject old timestamps to stop replays:
+
+```python
+import hashlib, hmac, time
+
+def verify(secret: str, timestamp: str, body: bytes, header: str, tolerance=300) -> bool:
+    if abs(time.time() - int(timestamp)) > tolerance:
+        return False
+    expected = "v1=" + hmac.new(secret.encode(), timestamp.encode() + b"." + body,
+                                hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, header)
+```
+
+Any `2xx` answer counts as delivered. Other statuses and network errors are
+retried with exponential backoff (500 ms, doubling, capped at one hour) up to
+`WEBHOOK_MAX_RETRIES` times, then abandoned. Redirects are **not** followed and
+each request times out after 10 seconds. Deliveries are at-least-once: make your
+receiver idempotent on `X-Kite-Delivery-Id`.
+
+Limits to know about: the queue lives in memory, so events not yet delivered
+are lost on restart or shutdown, and a full queue drops its oldest entries.
+Use a `https` URL: the payload contains the payer address and amount, and
+startup warns about plain `http` to non-loopback hosts. The library exposes the
+same pieces (`WebhookDispatcher`, `run_delivery_worker`, `sign_payload`,
+`verify_signature_at`) for use outside this service.
 
 ## Browser CORS support
 
